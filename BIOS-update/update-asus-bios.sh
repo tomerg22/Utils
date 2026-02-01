@@ -12,7 +12,6 @@ set -euo pipefail
 
 # Configuration
 TEMP_DIR="/tmp/ASUS_BIOS_Update"
-DESTINATION="/mnt/kingston1"
 
 # Colors
 RED='\033[0;31m'
@@ -30,6 +29,54 @@ check_root() {
         echo "Run with: sudo $0"
         exit 1
     fi
+}
+
+# Detect FAT32 USB drive
+detect_usb_drive() {
+    local usb_drives=()
+    local mount_points=()
+
+    # Find mounted USB drives with FAT32 (vfat) filesystem
+    while IFS= read -r line; do
+        local name tran fstype mountpoint
+        name=$(echo "$line" | awk '{print $1}')
+        tran=$(echo "$line" | awk '{print $2}')
+        fstype=$(echo "$line" | awk '{print $3}')
+        mountpoint=$(echo "$line" | awk '{print $4}')
+
+        if [[ "$tran" == "usb" && "$fstype" == "vfat" && -n "$mountpoint" ]]; then
+            usb_drives+=("$name")
+            mount_points+=("$mountpoint")
+        fi
+    done < <(lsblk -o NAME,TRAN,FSTYPE,MOUNTPOINT -n -l 2>/dev/null)
+
+    if [[ ${#usb_drives[@]} -eq 0 ]]; then
+        echo -e "${RED}No mounted FAT32 USB drives found${NC}" >&2
+        echo -e "${YELLOW}Please insert a FAT32-formatted USB drive and mount it${NC}" >&2
+        return 1
+    fi
+
+    if [[ ${#usb_drives[@]} -eq 1 ]]; then
+        echo -e "${GREEN}Found USB drive: ${usb_drives[0]} mounted at ${mount_points[0]}${NC}" >&2
+        echo "${mount_points[0]}"
+        return 0
+    fi
+
+    # Multiple drives found - let user choose
+    echo -e "${YELLOW}Multiple FAT32 USB drives found:${NC}" >&2
+    for i in "${!usb_drives[@]}"; do
+        echo -e "  $((i+1)). ${usb_drives[$i]} -> ${mount_points[$i]}" >&2
+    done
+
+    local selection
+    while true; do
+        read -rp "Select drive (1-${#usb_drives[@]}): " selection
+        if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le ${#usb_drives[@]} ]]; then
+            echo "${mount_points[$((selection-1))]}"
+            return 0
+        fi
+        echo -e "${RED}Invalid selection${NC}" >&2
+    done
 }
 
 # Detect motherboard model from system
@@ -150,6 +197,7 @@ get_latest_bios_info() {
 install_bios_update() {
     local download_url="$1"
     local version="$2"
+    local destination="$3"
 
     # Create temp directory
     rm -rf "$TEMP_DIR"
@@ -196,16 +244,9 @@ install_bios_update() {
 
     echo -e "${GREEN}Found BIOS file: $(basename "$cap_file")${NC}"
 
-    # Check destination exists
-    if [[ ! -d "$DESTINATION" ]]; then
-        echo -e "${RED}Destination not found: ${DESTINATION}${NC}" >&2
-        echo -e "${YELLOW}Make sure the drive is mounted${NC}" >&2
-        return 1
-    fi
-
     # Copy to destination with version name
     local new_name="${version}.CAP"
-    local destination_path="${DESTINATION}/${new_name}"
+    local destination_path="${destination}/${new_name}"
 
     # Remove existing file if present
     if [[ -f "$destination_path" ]]; then
@@ -284,8 +325,16 @@ main() {
     echo -e "${YELLOW}Update available: ${current_version} -> ${LATEST_VERSION}${NC}"
     echo ""
 
+    # Detect USB drive
+    local usb_destination
+    if ! usb_destination=$(detect_usb_drive); then
+        exit 1
+    fi
+    echo -e "${WHITE}Target USB drive: ${usb_destination}${NC}"
+    echo ""
+
     # Download and prepare
-    if ! install_bios_update "$DOWNLOAD_URL" "$LATEST_VERSION"; then
+    if ! install_bios_update "$DOWNLOAD_URL" "$LATEST_VERSION" "$usb_destination"; then
         exit 1
     fi
 

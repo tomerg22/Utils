@@ -12,6 +12,8 @@ set -euo pipefail
 
 # Configuration
 TEMP_DIR="/tmp/ASUS_BIOS_Update"
+MOUNT_BASE="/mnt/bios-update"
+TEMP_MOUNTS=()
 
 # Colors
 RED='\033[0;31m'
@@ -31,12 +33,46 @@ check_root() {
     fi
 }
 
-# Detect FAT32 USB drive
+# Mount a partition if not already mounted
+mount_partition() {
+    local device="$1"
+    local mount_point="${MOUNT_BASE}-${device##*/}"
+
+    # Create mount point
+    if [[ ! -d "$mount_point" ]]; then
+        mkdir -p "$mount_point"
+    fi
+
+    # Mount the partition
+    if mount -t vfat "/dev/$device" "$mount_point" 2>/dev/null; then
+        TEMP_MOUNTS+=("$mount_point")
+        echo "$mount_point"
+        return 0
+    fi
+
+    echo -e "${RED}Failed to mount /dev/$device${NC}" >&2
+    rmdir "$mount_point" 2>/dev/null
+    return 1
+}
+
+# Cleanup temporary mounts
+cleanup_mounts() {
+    for mount_point in "${TEMP_MOUNTS[@]}"; do
+        if mountpoint -q "$mount_point" 2>/dev/null; then
+            umount "$mount_point" 2>/dev/null
+            echo -e "${GRAY}Unmounted: ${mount_point}${NC}"
+        fi
+        rmdir "$mount_point" 2>/dev/null
+    done
+}
+
+# Detect FAT32 USB drive (mounted or unmounted)
 detect_usb_drive() {
     local usb_drives=()
     local mount_points=()
+    local devices=()
 
-    # Find mounted USB drives with FAT32 (vfat) filesystem
+    # Find USB drives with FAT32 (vfat) filesystem - mounted or not
     while IFS= read -r line; do
         local name tran fstype mountpoint
         name=$(echo "$line" | awk '{print $1}')
@@ -44,39 +80,62 @@ detect_usb_drive() {
         fstype=$(echo "$line" | awk '{print $3}')
         mountpoint=$(echo "$line" | awk '{print $4}')
 
-        if [[ "$tran" == "usb" && "$fstype" == "vfat" && -n "$mountpoint" ]]; then
+        if [[ "$tran" == "usb" && "$fstype" == "vfat" ]]; then
             usb_drives+=("$name")
-            mount_points+=("$mountpoint")
+            devices+=("$name")
+            if [[ -n "$mountpoint" ]]; then
+                mount_points+=("$mountpoint")
+            else
+                mount_points+=("")  # Empty = not mounted
+            fi
         fi
     done < <(lsblk -o NAME,TRAN,FSTYPE,MOUNTPOINT -n -l 2>/dev/null)
 
     if [[ ${#usb_drives[@]} -eq 0 ]]; then
-        echo -e "${RED}No mounted FAT32 USB drives found${NC}" >&2
-        echo -e "${YELLOW}Please insert a FAT32-formatted USB drive and mount it${NC}" >&2
+        echo -e "${RED}No FAT32 USB drives found${NC}" >&2
+        echo -e "${YELLOW}Please insert a FAT32-formatted USB drive${NC}" >&2
         return 1
     fi
 
-    if [[ ${#usb_drives[@]} -eq 1 ]]; then
-        echo -e "${GREEN}Found USB drive: ${usb_drives[0]} mounted at ${mount_points[0]}${NC}" >&2
-        echo "${mount_points[0]}"
-        return 0
+    local selected_idx=0
+
+    if [[ ${#usb_drives[@]} -gt 1 ]]; then
+        # Multiple drives found - let user choose
+        echo -e "${YELLOW}Multiple FAT32 USB drives found:${NC}" >&2
+        for i in "${!usb_drives[@]}"; do
+            local status="not mounted"
+            if [[ -n "${mount_points[$i]}" ]]; then
+                status="mounted at ${mount_points[$i]}"
+            fi
+            echo -e "  $((i+1)). ${usb_drives[$i]} ($status)" >&2
+        done
+
+        local selection
+        while true; do
+            read -rp "Select drive (1-${#usb_drives[@]}): " selection
+            if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le ${#usb_drives[@]} ]]; then
+                selected_idx=$((selection-1))
+                break
+            fi
+            echo -e "${RED}Invalid selection${NC}" >&2
+        done
     fi
 
-    # Multiple drives found - let user choose
-    echo -e "${YELLOW}Multiple FAT32 USB drives found:${NC}" >&2
-    for i in "${!usb_drives[@]}"; do
-        echo -e "  $((i+1)). ${usb_drives[$i]} -> ${mount_points[$i]}" >&2
-    done
+    local selected_device="${devices[$selected_idx]}"
+    local selected_mount="${mount_points[$selected_idx]}"
 
-    local selection
-    while true; do
-        read -rp "Select drive (1-${#usb_drives[@]}): " selection
-        if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le ${#usb_drives[@]} ]]; then
-            echo "${mount_points[$((selection-1))]}"
-            return 0
+    # If not mounted, mount it
+    if [[ -z "$selected_mount" ]]; then
+        echo -e "${CYAN}Mounting /dev/${selected_device}...${NC}" >&2
+        if ! selected_mount=$(mount_partition "$selected_device"); then
+            return 1
         fi
-        echo -e "${RED}Invalid selection${NC}" >&2
-    done
+        echo -e "${GREEN}Mounted at: ${selected_mount}${NC}" >&2
+    else
+        echo -e "${GREEN}Found USB drive: ${selected_device} mounted at ${selected_mount}${NC}" >&2
+    fi
+
+    echo "$selected_mount"
 }
 
 # Detect motherboard model from system
@@ -266,12 +325,13 @@ install_bios_update() {
     return 1
 }
 
-# Cleanup temporary files
+# Cleanup temporary files and mounts
 cleanup() {
     if [[ -d "$TEMP_DIR" ]]; then
         rm -rf "$TEMP_DIR"
         echo -e "${GRAY}Cleaned up temporary files${NC}"
     fi
+    cleanup_mounts
 }
 
 # Set trap for cleanup on exit

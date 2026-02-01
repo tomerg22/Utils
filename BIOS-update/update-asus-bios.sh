@@ -415,10 +415,12 @@ main() {
     echo -e "${RED}WARNING: Do not power off during BIOS update!${NC}"
     echo ""
 
+    # Clean up before potential restart
+    cleanup
+
     read -rp "Restart now to apply BIOS update? (Y/N) " restart_confirm
     if [[ "$restart_confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}Restarting in 5 seconds...${NC}"
-        sleep 5
+        echo -e "${YELLOW}Restarting...${NC}"
         reboot
     else
         echo -e "${YELLOW}Restart when ready to apply the BIOS update.${NC}"

@@ -8,7 +8,7 @@
 
 .NOTES
     After running, restart and enter BIOS (F2/Del) -> Tool -> ASUS EZ Flash 3
-    Select the .CAP file from C:\ drive to apply the update.
+    Select the .CAP file from the USB drive to apply the update.
 #>
 
 #Requires -RunAsAdministrator
@@ -17,7 +17,6 @@ $ErrorActionPreference = "Stop"
 
 # Configuration
 $TempDir = Join-Path $env:TEMP "ASUS_BIOS_Update"
-$DestinationDrive = "C:\"
 
 function Get-MotherboardModel {
     <#
@@ -41,6 +40,63 @@ function Get-MotherboardModel {
     }
 
     return $product
+}
+
+function Get-UsbDrive {
+    <#
+    .SYNOPSIS
+        Detects FAT32-formatted USB drives
+    #>
+    $usbDrives = @()
+
+    # Get USB disk drives
+    $usbDisks = Get-CimInstance Win32_DiskDrive | Where-Object { $_.InterfaceType -eq 'USB' }
+
+    foreach ($disk in $usbDisks) {
+        # Get partitions for this disk
+        $partitions = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskDrive.DeviceID='$($disk.DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition"
+
+        foreach ($partition in $partitions) {
+            # Get logical disks (drive letters) for this partition
+            $logicalDisks = Get-CimInstance -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($partition.DeviceID)'} WHERE AssocClass=Win32_LogicalDiskToPartition"
+
+            foreach ($logicalDisk in $logicalDisks) {
+                $volume = Get-Volume -DriveLetter $logicalDisk.DeviceID.TrimEnd(':') -ErrorAction SilentlyContinue
+                if ($volume -and $volume.FileSystem -eq 'FAT32') {
+                    $usbDrives += @{
+                        DriveLetter = $logicalDisk.DeviceID
+                        Label       = $volume.FileSystemLabel
+                        Size        = [math]::Round($volume.Size / 1GB, 2)
+                        Model       = $disk.Model
+                    }
+                }
+            }
+        }
+    }
+
+    if ($usbDrives.Count -eq 0) {
+        throw "No FAT32-formatted USB drives found. Please insert a FAT32 USB drive."
+    }
+
+    if ($usbDrives.Count -eq 1) {
+        $drive = $usbDrives[0]
+        Write-Host "Found USB drive: $($drive.DriveLetter) [$($drive.Label)] ($($drive.Size) GB)" -ForegroundColor Green
+        return $drive.DriveLetter
+    }
+
+    # Multiple drives - let user choose
+    Write-Host "Multiple FAT32 USB drives found:" -ForegroundColor Yellow
+    for ($i = 0; $i -lt $usbDrives.Count; $i++) {
+        $drive = $usbDrives[$i]
+        Write-Host "  $($i + 1). $($drive.DriveLetter) [$($drive.Label)] - $($drive.Model) ($($drive.Size) GB)"
+    }
+
+    do {
+        $selection = Read-Host "Select drive (1-$($usbDrives.Count))"
+        $selectionInt = [int]$selection
+    } while ($selectionInt -lt 1 -or $selectionInt -gt $usbDrives.Count)
+
+    return $usbDrives[$selectionInt - 1].DriveLetter
 }
 
 function Get-CurrentBiosVersion {
@@ -107,7 +163,8 @@ function Get-LatestBiosInfo {
 function Install-BiosUpdate {
     param(
         [string]$DownloadUrl,
-        [string]$Version
+        [string]$Version,
+        [string]$Destination
     )
 
     # Create temp directory
@@ -154,7 +211,7 @@ function Install-BiosUpdate {
 
     # Rename and copy to destination
     $newName = "$Version.CAP"
-    $destinationPath = Join-Path $DestinationDrive $newName
+    $destinationPath = Join-Path $Destination $newName
 
     # Check if file already exists
     if (Test-Path $destinationPath) {
@@ -162,9 +219,7 @@ function Install-BiosUpdate {
         Remove-Item -Path $destinationPath -Force
     }
 
-    # Copy using binary read/write to preserve exact bytes
-    $bytes = [System.IO.File]::ReadAllBytes($capFile.FullName)
-    [System.IO.File]::WriteAllBytes($destinationPath, $bytes)
+    Copy-Item -Path $capFile.FullName -Destination $destinationPath -Force
 
     if (Test-Path $destinationPath) {
         Write-Host "`nBIOS file ready: $destinationPath" -ForegroundColor Green
@@ -223,8 +278,12 @@ try {
     Write-Host "Update available: $currentVersion -> $latestVersion" -ForegroundColor Yellow
     Write-Host ""
 
+    # Detect USB drive
+    $usbDrive = Get-UsbDrive
+    Write-Host "Target USB drive: $usbDrive`n" -ForegroundColor White
+
     # Download and prepare
-    $biosPath = Install-BiosUpdate -DownloadUrl $latestInfo.DownloadUrl -Version $latestVersion
+    $biosPath = Install-BiosUpdate -DownloadUrl $latestInfo.DownloadUrl -Version $latestVersion -Destination $usbDrive
 
     Write-Host "`n========================================" -ForegroundColor Green
     Write-Host "  BIOS Update Ready!" -ForegroundColor Green
@@ -236,7 +295,7 @@ try {
     Write-Host "  1. Restart your computer" -ForegroundColor White
     Write-Host "  2. Enter BIOS Setup (press F2 or Del during boot)" -ForegroundColor White
     Write-Host "  3. Go to Tool -> ASUS EZ Flash 3 Utility" -ForegroundColor White
-    Write-Host "  4. Select the $latestVersion.CAP file from drive C:" -ForegroundColor White
+    Write-Host "  4. Select the $latestVersion.CAP file from the USB drive" -ForegroundColor White
     Write-Host "  5. Follow the on-screen instructions" -ForegroundColor White
     Write-Host ""
     Write-Host "WARNING: Do not power off during BIOS update!" -ForegroundColor Red

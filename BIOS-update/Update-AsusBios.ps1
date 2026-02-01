@@ -394,21 +394,21 @@ try {
     Write-Host "WARNING: Do not power off during BIOS update!" -ForegroundColor Red
     Write-Host ""
 
+    # Clean up before potential restart
+    Remove-TempFiles
+
     $restartConfirm = Read-Host "Restart now to apply BIOS update? (Y/N)"
     if ($restartConfirm -eq 'Y' -or $restartConfirm -eq 'y') {
-        Write-Host "`nRestarting in 5 seconds..." -ForegroundColor Yellow
-        Start-Sleep -Seconds 5
-        Restart-Computer -Force
+        Write-Host "`nRestarting..." -ForegroundColor Yellow
+        Restart-Computer
     }
     else {
         Write-Host "`nRestart when ready to apply the BIOS update." -ForegroundColor Yellow
     }
 }
 catch {
+    Remove-TempFiles
     Write-Host "`nERROR: $_" -ForegroundColor Red
     Write-Host $_.ScriptStackTrace -ForegroundColor Gray
     exit 1
-}
-finally {
-    Remove-TempFiles
 }

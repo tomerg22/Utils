@@ -190,7 +190,7 @@ check_dependencies() {
             esac
         done
 
-        if ! apt-get update -qq && apt-get install -y -qq "${packages[@]}"; then
+        if ! (apt-get update -qq && apt-get install -y -qq "${packages[@]}"); then
             echo -e "${RED}Failed to install dependencies${NC}"
             exit 1
         fi

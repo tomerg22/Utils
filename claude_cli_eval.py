@@ -138,8 +138,11 @@ TESTS = [
             "Requirements:\n"
             "- Each valid line has the format: 'TIMESTAMP LEVEL MESSAGE'\n"
             "- TIMESTAMP has no spaces, LEVEL is one token, MESSAGE is the rest of the line\n"
+            "- TIMESTAMP should resemble a real timestamp, not arbitrary text\n"
+            "- LEVEL should be uppercase alphabetic such as INFO, WARN, ERROR, DEBUG\n"
             "- Return a list of dicts with keys: timestamp, level, message\n"
             "- Ignore malformed lines gracefully\n"
+            "- Accept leading spaces or tabs before TIMESTAMP by treating them as ignorable prefix whitespace\n"
             "- Preserve original message spacing except leading separator spaces\n"
             "- Include runnable asserts covering malformed lines\n"
             "- Briefly explain edge cases handled\n"
@@ -164,6 +167,24 @@ TESTS = [
         expected_signals=["ttl", "expire", "time", "cleanup", "assert"],
         bad_signals=["threading", "asyncio"],
         exec_mode="ttl_cache",
+    ),
+    TestCase(
+        name="rate_limiter",
+        prompt=(
+            "Implement a simple fixed-window rate limiter in Python.\n"
+            "Requirements:\n"
+            "- Class name: RateLimiter\n"
+            "- Constructor takes limit and window_seconds\n"
+            "- Method: allow(key) -> bool\n"
+            "- A key may be allowed at most `limit` times per window\n"
+            "- After the window expires, requests should be allowed again\n"
+            "- Use time.time() for current time\n"
+            "- Include runnable asserts\n"
+            "- Briefly explain tradeoffs\n"
+        ),
+        expected_signals=["window", "limit", "time", "allow", "assert"],
+        bad_signals=["threading", "asyncio"],
+        exec_mode="rate_limiter",
     ),
 ]
 
@@ -272,7 +293,9 @@ def count_asserts_in_code(code: str) -> int:
 
 def score_response_heuristic(test: TestCase, response: str) -> Dict[str, Any]:
     text = normalize(response)
-    code = best_python_code_block(response) or ""
+    code = best_python_code_block(response)
+    if code:
+        code = sanitize_candidate_code(code) or ""
 
     expected_hits = sum(1 for s in test.expected_signals if s in text)
     bad_hits = sum(1 for s in test.bad_signals if s in text)
@@ -646,23 +669,51 @@ cases = [
     (
         [
             "bad line",
+            "malformed line without level",
             "2026-01-01T10:00:02Z WARN   extra spaces kept",
             "",
             "2026-01-01T10:00:03Z DEBUG x",
+            "\t2026-01-01T10:00:04Z INFO tab-prefixed line",
+            "   2026-01-01T10:00:05Z INFO space-prefixed line",
+            None,
         ],
         [
             {{"timestamp": "2026-01-01T10:00:02Z", "level": "WARN", "message": "extra spaces kept"}},
             {{"timestamp": "2026-01-01T10:00:03Z", "level": "DEBUG", "message": "x"}},
+            {{"timestamp": "2026-01-01T10:00:04Z", "level": "INFO", "message": "tab-prefixed line"}},
+            {{"timestamp": "2026-01-01T10:00:05Z", "level": "INFO", "message": "space-prefixed line"}},
+        ],
+    ),
+    (
+        [
+            "2026-01-01 INFO missing-T-and-Z should skip",
+            "2026-01-01T10:00:06Z info lowercase-level should skip",
+            "2026-01-01T10:00:07Z WARN message   with   internal   spacing",
+        ],
+        [
+            {{"timestamp": "2026-01-01T10:00:07Z", "level": "WARN", "message": "message   with   internal   spacing"}},
         ],
     ),
 ]
+
+def _normalize(records):
+    assert isinstance(records, list), f"expected list, got {{type(records).__name__}}"
+    out = []
+    for i, rec in enumerate(records):
+        assert isinstance(rec, dict), f"record {{i}} is not a dict: {{type(rec).__name__}}"
+        out.append({{
+            "timestamp": rec.get("timestamp"),
+            "level": rec.get("level"),
+            "message": rec.get("message"),
+        }})
+    return out
 
 passed = 0
 failures = []
 
 for idx, (lines, expected) in enumerate(cases):
     try:
-        got = fn(lines)
+        got = _normalize(fn(lines))
         assert got == expected, f"expected {{expected}}, got {{got}}"
         passed += 1
     except Exception as e:
@@ -675,7 +726,6 @@ print(json.dumps({{
     "failures": failures
 }}))
 """
-
 
 def build_ttl_cache_harness(candidate_code: str) -> str:
     return f"""
@@ -751,6 +801,92 @@ print(json.dumps({{
 """
 
 
+def build_rate_limiter_harness(candidate_code: str) -> str:
+    return f"""
+import json
+
+{candidate_code}
+
+def _find_class():
+    obj = globals().get("RateLimiter")
+    if isinstance(obj, type):
+        return "RateLimiter", obj
+    for name, obj in globals().items():
+        if isinstance(obj, type) and "rate" in name.lower() and "limit" in name.lower():
+            return name, obj
+    for name, obj in globals().items():
+        if isinstance(obj, type) and not name.startswith("_"):
+            return name, obj
+    raise RuntimeError("No RateLimiter class found")
+
+name, RateLimiter = _find_class()
+
+passed = 0
+failures = []
+
+try:
+    fake_now = [1000.0]
+    _orig_time = __import__("time").time
+    __import__("time").time = lambda: fake_now[0]
+    try:
+        rl = RateLimiter(limit=2, window_seconds=10)
+
+        assert rl.allow("a") is True
+        assert rl.allow("a") is True
+        assert rl.allow("a") is False
+
+        passed += 1
+    finally:
+        __import__("time").time = _orig_time
+except Exception as e:
+    failures.append({{"case_index": 0, "error": str(e)}})
+
+try:
+    fake_now = [2000.0]
+    _orig_time = __import__("time").time
+    __import__("time").time = lambda: fake_now[0]
+    try:
+        rl = RateLimiter(limit=2, window_seconds=5)
+
+        assert rl.allow("x") is True
+        assert rl.allow("x") is True
+        assert rl.allow("x") is False
+
+        fake_now[0] = 2005.1
+        assert rl.allow("x") is True
+
+        passed += 1
+    finally:
+        __import__("time").time = _orig_time
+except Exception as e:
+    failures.append({{"case_index": 1, "error": str(e)}})
+
+try:
+    fake_now = [3000.0]
+    _orig_time = __import__("time").time
+    __import__("time").time = lambda: fake_now[0]
+    try:
+        rl = RateLimiter(limit=1, window_seconds=10)
+
+        assert rl.allow("u1") is True
+        assert rl.allow("u1") is False
+        assert rl.allow("u2") is True
+        assert rl.allow("u2") is False
+
+        passed += 1
+    finally:
+        __import__("time").time = _orig_time
+except Exception as e:
+    failures.append({{"case_index": 2, "error": str(e)}})
+
+print(json.dumps({{
+    "passed": passed,
+    "total": 3,
+    "class": name,
+    "failures": failures
+}}))
+"""
+
 def build_exec_harness(exec_mode: str, candidate_code: str) -> str:
     if exec_mode == "interval_merge":
         return build_interval_merge_harness(candidate_code)
@@ -764,6 +900,8 @@ def build_exec_harness(exec_mode: str, candidate_code: str) -> str:
         return build_log_parser_harness(candidate_code)
     if exec_mode == "ttl_cache":
         return build_ttl_cache_harness(candidate_code)
+    if exec_mode == "rate_limiter":
+        return build_rate_limiter_harness(candidate_code)
     raise ValueError(f"Unknown exec_mode: {exec_mode}")
 
 
@@ -771,6 +909,22 @@ def build_exec_harness(exec_mode: str, candidate_code: str) -> str:
 # Execution scoring
 # ----------------------------
 
+
+
+def sanitize_candidate_code(code: str) -> str:
+    lines = code.splitlines()
+    future_lines = []
+    other_lines = []
+
+    for line in lines:
+        if line.strip().startswith("from __future__ import "):
+            future_lines.append(line)
+        else:
+            other_lines.append(line)
+
+    if future_lines:
+        return "\n".join(future_lines + [""] + other_lines)
+    return code
 def score_response_execution(test: TestCase, response: str) -> Dict[str, Any]:
     code = best_python_code_block(response)
     if not code:

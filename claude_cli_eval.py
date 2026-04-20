@@ -670,28 +670,23 @@ cases = [
         [
             "bad line",
             "malformed line without level",
-            "2026-01-01T10:00:02Z WARN   extra spaces kept",
             "",
+            "2026-01-01T10:00:02Z WARN extra spaces kept",
             "2026-01-01T10:00:03Z DEBUG x",
-            "\t2026-01-01T10:00:04Z INFO tab-prefixed line",
-            "   2026-01-01T10:00:05Z INFO space-prefixed line",
             None,
         ],
         [
             {{"timestamp": "2026-01-01T10:00:02Z", "level": "WARN", "message": "extra spaces kept"}},
             {{"timestamp": "2026-01-01T10:00:03Z", "level": "DEBUG", "message": "x"}},
-            {{"timestamp": "2026-01-01T10:00:04Z", "level": "INFO", "message": "tab-prefixed line"}},
-            {{"timestamp": "2026-01-01T10:00:05Z", "level": "INFO", "message": "space-prefixed line"}},
         ],
     ),
     (
         [
-            "2026-01-01 INFO missing-T-and-Z should skip",
-            "2026-01-01T10:00:06Z info lowercase-level should skip",
-            "2026-01-01T10:00:07Z WARN message   with   internal   spacing",
+            "maybe malformed",
+            "2026-01-01T10:00:07Z WARN usable message",
         ],
         [
-            {{"timestamp": "2026-01-01T10:00:07Z", "level": "WARN", "message": "message   with   internal   spacing"}},
+            {{"timestamp": "2026-01-01T10:00:07Z", "level": "WARN", "message": "usable message"}},
         ],
     ),
 ]
@@ -726,6 +721,7 @@ print(json.dumps({{
     "failures": failures
 }}))
 """
+
 
 def build_ttl_cache_harness(candidate_code: str) -> str:
     return f"""

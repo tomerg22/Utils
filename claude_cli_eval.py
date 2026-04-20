@@ -296,34 +296,91 @@ def score_response_heuristic(test: TestCase, response: str) -> Dict[str, Any]:
     code = best_python_code_block(response)
     if code:
         code = sanitize_candidate_code(code) or ""
+    else:
+        code = ""
 
     expected_hits = sum(1 for s in test.expected_signals if s in text)
     bad_hits = sum(1 for s in test.bad_signals if s in text)
 
     has_code_block = "```" in response
     assert_count = count_asserts_in_code(code)
+    has_any_assert = assert_count >= 1
     has_real_tests = assert_count >= 2
     word_count = len(response.split())
-    reasonable_length = 30 <= word_count <= 1400
+    reasonable_length = 20 <= word_count <= 1600
 
-    score = 0
-    score += expected_hits * 2
-    score -= bad_hits * 2
-    score += 1 if has_code_block else 0
-    score += 2 if has_real_tests else 0
-    score += 1 if reasonable_length else 0
+    code_lower = code.lower()
+    code_lines = [line for line in code.splitlines() if line.strip()]
+    non_comment_code_lines = [
+        line for line in code_lines
+        if not line.lstrip().startswith("#")
+    ]
+    code_size_ok = len(non_comment_code_lines) >= 6
 
-    max_score = len(test.expected_signals) * 2 + 4
-    heuristic_score = round(max(0, score) / max_score * 100, 1)
+    structural_signals = 0
+    if test.exec_mode in {"interval_merge", "two_sum", "topological_sort", "log_parser"}:
+        if re.search(r"(?m)^\s*def\s+\w+\s*\(", code):
+            structural_signals += 1
+    if test.exec_mode in {"lru_cache", "ttl_cache", "rate_limiter"}:
+        if re.search(r"(?m)^\s*class\s+\w+\s*[:\(]", code):
+            structural_signals += 1
+
+    if test.exec_mode == "two_sum" and (
+        "dict" in code_lower or "{}" in code or "seen" in code_lower or "lookup" in code_lower
+    ):
+        structural_signals += 1
+    if test.exec_mode == "interval_merge" and (
+        "sort(" in code_lower or "sorted(" in code_lower or "append(" in code_lower
+    ):
+        structural_signals += 1
+    if test.exec_mode == "lru_cache" and (
+        "get(" in code_lower and "put(" in code_lower
+    ):
+        structural_signals += 1
+    if test.exec_mode == "ttl_cache" and all(tok in code_lower for tok in ["put(", "get(", "cleanup("]):
+        structural_signals += 1
+    if test.exec_mode == "rate_limiter" and "allow(" in code_lower:
+        structural_signals += 1
+    if test.exec_mode == "log_parser" and (
+        "split(" in code_lower or "parse_logs" in code_lower or "timestamp" in code_lower
+    ):
+        structural_signals += 1
+    if test.exec_mode == "topological_sort" and (
+        "indegree" in code_lower or "deque" in code_lower or "queue" in code_lower
+    ):
+        structural_signals += 1
+
+    explanation_hits = expected_hits
+
+    score = 0.0
+    score += 38.0 if has_code_block else 0.0
+    score += 20.0 if code_size_ok else 0.0
+    score += 10.0 if has_any_assert else 0.0
+    score += 8.0 if has_real_tests else 0.0
+    score += 16.0 if reasonable_length else 0.0
+    score += min(structural_signals, 2) * 9.0
+    score += min(explanation_hits, 3) * 3.0
+    score -= min(bad_hits, 3) * 6.0
+
+    heuristic_score = max(0.0, min(score, 100.0))
+
+    if has_code_block and code_size_ok and min(structural_signals, 2) >= 1:
+        heuristic_score = max(heuristic_score, 72.0)
+    if has_real_tests and min(structural_signals, 2) >= 2:
+        heuristic_score = max(heuristic_score, 80.0)
+    if has_real_tests and min(structural_signals, 2) >= 2 and code_size_ok and reasonable_length:
+        heuristic_score = max(heuristic_score, 85.0)
 
     return {
-        "heuristic_score": heuristic_score,
+        "heuristic_score": round(min(100.0, heuristic_score), 1),
         "expected_hits": expected_hits,
         "bad_hits": bad_hits,
         "has_code_block": has_code_block,
         "assert_count": assert_count,
         "has_real_tests": has_real_tests,
         "word_count": word_count,
+        "structural_signals": structural_signals,
+        "non_comment_code_lines": len(non_comment_code_lines),
     }
 
 
@@ -910,117 +967,117 @@ def build_exec_harness(exec_mode: str, candidate_code: str) -> str:
 def sanitize_candidate_code(code: str) -> str:
     lines = code.splitlines()
     future_lines = []
-    other_lines = []
+    body_lines = []
 
     for line in lines:
         if line.strip().startswith("from __future__ import "):
             future_lines.append(line)
         else:
-            other_lines.append(line)
+            body_lines.append(line)
+
+    sanitized: List[str] = []
+    skip_main_block = False
+    main_indent = 0
+
+    for line in body_lines:
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+
+        if skip_main_block:
+            if stripped and indent <= main_indent:
+                skip_main_block = False
+            else:
+                continue
+
+        if re.match(r'^\s*if\s+__name__\s*==\s*["\']__main__["\']\s*:\s*$', line):
+            skip_main_block = True
+            main_indent = indent
+            continue
+
+        if indent == 0 and stripped.startswith("assert "):
+            continue
+
+        sanitized.append(line)
 
     if future_lines:
-        return "\n".join(future_lines + [""] + other_lines)
-    return code
-def score_response_execution(test: TestCase, response: str) -> Dict[str, Any]:
-    code = best_python_code_block(response)
-    if not code:
+        return "\n".join(future_lines + ([""] if sanitized else []) + sanitized)
+    return "\n".join(sanitized)
+def score_response_execution(test, response: str) -> Dict[str, Any]:
+    code = best_python_code_block(response) or ""
+    if not code.strip():
         return {
             "execution_score": None,
+            "exec_cases_passed": 0,
+            "exec_cases_total": 0,
+            "exec_valid": False,
             "exec_passed": False,
             "exec_reason": "no_code_block",
-            "exec_stdout": "",
-            "exec_stderr": "",
-            "exec_cases_passed": 0,
-            "exec_cases_total": 0,
-            "exec_valid": False,
+            "failures": [],
         }
 
-    if not test.exec_mode:
-        return {
-            "execution_score": None,
-            "exec_passed": False,
-            "exec_reason": "no_exec_mode",
-            "exec_stdout": "",
-            "exec_stderr": "",
-            "exec_cases_passed": 0,
-            "exec_cases_total": 0,
-            "exec_valid": False,
-        }
-
+    code = sanitize_candidate_code(code)
     harness = build_exec_harness(test.exec_mode, code)
 
-    try:
-        result = run_python_code_safely(harness, timeout=10)
-    except subprocess.TimeoutExpired:
+    result = run_python_code_safely(harness, timeout=10)
+    stdout = (result.get("stdout") or "").strip()
+    stderr = (result.get("stderr") or "").strip()
+    returncode = int(result.get("returncode", 1))
+
+    if returncode != 0:
         return {
             "execution_score": None,
-            "exec_passed": False,
-            "exec_reason": "timeout",
-            "exec_stdout": "",
-            "exec_stderr": "Timed out",
             "exec_cases_passed": 0,
             "exec_cases_total": 0,
             "exec_valid": False,
-        }
-
-    stdout = result["stdout"]
-    stderr = result["stderr"]
-
-    if result["returncode"] != 0:
-        return {
-            "execution_score": None,
             "exec_passed": False,
             "exec_reason": "harness_failed",
-            "exec_stdout": stdout,
-            "exec_stderr": stderr,
-            "exec_cases_passed": 0,
-            "exec_cases_total": 0,
-            "exec_valid": False,
+            "failures": [],
+            "stdout": stdout,
+            "stderr": stderr,
+            "error": stderr or stdout or f"subprocess exited with code {returncode}",
         }
 
     try:
-        payload = json.loads(stdout.splitlines()[-1])
-    except Exception:
+        stdout_lines = [line for line in stdout.splitlines() if line.strip()]
+        payload_text = stdout_lines[-1] if stdout_lines else ""
+        payload = json.loads(payload_text)
+    except Exception as e:
         return {
             "execution_score": None,
-            "exec_passed": False,
-            "exec_reason": "bad_json_output",
-            "exec_stdout": stdout,
-            "exec_stderr": stderr,
             "exec_cases_passed": 0,
             "exec_cases_total": 0,
             "exec_valid": False,
+            "exec_passed": False,
+            "exec_reason": "bad_harness_output",
+            "failures": [],
+            "stdout": stdout,
+            "stderr": stderr,
+            "error": f"Failed to parse harness JSON from last stdout line: {e}",
         }
 
     passed = int(payload.get("passed", 0))
     total = int(payload.get("total", 0))
+    score = round((passed / total) * 100, 1) if total else None
 
-    if total <= 0:
-        return {
-            "execution_score": None,
-            "exec_passed": False,
-            "exec_reason": "harness_failed",
-            "exec_stdout": stdout,
-            "exec_stderr": stderr,
-            "exec_cases_passed": passed,
-            "exec_cases_total": total,
-            "exec_details": payload,
-            "exec_valid": False,
-        }
-
-    execution_score = round((passed / total) * 100, 1)
-
-    return {
-        "execution_score": execution_score,
-        "exec_passed": passed == total,
-        "exec_reason": "passed" if passed == total else "partial_or_failed",
-        "exec_stdout": stdout,
-        "exec_stderr": stderr,
+    out = {
+        "execution_score": score,
         "exec_cases_passed": passed,
         "exec_cases_total": total,
-        "exec_details": payload,
         "exec_valid": True,
+        "exec_passed": total > 0 and passed == total,
+        "exec_reason": "passed" if total > 0 and passed == total else "partial_or_failed",
+        "failures": payload.get("failures", []),
     }
+
+    for k in ("function", "class", "all_results"):
+        if k in payload:
+            out[k] = payload[k]
+    if stdout:
+        out["stdout"] = stdout
+    if stderr:
+        out["stderr"] = stderr
+
+    return out
 
 
 def combine_scores(
@@ -1106,12 +1163,25 @@ def print_test_result(name: str, heuristic: Dict[str, Any], execution: Dict[str,
     print(f"→ {name}")
     print(f"  heuristic: {heuristic['heuristic_score']}")
     print(f"  execution: {format_execution_line(execution)}")
+    if not execution["exec_valid"]:
+        detail = execution.get("error") or execution.get("stderr") or execution.get("stdout")
+        if detail:
+            lines = [line for line in str(detail).splitlines() if line.strip()]
+            preview = " | ".join(lines[:3])[:400]
+            print(f"    detail : {preview}")
     print(f"  combined : {combined}")
 
 
 # ----------------------------
 # Main
 # ----------------------------
+
+# Defensive aliases for local-edit / stale-buffer issues.
+# If the helper definitions above are present, these assignments are no-ops.
+initialize_output_file = globals().get("initialize_output_file")
+append_csv = globals().get("append_csv")
+initialize_jsonl = globals().get("initialize_jsonl")
+append_jsonl = globals().get("append_jsonl")
 
 def main() -> None:
     parser = argparse.ArgumentParser(

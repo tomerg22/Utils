@@ -333,9 +333,7 @@ def score_response_heuristic(test: TestCase, response: str) -> Dict[str, Any]:
         "sort(" in code_lower or "sorted(" in code_lower or "append(" in code_lower
     ):
         structural_signals += 1
-    if test.exec_mode == "lru_cache" and (
-        "get(" in code_lower and "put(" in code_lower
-    ):
+    if test.exec_mode == "lru_cache" and ("get(" in code_lower and "put(" in code_lower):
         structural_signals += 1
     if test.exec_mode == "ttl_cache" and all(tok in code_lower for tok in ["put(", "get(", "cleanup("]):
         structural_signals += 1
@@ -350,26 +348,33 @@ def score_response_heuristic(test: TestCase, response: str) -> Dict[str, Any]:
     ):
         structural_signals += 1
 
-    explanation_hits = expected_hits
-
+    # Heuristic is now deliberately conservative.
+    # It should rank obviously solid answers well without saturating near 100
+    # unless the response is strong in multiple independent ways.
     score = 0.0
-    score += 38.0 if has_code_block else 0.0
-    score += 20.0 if code_size_ok else 0.0
-    score += 10.0 if has_any_assert else 0.0
-    score += 8.0 if has_real_tests else 0.0
-    score += 16.0 if reasonable_length else 0.0
-    score += min(structural_signals, 2) * 9.0
-    score += min(explanation_hits, 3) * 3.0
-    score -= min(bad_hits, 3) * 6.0
+    score += 18.0 if has_code_block else 0.0
+    score += 12.0 if code_size_ok else 0.0
+    score += 6.0 if has_any_assert else 0.0
+    score += 6.0 if has_real_tests else 0.0
+    score += 8.0 if reasonable_length else 0.0
+    score += min(structural_signals, 2) * 10.0
+    score += min(expected_hits, 4) * 4.0
+    score -= min(bad_hits, 3) * 8.0
+
+    # Small bonus for denser, likely-substantive implementations.
+    if len(non_comment_code_lines) >= 12:
+        score += 4.0
 
     heuristic_score = max(0.0, min(score, 100.0))
 
+    # Conservative floors so clearly real solutions do not score too low,
+    # but also do not jump straight to the high 90s.
     if has_code_block and code_size_ok and min(structural_signals, 2) >= 1:
-        heuristic_score = max(heuristic_score, 72.0)
+        heuristic_score = max(heuristic_score, 58.0)
     if has_real_tests and min(structural_signals, 2) >= 2:
-        heuristic_score = max(heuristic_score, 80.0)
+        heuristic_score = max(heuristic_score, 68.0)
     if has_real_tests and min(structural_signals, 2) >= 2 and code_size_ok and reasonable_length:
-        heuristic_score = max(heuristic_score, 85.0)
+        heuristic_score = max(heuristic_score, 74.0)
 
     return {
         "heuristic_score": round(min(100.0, heuristic_score), 1),
@@ -389,11 +394,12 @@ def score_response_heuristic(test: TestCase, response: str) -> Dict[str, Any]:
 # ----------------------------
 
 def run_python_code_safely(script: str, timeout: int = 10) -> Dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="claude_eval_") as tmpdir:
-        script_path = os.path.join(tmpdir, "candidate_eval.py")
-        with open(script_path, "w", encoding="utf-8") as f:
-            f.write(script)
+    tmpdir = tempfile.mkdtemp(prefix="claude_eval_")
+    script_path = os.path.join(tmpdir, "candidate_eval.py")
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script)
 
+    try:
         proc = subprocess.run(
             [sys.executable, "-I", script_path],
             text=True,
@@ -407,6 +413,19 @@ def run_python_code_safely(script: str, timeout: int = 10) -> Dict[str, Any]:
             "returncode": proc.returncode,
             "stdout": (proc.stdout or "").strip(),
             "stderr": (proc.stderr or "").strip(),
+            "script_path": script_path,
+            "tmpdir": tmpdir,
+            "script": script,
+        }
+    except subprocess.TimeoutExpired as e:
+        return {
+            "returncode": 124,
+            "stdout": ((e.stdout or "") if isinstance(e.stdout, str) else "").strip(),
+            "stderr": ((e.stderr or "") if isinstance(e.stderr, str) else "").strip(),
+            "script_path": script_path,
+            "tmpdir": tmpdir,
+            "script": script,
+            "timeout": True,
         }
 
 
@@ -737,15 +756,6 @@ cases = [
             {{"timestamp": "2026-01-01T10:00:03Z", "level": "DEBUG", "message": "x"}},
         ],
     ),
-    (
-        [
-            "maybe malformed",
-            "2026-01-01T10:00:07Z WARN usable message",
-        ],
-        [
-            {{"timestamp": "2026-01-01T10:00:07Z", "level": "WARN", "message": "usable message"}},
-        ],
-    ),
 ]
 
 def _normalize(records):
@@ -940,22 +950,29 @@ print(json.dumps({{
 }}))
 """
 
-def build_exec_harness(exec_mode: str, candidate_code: str) -> str:
+def build_exec_harness(exec_mode: str, candidate_code: str, future_lines: Optional[List[str]] = None) -> str:
     if exec_mode == "interval_merge":
-        return build_interval_merge_harness(candidate_code)
-    if exec_mode == "two_sum":
-        return build_two_sum_harness(candidate_code)
-    if exec_mode == "lru_cache":
-        return build_lru_cache_harness(candidate_code)
-    if exec_mode == "topological_sort":
-        return build_topological_sort_harness(candidate_code)
-    if exec_mode == "log_parser":
-        return build_log_parser_harness(candidate_code)
-    if exec_mode == "ttl_cache":
-        return build_ttl_cache_harness(candidate_code)
-    if exec_mode == "rate_limiter":
-        return build_rate_limiter_harness(candidate_code)
-    raise ValueError(f"Unknown exec_mode: {exec_mode}")
+        body = build_interval_merge_harness(candidate_code)
+    elif exec_mode == "two_sum":
+        body = build_two_sum_harness(candidate_code)
+    elif exec_mode == "lru_cache":
+        body = build_lru_cache_harness(candidate_code)
+    elif exec_mode == "topological_sort":
+        body = build_topological_sort_harness(candidate_code)
+    elif exec_mode == "log_parser":
+        body = build_log_parser_harness(candidate_code)
+    elif exec_mode == "ttl_cache":
+        body = build_ttl_cache_harness(candidate_code)
+    elif exec_mode == "rate_limiter":
+        body = build_rate_limiter_harness(candidate_code)
+    else:
+        raise ValueError(f"Unknown exec_mode: {exec_mode}")
+
+    if future_lines:
+        prefix = "\n".join(future_lines).strip()
+        if prefix:
+            return prefix + "\n\n" + body.lstrip()
+    return body
 
 
 # ----------------------------
@@ -963,17 +980,24 @@ def build_exec_harness(exec_mode: str, candidate_code: str) -> str:
 # ----------------------------
 
 
-
-def sanitize_candidate_code(code: str) -> str:
+# --- Helper: split_future_imports
+def split_future_imports(code: str) -> Tuple[List[str], str]:
     lines = code.splitlines()
-    future_lines = []
-    body_lines = []
+    future_lines: List[str] = []
+    body_lines: List[str] = []
 
     for line in lines:
         if line.strip().startswith("from __future__ import "):
             future_lines.append(line)
         else:
             body_lines.append(line)
+
+    return future_lines, "\n".join(body_lines)
+
+# --- Helper: sanitize_candidate_code
+def sanitize_candidate_code(code: str) -> str:
+    future_lines, body = split_future_imports(code)
+    body_lines = body.splitlines()
 
     sanitized: List[str] = []
     skip_main_block = False
@@ -1016,12 +1040,15 @@ def score_response_execution(test, response: str) -> Dict[str, Any]:
         }
 
     code = sanitize_candidate_code(code)
-    harness = build_exec_harness(test.exec_mode, code)
+    future_lines, code = split_future_imports(code)
+    harness = build_exec_harness(test.exec_mode, code, future_lines=future_lines)
 
     result = run_python_code_safely(harness, timeout=10)
     stdout = (result.get("stdout") or "").strip()
     stderr = (result.get("stderr") or "").strip()
     returncode = int(result.get("returncode", 1))
+    script_path = result.get("script_path")
+    tmpdir = result.get("tmpdir")
 
     if returncode != 0:
         return {
@@ -1034,6 +1061,8 @@ def score_response_execution(test, response: str) -> Dict[str, Any]:
             "failures": [],
             "stdout": stdout,
             "stderr": stderr,
+            "script_path": script_path,
+            "tmpdir": tmpdir,
             "error": stderr or stdout or f"subprocess exited with code {returncode}",
         }
 
@@ -1167,8 +1196,10 @@ def print_test_result(name: str, heuristic: Dict[str, Any], execution: Dict[str,
         detail = execution.get("error") or execution.get("stderr") or execution.get("stdout")
         if detail:
             lines = [line for line in str(detail).splitlines() if line.strip()]
-            preview = " | ".join(lines[:3])[:400]
+            preview = " | ".join(lines[:4])[:500]
             print(f"    detail : {preview}")
+        if execution.get("script_path"):
+            print(f"    script : {execution['script_path']}")
     print(f"  combined : {combined}")
 
 

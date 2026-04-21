@@ -1,0 +1,25 @@
+name: log_parser
+difficulty: hard
+entry_point: parse_logs
+weight: 1.0
+prompt: |
+  Write a Python function `parse_logs(lines)` that parses application log lines and returns a tuple
+  `(entries, malformed_count)`.
+  Rules:
+  - Each valid line: `TIMESTAMP LEVEL MESSAGE`.
+  - LEVEL is one of DEBUG, INFO, WARN, ERROR (uppercase, exact).
+  - TIMESTAMP is a single non-whitespace token, must be non-empty.
+  - MESSAGE is the remainder of the line after the single space separating it from LEVEL. Preserve interior whitespace exactly as-is.
+  - Strip leading whitespace from each line before parsing.
+  - A line is malformed if: fewer than 3 fields after the leading-ws strip, or unknown LEVEL, or empty TIMESTAMP, or empty MESSAGE after the level.
+  - Malformed lines are counted (not included in entries).
+  - Completely empty lines (after strip) are NOT counted as malformed — they're silently skipped.
+  - Return `(entries: list[dict with timestamp,level,message], malformed_count: int)`.
+  - Briefly explain the malformed-vs-empty distinction and how you preserve interior message whitespace.
+  Respond with a single Python code block followed by a short explanation.
+reasoning_rubric:
+  - empty_lines_skipped_not_counted_malformed
+  - malformed_counter_returned_separately
+  - level_whitelist_exact_match
+  - interior_message_whitespace_preserved
+  - leading_whitespace_stripped

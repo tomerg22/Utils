@@ -1,0 +1,22 @@
+name: dijkstra_neg_detect
+difficulty: hard
+entry_point: shortest_paths
+weight: 1.5
+prompt: |
+  Write a Python function `shortest_paths(n: int, edges: list[tuple[int, int, int]], source: int) -> list[float]`.
+  - `n` is the number of nodes (0-indexed, 0..n-1).
+  - `edges` is a list of directed edges `(u, v, weight)`. Weights are INTEGERS and may be negative.
+  - Return a list of shortest-path distances from `source` to each node. Unreachable nodes get `float('inf')`.
+  - Use Dijkstra's algorithm with a binary heap (heapq) for non-negative graphs. MUST run in O((V+E) log V) on non-negative graphs.
+  - If ANY edge has negative weight, RAISE ValueError. Do NOT silently fall back to Bellman-Ford.
+  - Invalid source (source < 0 or source >= n) raises IndexError.
+  - Empty graph (n=0) raises ValueError.
+  - Each node's distance to itself is 0 when reachable.
+  - Explicitly explain: why Dijkstra fails on negative edges, why you validate up front rather than detect during relaxation, and the heap's role in complexity.
+  Respond with a single Python code block followed by a short explanation.
+reasoning_rubric:
+  - heapq_or_priority_queue_named
+  - o_v_plus_e_log_v_complexity_stated
+  - dijkstra_fails_on_negative_edges_explained
+  - upfront_negative_edge_check_before_main_loop
+  - unreachable_node_returns_inf_mentioned

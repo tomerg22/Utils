@@ -1,0 +1,24 @@
+name: expression_evaluator
+difficulty: hard
+entry_point: evaluate_expression
+weight: 1.5
+prompt: |
+  Write a Python function `evaluate_expression(expr: str) -> float` that evaluates an arithmetic expression
+  containing only these tokens: integers (no floats), whitespace, the binary operators `+ - * /`, parentheses `(` `)`,
+  and UNARY minus.
+  Rules:
+  - Standard precedence: `*` and `/` bind tighter than `+` and `-`. Left-associative.
+  - Unary minus binds tighter than any binary operator, so `-3*2` == -6 and `-(3+2)` == -5.
+  - Division is TRUE division (returns float).
+  - Division by zero raises ZeroDivisionError.
+  - Malformed input (mismatched parens, two operators in a row that aren't a unary-minus chain, trailing operator, empty string) raises ValueError.
+  - Do NOT use `eval`, `exec`, `compile`, `ast.literal_eval`, or any expression parser from the stdlib. Implement parsing yourself.
+  - The function must be pure (no globals, no side effects).
+  Briefly explain your parser approach (recursive descent or shunting yard) and how you handle unary minus specifically.
+  Respond with a single Python code block followed by a short explanation.
+reasoning_rubric:
+  - no_builtin_eval_used
+  - unary_minus_precedence_explicit
+  - operator_precedence_correct
+  - paren_mismatch_raises_valueerror
+  - parser_approach_named_rd_or_shunting_yard

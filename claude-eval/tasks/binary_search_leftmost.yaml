@@ -1,0 +1,18 @@
+name: binary_search_leftmost
+difficulty: easy
+entry_point: leftmost_binary_search
+weight: 1.0
+prompt: |
+  Write a Python function `leftmost_binary_search(arr, target)`.
+  - `arr` is a sorted list (non-decreasing) of integers.
+  - Return the index of the leftmost occurrence of `target` if present, else -1.
+  - Must run in O(log n) time — no linear scan.
+  - Handle empty arrays, single-element arrays, and duplicates.
+  - Briefly explain why the standard `bisect_left` approach is safe for duplicates.
+  Respond with a single Python code block followed by a short explanation.
+reasoning_rubric:
+  - o_log_n_maintained_with_duplicates
+  - lo_hi_invariant_explained
+  - empty_array_edge_case
+  - duplicates_handled_correctly
+  - integer_overflow_or_mid_computation_noted

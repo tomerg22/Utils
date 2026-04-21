@@ -1,0 +1,25 @@
+name: bugfix_two_sum
+difficulty: easy
+entry_point: two_sum
+weight: 1.0
+prompt: |
+  The following Python function is buggy. Fix it and explain the bug(s).
+
+      def two_sum(nums, target):
+          for i in range(len(nums)):
+              for j in range(i+1, len(nums)):
+                  if nums[i] + nums[j] == target:
+                      return i
+
+  Requirements for the fixed version named `two_sum(nums, target)`:
+  - Return a pair of indices (tuple or list of two ints) if a solution exists.
+  - Return None if no pair sums to target.
+  - Prefer an O(n) solution using a hash map.
+  - Briefly explain the original bug and why the new version is better.
+  Respond with a single Python code block followed by a short explanation.
+reasoning_rubric:
+  - original_returns_only_one_index_noted
+  - missing_no_solution_case_noted
+  - hash_map_single_pass_explained
+  - complexity_improvement_o_n_stated
+  - index_uniqueness_i_ne_j_preserved

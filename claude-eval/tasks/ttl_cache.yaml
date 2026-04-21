@@ -1,0 +1,21 @@
+name: ttl_cache
+difficulty: hard
+entry_point: TTLCache
+weight: 1.0
+prompt: |
+  Implement a Python class `TTLCache` with these exact methods:
+  - `TTLCache(default_ttl_seconds)`.
+  - `put(key, value, ttl=None)` — ttl=None means use default. ttl=0 means expire immediately (get returns None right away). Negative ttl must raise ValueError.
+  - `get(key)` — returns value if not expired, else None. Does NOT extend the TTL.
+  - `get_with_ttl(key)` — returns (value, remaining_seconds_as_float) if not expired, else None. remaining_seconds may be <= 0 only if the key is about to be swept.
+  - `cleanup()` — returns the number of expired keys it removed.
+  - `size()` — number of keys currently stored (including any lazily-expired not yet cleaned).
+  - Use `time.time()` as the clock.
+  - Briefly discuss lazy vs eager expiration and how your approach bounds memory.
+  Respond with a single Python code block followed by a short explanation.
+reasoning_rubric:
+  - time_time_used_for_clock
+  - negative_ttl_raises_valueerror
+  - ttl_zero_expires_immediately
+  - get_does_not_extend_ttl
+  - cleanup_returns_count_and_is_eager

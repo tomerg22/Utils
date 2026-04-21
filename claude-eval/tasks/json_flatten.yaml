@@ -1,0 +1,26 @@
+name: json_flatten
+difficulty: hard
+entry_point: flatten_json
+weight: 1.0
+prompt: |
+  Write TWO Python functions:
+    1. `flatten_json(data, sep=".")` — flatten a nested dict as described below.
+    2. `unflatten_json(flat, sep=".")` — the inverse. `flatten_json` composed with `unflatten_json` must round-trip for valid inputs.
+  Rules for flatten_json:
+  - Nested dict keys become parent+sep+child.
+  - List elements become parent+sep+INDEX where INDEX is the integer index as string.
+  - Primitives (str, int, float, bool, None) are leaves.
+  - Empty dicts {} and empty lists [] are preserved as a single leaf with the path — i.e. `{"a": {}}` → `{"a": {}}` and `{"b": []}` → `{"b": []}`. This is a deliberate design choice so round-tripping works.
+  - If a nested key contains the separator, raise ValueError.
+  Rules for unflatten_json:
+  - Given the flat dict, reconstruct the original nested structure.
+  - Index keys like "0", "1" reconstruct lists; string non-integer keys reconstruct dicts.
+  - Raise ValueError on ambiguous inputs (e.g. same path has both list and dict children).
+  Briefly explain how round-tripping works and why empty containers are preserved as leaves.
+  Respond with a single Python code block followed by a short explanation.
+reasoning_rubric:
+  - round_trip_invariant_preserved
+  - empty_containers_preserved_as_leaves
+  - separator_in_key_raises_valueerror
+  - list_vs_dict_detection_via_integer_keys
+  - recursive_or_stack_based_approach_named

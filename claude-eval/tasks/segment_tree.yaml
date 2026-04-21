@@ -1,0 +1,24 @@
+name: segment_tree
+difficulty: hard
+entry_point: SegmentTree
+weight: 1.5
+prompt: |
+  Implement a Python class `SegmentTree` supporting range-sum queries AND range-add updates
+  using LAZY PROPAGATION. All operations must be O(log n).
+  Interface:
+  - `SegmentTree(arr: list[int])` — build from initial array (may be empty).
+  - `update(lo: int, hi: int, delta: int)` — add `delta` to every element in the inclusive range [lo, hi].
+  - `query(lo: int, hi: int) -> int` — return the sum of elements in the inclusive range [lo, hi].
+  - `point_set(idx: int, value: int)` — set a single element to `value` (must coexist correctly with lazy ranges).
+  Constraints:
+  - Out-of-range indices (negative, or >= len) must raise IndexError.
+  - Empty array: `update` and `query` with any range raise IndexError (no valid range exists).
+  - Must use lazy propagation correctly; do not recompute the whole tree on every update.
+  Briefly explain: lazy propagation invariant, push-down direction, and how `point_set` interacts with pending lazy values on the path.
+  Respond with a single Python code block followed by a short explanation.
+reasoning_rubric:
+  - lazy_propagation_invariant_stated
+  - push_down_before_recurse_explained
+  - range_update_does_not_touch_all_leaves
+  - point_set_pushes_down_pending_lazy
+  - o_log_n_complexity_justified

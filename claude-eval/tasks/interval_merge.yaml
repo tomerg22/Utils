@@ -1,0 +1,18 @@
+name: interval_merge
+difficulty: medium
+entry_point: merge_intervals
+weight: 1.0
+prompt: |
+  Write a Python function `merge_intervals(intervals)` that merges overlapping intervals.
+  - Input: list of (start, end) tuples, integers.
+  - Return: list of merged (start, end) tuples, sorted by start.
+  - Intervals that merely touch (e.g. (1,4) and (4,5)) should be merged.
+  - Handle empty input.
+  - Briefly explain your approach and edge cases.
+  Respond with a single Python code block followed by a short explanation.
+reasoning_rubric:
+  - empty_input_handled
+  - touching_intervals_merged_explicitly
+  - sort_before_merge_explained
+  - complexity_stated
+  - single_interval_edge_case

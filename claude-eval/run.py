@@ -219,6 +219,148 @@ def write_iteration_report(summary: dict):
             lines.append(f"- {n}: stdev={d['stdev_combined']:.1f}")
 
     (REPORTS_DIR / f"iteration_{summary['iteration']}.md").write_text("\n".join(lines))
+    (REPORTS_DIR / f"iteration_{summary['iteration']}.json").write_text(
+        json.dumps(summary, indent=2, default=str)
+    )
+
+
+SEVERITY_ORDER = {
+    "HEALTHY": 0, "FLAKY": 1, "SUSPICIOUS": 2,
+    "DEGRADED": 3, "REGRESSION": 4, "BROKEN": 5,
+}
+
+
+def _max_severity(a: str, b: str) -> str:
+    return a if SEVERITY_ORDER[a] >= SEVERITY_ORDER[b] else b
+
+
+def load_prior_summary(current_iter: int) -> dict | None:
+    priors = []
+    for p in REPORTS_DIR.glob("iteration_*.json"):
+        try:
+            n = int(p.stem.split("_")[1])
+        except (ValueError, IndexError):
+            continue
+        if n < current_iter:
+            priors.append((n, p))
+    if not priors:
+        return None
+    _, latest = max(priors)
+    try:
+        return json.loads(latest.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def compute_status(summary: dict, prior: dict | None) -> dict:
+    severity = "HEALTHY"
+    issues: list[str] = []
+
+    gen_ok = summary["gen_ok_ratio"]
+    if gen_ok < 0.5:
+        severity = _max_severity(severity, "BROKEN")
+        issues.append(
+            f"gen_ok={gen_ok:.2f} ({summary['gen_ok_count']}/{summary['total_samples']}) "
+            f"— likely rate limit or infra failure"
+        )
+    elif gen_ok < 0.9:
+        severity = _max_severity(severity, "DEGRADED")
+        issues.append(
+            f"gen_ok={gen_ok:.2f} ({summary['gen_ok_count']}/{summary['total_samples']}) "
+            f"— some samples failed to generate"
+        )
+
+    flaky = sorted(
+        ((n, d["stdev_combined"]) for n, d in summary["per_task"].items()
+         if d["stdev_combined"] >= 15),
+        key=lambda x: -x[1],
+    )
+
+    regressed: list[tuple[str, float, float]] = []
+    score_delta: float | None = None
+    if prior:
+        score_delta = summary["iteration_score"] - prior["iteration_score"]
+        prior_tasks = prior.get("per_task", {})
+        for name, d in summary["per_task"].items():
+            pd = prior_tasks.get(name)
+            if not pd:
+                continue
+            corr_drop = pd["mean_correctness"] - d["mean_correctness"]
+            if corr_drop >= 20:
+                regressed.append((name, pd["mean_correctness"], d["mean_correctness"]))
+        if regressed or score_delta < -6:
+            severity = _max_severity(severity, "REGRESSION")
+        elif score_delta < -3:
+            severity = _max_severity(severity, "SUSPICIOUS")
+
+    if severity == "HEALTHY" and flaky:
+        severity = "FLAKY"
+
+    return {
+        "severity": severity,
+        "issues": issues,
+        "flaky": flaky,
+        "regressed": regressed,
+        "score_delta": score_delta,
+        "prior_iter": prior["iteration"] if prior else None,
+        "gen_ok_ratio": gen_ok,
+    }
+
+
+def print_status(status: dict, summary: dict, run_idx: int) -> None:
+    bar = "=" * 60
+    head = (
+        f"STATUS: {status['severity']}  "
+        f"score={summary['iteration_score']:.2f}  "
+        f"gen_ok={status['gen_ok_ratio']:.2f}"
+    )
+    if status["score_delta"] is not None:
+        sign = "+" if status["score_delta"] >= 0 else ""
+        head += f"  Δ vs iter {status['prior_iter']}: {sign}{status['score_delta']:.2f}"
+    print(f"\n{bar}\n{head}\n{bar}")
+
+    if status["issues"]:
+        print("Infrastructure:")
+        for msg in status["issues"]:
+            print(f"  - {msg}")
+        print(f"  Inspect: logs/raw/iter_{run_idx}/")
+
+    if status["regressed"]:
+        print("Regressed tasks (correctness drop ≥20):")
+        for name, was, now in status["regressed"]:
+            print(f"  - {name}: {was:.0f} → {now:.0f}")
+
+    if status["flaky"]:
+        print("Flaky (high stdev — re-run with more samples):")
+        for name, sd in status["flaky"]:
+            print(f"  - {name}: stdev={sd:.1f}")
+
+    if status["severity"] == "HEALTHY":
+        print("No regressions, no flakes, infra healthy.")
+
+    saturated = sum(
+        1 for d in summary["per_task"].values() if d["mean_correctness"] >= 100
+    )
+    total = len(summary["per_task"])
+    if total and saturated / total >= 0.8:
+        print(
+            f"Note: {saturated}/{total} tasks at correctness=100 "
+            f"— benchmark is saturated, limited headroom for improvement."
+        )
+
+    print("\nLegend (severity, lowest → highest):")
+    print("  HEALTHY     no issues")
+    print("  FLAKY       a task has stdev_combined ≥ 15 across samples")
+    print("  SUSPICIOUS  score dropped 3-6 points vs prior iteration")
+    print("  DEGRADED    gen_ok between 0.5 and 0.9 (some samples failed to generate)")
+    print("  REGRESSION  score dropped >6, or any task lost ≥20 correctness vs prior")
+    print("  BROKEN      gen_ok < 0.5 (likely rate limit or infra failure)")
+    print("\nComparison:")
+    print("  Δ vs iter N = current score − prior score (latest reports/iteration_*.json).")
+    print("  Regressed tasks = mean_correctness dropped ≥20 vs that prior.")
+    if status["score_delta"] is None:
+        print("  No prior iteration_*.json found — Δ shown from the next run onward.")
+    print(bar)
 
 
 def write_final_report(history: list[dict], stop_reason: str):
@@ -322,14 +464,11 @@ def main():
     except (TypeError, ValueError):
         pass
 
+    prior = load_prior_summary(run_idx)
     summary = run_iteration(run_idx, all_tasks, methodology)
 
-    print(f"\n[run {run_idx}] score={summary['iteration_score']:.2f}  "
-          f"gen_ok={summary['gen_ok_ratio']:.2f}", flush=True)
-
-    if summary["gen_ok_ratio"] < 0.5:
-        print(f"⛔ {summary['gen_ok_count']}/{summary['total_samples']} healthy — "
-              f"likely rate limit. Check logs/raw/iter_{run_idx}/")
+    status = compute_status(summary, prior)
+    print_status(status, summary, run_idx)
 
     write_final_report([summary], f"single_run_{run_idx}")
 

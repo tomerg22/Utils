@@ -7,6 +7,8 @@
 #
 # After running, restart and enter BIOS (F2/Del) -> Tool -> ASUS EZ Flash 3
 # Select the .CAP file from the USB drive to apply the update.
+#
+# Requires root (dmidecode, mount). Run with: sudo ./update-asus-bios.sh
 
 set -euo pipefail
 
@@ -14,6 +16,7 @@ set -euo pipefail
 TEMP_DIR="/tmp/ASUS_BIOS_Update"
 MOUNT_BASE="/mnt/bios-update"
 TEMP_MOUNTS=()
+CLEANED=0
 
 # Colors
 RED='\033[0;31m'
@@ -31,6 +34,32 @@ check_root() {
         echo "Run with: sudo $0"
         exit 1
     fi
+}
+
+# Extract one KEY="value" field from a `lsblk -P` line.
+# Used instead of eval, which would execute crafted filesystem labels.
+kv() {
+    local line="$1" key="$2"
+    if [[ $line =~ (^|[[:space:]])${key}=\"([^\"]*)\" ]]; then
+        printf '%s' "${BASH_REMATCH[2]}"
+    fi
+}
+
+# Rows from the last `lsblk -P` read, so a partition can look up its parent.
+LSBLK_ROWS=()
+
+# Transport (TRAN) of a device name, resolved by scanning the collected rows.
+# A linear scan over a handful of block devices; avoids associative arrays so
+# this works on bash 3.2 as well as the bash 5 Ubuntu ships.
+tran_of() {
+    local target="$1" i n
+    for ((i = 0; i < ${#LSBLK_ROWS[@]}; i++)); do
+        n=$(kv "${LSBLK_ROWS[$i]}" NAME)
+        if [[ "$n" == "$target" ]]; then
+            kv "${LSBLK_ROWS[$i]}" TRAN
+            return 0
+        fi
+    done
 }
 
 # Mount a partition if not already mounted
@@ -51,69 +80,101 @@ mount_partition() {
     fi
 
     echo -e "${RED}Failed to mount /dev/$device${NC}" >&2
-    rmdir "$mount_point" 2>/dev/null
+    rmdir "$mount_point" 2>/dev/null || true
     return 1
 }
 
 # Cleanup temporary mounts
 cleanup_mounts() {
+    # Length check first: expanding an empty array under `set -u` errors on
+    # bash < 4.4.
+    [[ ${#TEMP_MOUNTS[@]} -eq 0 ]] && return 0
+    local mount_point
     for mount_point in "${TEMP_MOUNTS[@]}"; do
         if mountpoint -q "$mount_point" 2>/dev/null; then
-            umount "$mount_point" 2>/dev/null
+            umount "$mount_point" 2>/dev/null || true
             echo -e "${GRAY}Unmounted: ${mount_point}${NC}"
         fi
-        rmdir "$mount_point" 2>/dev/null
+        rmdir "$mount_point" 2>/dev/null || true
     done
 }
 
 # Detect FAT32 USB drive (mounted or unmounted)
+#
+# Uses `lsblk -P` (KEY="value" pairs) rather than positional awk. With
+# space-padded columnar output, awk's default field splitting shifts fields
+# left whenever a column is empty, so a partition row like
+#   sdb1      vfat /media/user/USB
+# was read as tran=vfat, fstype=/media/user/USB and never matched.
+#
+# TRAN is also a *disk* property while FSTYPE/MOUNTPOINT are *partition*
+# properties, so they never appear on the same row. PKNAME links a partition
+# back to its parent disk, and the transport is resolved from there.
 detect_usb_drive() {
-    local usb_drives=()
-    local mount_points=()
-    local devices=()
+    local devices=() mount_points=() labels=()
+    local i line
 
-    # Find USB drives with FAT32 (vfat) filesystem - mounted or not
+    # Pass 1: collect every row. Kept in a plain indexed array rather than an
+    # associative one so this also runs on bash 3.2.
+    LSBLK_ROWS=()
     while IFS= read -r line; do
-        local name tran fstype mountpoint
-        name=$(echo "$line" | awk '{print $1}')
-        tran=$(echo "$line" | awk '{print $2}')
-        fstype=$(echo "$line" | awk '{print $3}')
-        mountpoint=$(echo "$line" | awk '{print $4}')
+        [[ -z "$line" ]] && continue
+        LSBLK_ROWS+=("$line")
+    done < <(lsblk -P -o NAME,TRAN,FSTYPE,MOUNTPOINT,PKNAME,LABEL 2>/dev/null)
 
-        if [[ "$tran" == "usb" && "$fstype" == "vfat" ]]; then
-            usb_drives+=("$name")
-            devices+=("$name")
-            if [[ -n "$mountpoint" ]]; then
-                mount_points+=("$mountpoint")
-            else
-                mount_points+=("")  # Empty = not mounted
-            fi
+    if [[ ${#LSBLK_ROWS[@]} -eq 0 ]]; then
+        echo -e "${RED}lsblk returned no block devices${NC}" >&2
+        return 1
+    fi
+
+    # Pass 2: keep vfat filesystems whose own or parent transport is usb.
+    for ((i = 0; i < ${#LSBLK_ROWS[@]}; i++)); do
+        line="${LSBLK_ROWS[$i]}"
+        local name tran fstype mp pk label transport
+        name=$(kv "$line" NAME)
+        tran=$(kv "$line" TRAN)
+        fstype=$(kv "$line" FSTYPE)
+        mp=$(kv "$line" MOUNTPOINT)
+        pk=$(kv "$line" PKNAME)
+        label=$(kv "$line" LABEL)
+
+        [[ "$fstype" == "vfat" ]] || continue
+
+        transport="$tran"
+        if [[ -z "$transport" && -n "$pk" ]]; then
+            transport=$(tran_of "$pk")
         fi
-    done < <(lsblk -o NAME,TRAN,FSTYPE,MOUNTPOINT -n -l 2>/dev/null)
+        [[ "$transport" == "usb" ]] || continue
 
-    if [[ ${#usb_drives[@]} -eq 0 ]]; then
+        devices+=("$name")
+        mount_points+=("$mp")
+        labels+=("${label:-no label}")
+    done
+
+    if [[ ${#devices[@]} -eq 0 ]]; then
         echo -e "${RED}No FAT32 USB drives found${NC}" >&2
         echo -e "${YELLOW}Please insert a FAT32-formatted USB drive${NC}" >&2
+        echo -e "${GRAY}Debug: lsblk -P -o NAME,TRAN,FSTYPE,MOUNTPOINT,PKNAME${NC}" >&2
         return 1
     fi
 
     local selected_idx=0
 
-    if [[ ${#usb_drives[@]} -gt 1 ]]; then
+    if [[ ${#devices[@]} -gt 1 ]]; then
         # Multiple drives found - let user choose
         echo -e "${YELLOW}Multiple FAT32 USB drives found:${NC}" >&2
-        for i in "${!usb_drives[@]}"; do
+        for i in "${!devices[@]}"; do
             local status="not mounted"
             if [[ -n "${mount_points[$i]}" ]]; then
                 status="mounted at ${mount_points[$i]}"
             fi
-            echo -e "  $((i+1)). ${usb_drives[$i]} ($status)" >&2
+            echo -e "  $((i+1)). ${devices[$i]} [${labels[$i]}] ($status)" >&2
         done
 
         local selection
         while true; do
-            read -rp "Select drive (1-${#usb_drives[@]}): " selection
-            if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le ${#usb_drives[@]} ]]; then
+            read -rp "Select drive (1-${#devices[@]}): " selection
+            if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le ${#devices[@]} ]]; then
                 selected_idx=$((selection-1))
                 break
             fi
@@ -170,7 +231,7 @@ check_dependencies() {
     local missing=()
     local packages=()
 
-    for cmd in curl jq dmidecode unzip; do
+    for cmd in curl jq dmidecode unzip sha256sum lsblk; do
         if ! command -v "$cmd" &> /dev/null; then
             missing+=("$cmd")
         fi
@@ -187,6 +248,8 @@ check_dependencies() {
                 jq)        packages+=("jq") ;;
                 dmidecode) packages+=("dmidecode") ;;
                 unzip)     packages+=("unzip") ;;
+                sha256sum) packages+=("coreutils") ;;
+                lsblk)     packages+=("util-linux") ;;
             esac
         done
 
@@ -200,20 +263,52 @@ check_dependencies() {
 }
 
 # Get current BIOS version from system
+#
+# ASUS reports a bare 4-digit version, but the SMBIOS string is free-form and
+# can carry other numbers (dates, vendor versions). Prefer a standalone
+# 4-digit token; if several exist, take the last and say so rather than
+# silently trusting the first match.
 get_current_bios_version() {
     local bios_version
     bios_version=$(dmidecode -s bios-version 2>/dev/null || echo "")
 
     echo -e "${CYAN}Current BIOS string: ${bios_version}${NC}" >&2
 
-    # Extract 4-digit version number
-    if [[ $bios_version =~ ([0-9]{4}) ]]; then
-        echo "${BASH_REMATCH[1]}"
-        return 0
+    local -a tokens=()
+    local tok
+    # Split on runs of non-digits, then keep whole 4-digit tokens. A single
+    # regex with trailing context would not work: with `grep -o` the context
+    # character of one match consumes the leading context of the next, so
+    # "... 2026 1838" would yield only 2026.
+    while read -r tok; do
+        [[ -n "$tok" ]] && tokens+=("$tok")
+    done < <(tr -cs '0-9' '\n' <<<"$bios_version" | grep -xE '[0-9]{4}' || true)
+
+    if [[ ${#tokens[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}Warning: Could not parse a 4-digit BIOS version from: ${bios_version}${NC}" >&2
+        return 1
     fi
 
-    echo -e "${YELLOW}Warning: Could not parse BIOS version from: ${bios_version}${NC}" >&2
-    return 1
+    if [[ ${#tokens[@]} -gt 1 ]]; then
+        echo -e "${YELLOW}Warning: multiple 4-digit values in BIOS string (${tokens[*]}); using last${NC}" >&2
+    fi
+
+    # Computed index rather than ${tokens[-1]}: negative subscripts need bash 4.3
+    echo "${tokens[$((${#tokens[@]} - 1))]}"
+}
+
+# Compare two BIOS versions numerically.
+# Forces base 10: bash arithmetic reads a leading zero as octal, so "0805"
+# errors ("value too great for base") and "0710" is silently read as 456.
+version_ge() {
+    local a="${1#"${1%%[!0]*}"}" b="${2#"${2%%[!0]*}"}"   # strip leading zeros
+    a="${a:-0}"; b="${b:-0}"
+    if [[ ! "$a" =~ ^[0-9]+$ || ! "$b" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}Warning: non-numeric version ('$1' vs '$2'); comparing as strings${NC}" >&2
+        [[ "$1" > "$2" || "$1" == "$2" ]]
+        return $?
+    fi
+    (( 10#$a >= 10#$b ))
 }
 
 # Query ASUS API for latest BIOS information
@@ -236,10 +331,11 @@ get_latest_bios_info() {
     fi
 
     # Parse JSON response - extract first (latest) BIOS entry
-    local version download_url release_date
+    local version download_url release_date sha256
     version=$(echo "$response" | jq -r '.Result.Obj[0].Files[0].Version // empty')
     download_url=$(echo "$response" | jq -r '.Result.Obj[0].Files[0].DownloadUrl.Global // empty')
     release_date=$(echo "$response" | jq -r '.Result.Obj[0].Files[0].ReleaseDate // empty')
+    sha256=$(echo "$response" | jq -r '.Result.Obj[0].Files[0].sha256 // empty')
 
     if [[ -z "$version" || -z "$download_url" ]]; then
         echo -e "${RED}No BIOS information found in API response${NC}" >&2
@@ -250,6 +346,7 @@ get_latest_bios_info() {
     LATEST_VERSION="$version"
     DOWNLOAD_URL="$download_url"
     RELEASE_DATE="$release_date"
+    EXPECTED_SHA256=$(printf '%s' "$sha256" | tr 'A-Z' 'a-z')
 }
 
 # Download and extract BIOS update
@@ -274,7 +371,7 @@ install_bios_update() {
 
     # Encode spaces in URL
     local encoded_url="${download_url// /%20}"
-    if ! curl -L -o "$zip_path" "$encoded_url"; then
+    if ! curl -fL -o "$zip_path" "$encoded_url"; then
         echo -e "${RED}Failed to download BIOS package${NC}" >&2
         return 1
     fi
@@ -282,6 +379,31 @@ install_bios_update() {
     local file_size
     file_size=$(du -h "$zip_path" | cut -f1)
     echo -e "${GREEN}Downloaded: ${file_size}${NC}"
+
+    # Verify integrity BEFORE anything gets written to the USB drive.
+    # A corrupted .CAP flashed by EZ Flash can leave the board unbootable,
+    # so a failed check is fatal, never a warning.
+    if [[ -n "${EXPECTED_SHA256:-}" ]]; then
+        echo -e "${CYAN}Verifying SHA-256 against ASUS-published hash...${NC}"
+        local actual_sha
+        actual_sha=$(sha256sum "$zip_path" | awk '{print $1}' | tr 'A-Z' 'a-z')
+        if [[ "$actual_sha" != "$EXPECTED_SHA256" ]]; then
+            echo -e "${RED}SHA-256 MISMATCH - refusing to continue${NC}" >&2
+            echo -e "${RED}  expected: ${EXPECTED_SHA256}${NC}" >&2
+            echo -e "${RED}  actual:   ${actual_sha}${NC}" >&2
+            echo -e "${YELLOW}The download is corrupt or tampered with. Do not flash it.${NC}" >&2
+            return 1
+        fi
+        echo -e "${GREEN}SHA-256 verified: ${actual_sha}${NC}"
+    else
+        echo -e "${YELLOW}Warning: ASUS published no SHA-256 for this release${NC}"
+        echo -e "${CYAN}Falling back to archive integrity test...${NC}"
+        if ! unzip -tq "$zip_path"; then
+            echo -e "${RED}Archive is corrupt - refusing to continue${NC}" >&2
+            return 1
+        fi
+        echo -e "${GREEN}Archive integrity OK${NC}"
+    fi
 
     # Extract
     echo -e "${CYAN}Extracting BIOS package...${NC}"
@@ -303,9 +425,13 @@ install_bios_update() {
 
     echo -e "${GREEN}Found BIOS file: $(basename "$cap_file")${NC}"
 
-    # Copy to destination with version name
-    local new_name="${version}.CAP"
-    local destination_path="${destination}/${new_name}"
+    # Keep ASUS's original filename. It already encodes board and version
+    # (e.g. PRIME-B760M-K-D4-ASUS-1838.CAP), and USB BIOS FlashBack expects a
+    # specific board name that renaming to "<version>.CAP" would destroy.
+    # ASUS ships BIOSRenamer.exe in the archive for exactly that purpose.
+    local cap_name
+    cap_name=$(basename "$cap_file")
+    local destination_path="${destination}/${cap_name}"
 
     # Remove existing file if present
     if [[ -f "$destination_path" ]]; then
@@ -315,9 +441,21 @@ install_bios_update() {
 
     cp "$cap_file" "$destination_path"
 
+    # Copy BIOSRenamer alongside if present - needed to rename the .CAP for
+    # USB BIOS FlashBack (the rear-panel button method).
+    local renamer
+    renamer=$(find "$extract_path" -iname "BIOSRenamer*.exe" -type f | head -n 1)
+    if [[ -n "$renamer" ]]; then
+        cp "$renamer" "${destination}/$(basename "$renamer")" 2>/dev/null || true
+        echo -e "${GRAY}Also copied $(basename "$renamer") (for USB BIOS FlashBack)${NC}"
+    fi
+
     if [[ -f "$destination_path" ]]; then
+        # Flush to the USB device before we report success.
+        sync
         echo -e "${GREEN}BIOS file ready: ${destination_path}${NC}"
         BIOS_PATH="$destination_path"
+        BIOS_FILENAME="$cap_name"
         return 0
     fi
 
@@ -325,8 +463,13 @@ install_bios_update() {
     return 1
 }
 
-# Cleanup temporary files and mounts
+# Cleanup temporary files and mounts (idempotent - also runs from the EXIT trap)
 cleanup() {
+    if [[ $CLEANED -eq 1 ]]; then
+        return 0
+    fi
+    CLEANED=1
+
     if [[ -d "$TEMP_DIR" ]]; then
         rm -rf "$TEMP_DIR"
         echo -e "${GRAY}Cleaned up temporary files${NC}"
@@ -375,8 +518,8 @@ main() {
     echo -e "${GRAY}Release date: ${RELEASE_DATE}${NC}"
     echo ""
 
-    # Compare versions
-    if [[ "$current_version" -ge "$LATEST_VERSION" ]]; then
+    # Compare versions (base-10 safe)
+    if version_ge "$current_version" "$LATEST_VERSION"; then
         echo -e "${GREEN}Your BIOS is already up to date!${NC}"
         echo -e "${GRAY}Current: ${current_version}, Latest: ${LATEST_VERSION}${NC}"
         exit 0
@@ -409,13 +552,13 @@ main() {
     echo -e "${WHITE}  1. Restart your computer${NC}"
     echo -e "${WHITE}  2. Enter BIOS Setup (press F2 or Del during boot)${NC}"
     echo -e "${WHITE}  3. Go to Tool -> ASUS EZ Flash 3 Utility${NC}"
-    echo -e "${WHITE}  4. Select the ${LATEST_VERSION}.CAP file from the USB drive${NC}"
+    echo -e "${WHITE}  4. Select ${BIOS_FILENAME} from the USB drive${NC}"
     echo -e "${WHITE}  5. Follow the on-screen instructions${NC}"
     echo ""
     echo -e "${RED}WARNING: Do not power off during BIOS update!${NC}"
     echo ""
 
-    # Clean up before potential restart
+    # Unmount before any restart so USB writes are flushed
     cleanup
 
     read -rp "Restart now to apply BIOS update? (Y/N) " restart_confirm

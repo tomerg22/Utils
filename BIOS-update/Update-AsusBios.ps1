@@ -369,11 +369,13 @@ function Install-BiosUpdate {
 
     Write-Host "Found BIOS file: $($capFile.Name)" -ForegroundColor Green
 
-    # Keep ASUS's original filename. It already encodes board and version
-    # (e.g. PRIME-B760M-K-D4-ASUS-1838.CAP), and USB BIOS FlashBack expects a
-    # specific board name that renaming to "<version>.CAP" would destroy.
-    # ASUS ships BIOSRenamer.exe in the archive for exactly that purpose.
-    $destinationPath = Join-Path $Destination $capFile.Name
+    # Rename to <version>.CAP on the destination (e.g. 4004.CAP). EZ Flash 3
+    # accepts any filename and this short name is easy to pick in the utility.
+    # (USB BIOS FlashBack is different - it needs a board-specific name that
+    # ASUS's BIOSRenamer.exe generates from the ORIGINAL download filename, so
+    # for FlashBack run BIOSRenamer on the unzipped download rather than this.)
+    $newName = "$Version.CAP"
+    $destinationPath = Join-Path $Destination $newName
 
     # Check if file already exists
     if (Test-Path $destinationPath) {
@@ -382,15 +384,6 @@ function Install-BiosUpdate {
     }
 
     Copy-Item -Path $capFile.FullName -Destination $destinationPath -Force
-
-    # Copy BIOSRenamer alongside if present - needed to rename the .CAP for
-    # USB BIOS FlashBack (the rear-panel button method).
-    $renamer = Get-ChildItem -Path $extractPath -Filter "BIOSRenamer*.exe" -Recurse |
-               Select-Object -First 1
-    if ($renamer) {
-        Copy-Item -Path $renamer.FullName -Destination (Join-Path $Destination $renamer.Name) -Force -ErrorAction SilentlyContinue
-        Write-Host "Also copied $($renamer.Name) (for USB BIOS FlashBack)" -ForegroundColor Gray
-    }
 
     if (Test-Path $destinationPath) {
         Write-Host "`nBIOS file ready: $destinationPath" -ForegroundColor Green

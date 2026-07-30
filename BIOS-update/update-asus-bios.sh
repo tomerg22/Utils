@@ -425,13 +425,13 @@ install_bios_update() {
 
     echo -e "${GREEN}Found BIOS file: $(basename "$cap_file")${NC}"
 
-    # Keep ASUS's original filename. It already encodes board and version
-    # (e.g. PRIME-B760M-K-D4-ASUS-1838.CAP), and USB BIOS FlashBack expects a
-    # specific board name that renaming to "<version>.CAP" would destroy.
-    # ASUS ships BIOSRenamer.exe in the archive for exactly that purpose.
-    local cap_name
-    cap_name=$(basename "$cap_file")
-    local destination_path="${destination}/${cap_name}"
+    # Rename to <version>.CAP on the destination (e.g. 4004.CAP). EZ Flash 3
+    # accepts any filename and this short name is easy to pick in the utility.
+    # (USB BIOS FlashBack is different - it needs a board-specific name that
+    # ASUS's BIOSRenamer.exe generates from the ORIGINAL download filename, so
+    # for FlashBack run BIOSRenamer on the unzipped download rather than this.)
+    local new_name="${version}.CAP"
+    local destination_path="${destination}/${new_name}"
 
     # Remove existing file if present
     if [[ -f "$destination_path" ]]; then
@@ -441,21 +441,12 @@ install_bios_update() {
 
     cp "$cap_file" "$destination_path"
 
-    # Copy BIOSRenamer alongside if present - needed to rename the .CAP for
-    # USB BIOS FlashBack (the rear-panel button method).
-    local renamer
-    renamer=$(find "$extract_path" -iname "BIOSRenamer*.exe" -type f | head -n 1)
-    if [[ -n "$renamer" ]]; then
-        cp "$renamer" "${destination}/$(basename "$renamer")" 2>/dev/null || true
-        echo -e "${GRAY}Also copied $(basename "$renamer") (for USB BIOS FlashBack)${NC}"
-    fi
-
     if [[ -f "$destination_path" ]]; then
         # Flush to the USB device before we report success.
         sync
         echo -e "${GREEN}BIOS file ready: ${destination_path}${NC}"
         BIOS_PATH="$destination_path"
-        BIOS_FILENAME="$cap_name"
+        BIOS_FILENAME="$new_name"
         return 0
     fi
 

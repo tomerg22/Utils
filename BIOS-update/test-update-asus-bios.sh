@@ -175,12 +175,14 @@ dest_ok=$(mktemp -d)
 EXPECTED_SHA256="$GOOD_SHA"
 install_bios_update "https://example/PRIME-TEST-BOARD-1838.zip" 1838 "$dest_ok" >/dev/null 2>&1
 chk "valid hash is accepted"        "$?" "0"
-chk "stages the original .CAP name" \
-    "$(ls "$dest_ok" | grep -c '^PRIME-TEST-BOARD-1838.CAP$')" "1"
-chk "does not rename to <version>.CAP" \
-    "$(ls "$dest_ok" | grep -c '^1838.CAP$')" "0"
-chk "copies BIOSRenamer.exe too" \
-    "$(ls "$dest_ok" | grep -ci 'BIOSRenamer')" "1"
+chk "stages as <version>.CAP" \
+    "$(ls "$dest_ok" | grep -c '^1838.CAP$')" "1"
+chk "does not keep the long ASUS name" \
+    "$(ls "$dest_ok" | grep -c '^PRIME-TEST-BOARD-1838.CAP$')" "0"
+# BIOSRenamer is for FlashBack and needs ASUS's original filename; it must not
+# be shipped next to a renamed <version>.CAP where it would be useless.
+chk "does not copy BIOSRenamer" \
+    "$(ls "$dest_ok" | grep -ci 'BIOSRenamer')" "0"
 
 dest_bad=$(mktemp -d)
 EXPECTED_SHA256="deadbeef00000000000000000000000000000000000000000000000000000bad"

@@ -570,4 +570,8 @@ main() {
     fi
 }
 
-main "$@"
+# Only run when executed directly, so test-update-asus-bios.sh can source this
+# file and exercise the functions in isolation.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

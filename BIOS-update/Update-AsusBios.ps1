@@ -406,6 +406,10 @@ function Remove-TempFiles {
     Remove-TempDriveLetters
 }
 
+# When dot-sourced (by Test-UpdateAsusBios.ps1) stop here, exposing only the
+# functions above so they can be tested in isolation.
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 # Main execution
 try {
     Write-Host "`n========================================" -ForegroundColor Cyan

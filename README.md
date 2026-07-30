@@ -39,6 +39,24 @@ Installs `curl`, `jq`, `dmidecode`, `unzip` via `apt-get` if missing.
 6. Extract the `.CAP`, keeping ASUS's original filename
 7. Print the EZ Flash steps and offer to reboot
 
+### Tests
+
+Both suites run on any machine — no root/Administrator, no ASUS board, no USB
+drive, no network. `lsblk`, `dmidecode`, `curl` and the BIOS archive are stubbed.
+
+```bash
+./BIOS-update/test-update-asus-bios.sh          # 25 tests
+pwsh -File ./BIOS-update/Test-UpdateAsusBios.ps1 # 18 tests
+```
+
+Each case pins down behaviour that was previously wrong — the comments in the
+test files say what broke. Both scripts return early when sourced/dot-sourced,
+so the tests exercise their functions without running `main`.
+
+What the tests do **not** cover: the actual flash. Nothing here has been run
+end to end against a real ASUS board, and EZ Flash itself is untested by
+definition.
+
 ### Applying the update
 
 Reboot, enter BIOS (F2 or Del), then **Tool → ASUS EZ Flash 3 Utility**, and

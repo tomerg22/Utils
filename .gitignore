@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# claude_cli_eval.py output artifacts (see --out / --full-out)
+claude_cli_eval_results.csv
+claude_eval_full.jsonl

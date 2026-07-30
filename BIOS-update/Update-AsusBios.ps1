@@ -217,10 +217,16 @@ function Get-CurrentBiosVersion {
 
     Write-Host "Current BIOS string: $biosVersion" -ForegroundColor Cyan
 
-    $tokens = [regex]::Matches($biosVersion, '(?<![0-9])[0-9]{4}(?![0-9])') |
-              ForEach-Object { $_.Value }
+    # @(...) forces an array. Without it, a single match makes $tokens a scalar
+    # [string], and $tokens[-1] then indexes the last CHARACTER ("1825" -> "5")
+    # instead of the last token. With >=2 matches it was already an array, so
+    # the bug only bit the common single-version case.
+    $tokens = @(
+        [regex]::Matches($biosVersion, '(?<![0-9])[0-9]{4}(?![0-9])') |
+            ForEach-Object { $_.Value }
+    )
 
-    if (-not $tokens -or $tokens.Count -eq 0) {
+    if ($tokens.Count -eq 0) {
         Write-Warning "Could not parse a 4-digit BIOS version from: $biosVersion"
         return $null
     }

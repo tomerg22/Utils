@@ -59,21 +59,38 @@ catch { $threw = $true }
 Check "non-numeric does not throw" $threw $false
 
 # ---------------------------------------------------------------------------
-# 4-digit BIOS version token rule
+# Get-CurrentBiosVersion — the REAL function, not a reimplementation.
 #
-# The SMBIOS string is free-form, so taking the first 4-digit run could pick
-# up a year. The rule is: whole 4-digit tokens only, prefer the last.
+# This is deliberately end-to-end: an earlier version of this test checked a
+# private "Get-Tokens" copy that joined matches with commas, which never
+# exercised the function's own return path — and so missed a real bug. For a
+# single match, PowerShell made $tokens a scalar string, and $tokens[-1]
+# returned the last CHARACTER: "1825" was reported as "5". These cases call
+# the shipped function with Get-CimInstance mocked, so that path is covered.
 # ---------------------------------------------------------------------------
-Write-Host "BIOS version token extraction"
-function Get-Tokens {
-    param([string]$Text)
-    ([regex]::Matches($Text, '(?<![0-9])[0-9]{4}(?![0-9])') | ForEach-Object { $_.Value }) -join ','
+Write-Host "Get-CurrentBiosVersion (single vs multiple tokens)"
+
+$script:FakeBios = ''
+function Get-CimInstance {
+    param([Parameter(Position = 0)]$ClassName)
+    if ($ClassName -eq 'Win32_BIOS') {
+        return [pscustomobject]@{ SMBIOSBIOSVersion = $script:FakeBios }
+    }
+    throw "unexpected CIM class in test: $ClassName"
 }
-Check "bare 4-digit version"       (Get-Tokens "1838") "1838"
-Check "finds both, last preferred" (Get-Tokens "American Megatrends 5.13 2026 1838") "2026,1838"
-Check "keeps a leading zero"       (Get-Tokens "0805") "0805"
-Check "no match on v1.2"           (Get-Tokens "v1.2") ""
-Check "does not split 6 digits"    (Get-Tokens "123456") ""
+
+function BiosVer {
+    param([string]$Raw)
+    $script:FakeBios = $Raw
+    Get-CurrentBiosVersion -WarningAction SilentlyContinue
+}
+
+Check "single token 1825 -> 1825 (the reported bug)" (BiosVer "1825") "1825"
+Check "bare 4-digit version"       (BiosVer "1838") "1838"
+Check "prefers the last token"     (BiosVer "American Megatrends 5.13 2026 1838") "1838"
+Check "keeps a leading zero"       (BiosVer "0805") "0805"
+Check "no 4-digit -> null"         (BiosVer "v1.2") ""
+Check "does not split 6 digits"    (BiosVer "123456") ""
 
 # ---------------------------------------------------------------------------
 # Integrity gate

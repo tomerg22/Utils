@@ -1,0 +1,12 @@
+# Pairing token granted by the TV - a credential, never commit
+tv-token.txt
+
+# Local network details (MAC / IP / subnet)
+tv-config.json
+
+# Runtime state and logs (contain the TV's IP and MAC)
+tv-ip-cache.txt
+tv_listener.log
+
+__pycache__/
+*.pyc

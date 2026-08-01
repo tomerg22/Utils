@@ -92,3 +92,24 @@ powershell -ExecutionPolicy Bypass -File jarvis/setup.ps1
 ```
 
 See `jarvis/README.md` for configuration, security model, and troubleshooting.
+
+## tv-control
+
+Turns a Samsung Smart TV used as a second monitor **off** when Windows puts
+the displays to sleep and back **on** when the PC wakes — over the network, no
+extra hardware. Without it, a TV used as a monitor just sits on a "no signal"
+dialog when the PC sleeps and never comes back by itself.
+
+A hidden background listener hooks the Windows display-state and
+suspend/resume notifications. Power-off goes over Samsung's local WebSocket
+remote-control API; power-on is a Wake-on-LAN burst. The TV is identified by
+MAC address, so a DHCP reassignment self-heals via an ARP rediscovery scan.
+
+```powershell
+py -3 -m pip install websocket-client wakeonlan pywin32
+```
+
+See `tv-control/README.md` for pairing, configuration, and the Windows timing
+constraints that shape the design — the suspend window is only a few hundred
+milliseconds wide, which is why a connection is held open and rotated rather
+than opened on demand.

@@ -1,0 +1,19 @@
+{
+  "wake_threshold": 0.4,
+  "silence_rms": 350,
+  "silence_seconds": 0.8,
+  "max_command_seconds": 8,
+  "whisper_model": "base.en",
+  "permission_mode": "acceptEdits",
+  "speak_replies": true,
+  "max_speak_chars": 400,
+  "input_device": null,
+  "tts_voice": "en-GB-RyanNeural",
+  "tts_rate": "-12%",
+  "tts_pitch": "-6Hz",
+  "ack_text": "Right away, sir.",
+  "followup_window_seconds": 30,
+  "voice_system_prompt": "You are answering through a voice interface. Reply in at most two short conversational sentences unless the user explicitly asks for detail. No markdown, no code blocks, no lists. To control apps or media, run exactly this pre-approved command: powershell -ExecutionPolicy Bypass -File {APPS} <action> [arg] with one of these actions: launch-chrome [url], launch-whatsapp, launch-spotify, launch-steam, launch-discord, launch-claude, close-chrome, close-whatsapp, close-spotify, close-steam, close-discord, close-claude, open-url <url>, play-pause, next-track, previous-track, volume-up, volume-down, mute, sleep (puts the PC to sleep), status, list-games, launch-game <appid>, close-game <appid>. For Steam games: use list-games to see installed games with appids, then launch-game or close-game with the appid. To close a game use ONLY close-game <appid> - never close-steam, which kills the whole Steam client and every running game; use close-steam only when the user explicitly asks to close Steam itself. claude means the Claude Desktop app. Use it for requests like 'open Spotify', 'pause the music', 'next song', or 'open youtube.com'. When an action succeeds, reply with exactly: OK. Nothing more - the user hears a completion tone instead of speech. Only reply with words if the action failed or the user asked a question.",
+  "daily_claude_limit": 60,
+  "session_idle_reset_seconds": 600
+}

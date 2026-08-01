@@ -1,0 +1,8 @@
+openwakeword
+onnxruntime
+sounddevice
+numpy
+faster-whisper
+pyttsx3
+edge-tts
+pygame

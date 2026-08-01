@@ -74,3 +74,21 @@ Do not power off during the flash.
   exact name FlashBack needs.
 - Only ASUS boards are supported; the scripts refuse to run on anything else.
 - The USB drive must be **FAT32**. EZ Flash cannot read NTFS or exFAT.
+
+## jarvis
+
+Always-on "Hey Jarvis" voice assistant for Claude Code on Windows. Wake word
+and speech-to-text run locally (openWakeWord + faster-whisper); simple
+commands execute instantly, anything else goes to a persistent Claude Code
+session and is spoken back with neural TTS.
+
+Controls apps (Chrome, WhatsApp, Spotify, Steam, Discord, Claude Desktop),
+media keys, Steam games by name, and PC sleep. Claude's shell access is
+allowlisted to a single action script, so a misheard command cannot run
+arbitrary commands.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File jarvis/setup.ps1
+```
+
+See `jarvis/README.md` for configuration, security model, and troubleshooting.

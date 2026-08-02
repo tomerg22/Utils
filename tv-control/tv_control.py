@@ -43,6 +43,26 @@ TV_MAC = _config["tv_mac"]
 LAST_KNOWN_IP = _config["last_known_ip"]
 SUBNET_PREFIX = _config["subnet_prefix"]  # /24 this PC is on
 
+# Believed TV power state, shared across processes: the listener runs as a
+# background service while sleep_pc.py runs in the foreground, and the two
+# must agree. KEY_POWER is a toggle, so a redundant send from the listener's
+# suspend hook would switch the TV straight back on.
+STATE_FILE = BASE_DIR / "tv-state.json"
+
+
+def get_believed_off() -> bool:
+    try:
+        return bool(json.loads(STATE_FILE.read_text()).get("believed_off", False))
+    except Exception:
+        return False
+
+
+def set_believed_off(value: bool) -> None:
+    try:
+        STATE_FILE.write_text(json.dumps({"believed_off": value, "at": time.time()}))
+    except Exception:
+        pass
+
 CLIENT_NAME = base64.b64encode(b"claude-tv-control").decode()
 REST_TIMEOUT = 1.5
 WS_TIMEOUT = 5
@@ -314,8 +334,10 @@ def power_off(fast: bool = True) -> None:
     is harmless: its WebSocket server is unreachable, so the attempt simply
     fails and is logged.
     """
+    set_believed_off(True)
+
     # Fastest path: reuse the already-open socket (~5ms). This is the only
-    # path that reliably completes while the system is suspending.
+    # path with any chance of completing while the system is suspending.
     if fast and _send_key_warm("KEY_POWER"):
         return
 
@@ -353,6 +375,11 @@ def power_off(fast: bool = True) -> None:
 
 
 def power_on() -> None:
+    # Cleared unconditionally and first: whether the TV is already on or is
+    # about to be woken, it is no longer "believed off", and a later power_off
+    # must not be suppressed. Returning early without clearing this would
+    # wedge the TV on permanently.
+    set_believed_off(False)
     ip = resolve_tv_ip()
     state = get_state(ip) if ip else None
     if state == "on":

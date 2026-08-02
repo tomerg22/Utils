@@ -76,7 +76,6 @@ def _make_guid(guid_str: str) -> GUID:
 _startup_event_seen = False
 _last_resume = 0.0
 _last_power_on = 0.0
-_tv_believed_off = False
 
 # A display-off notification queued during suspend is delivered on resume,
 # which would switch the TV off moments before switching it back on.
@@ -96,28 +95,25 @@ def _do_power_off(source: str) -> None:
     observed), so a time-based debounce cannot cover it: the state is tracked
     explicitly and cleared only by a power-on.
     """
-    global _tv_believed_off
-    if _tv_believed_off:
+    if tv_control.get_believed_off():
         log(f"{source} -> skipped, TV already believed off "
             "(KEY_POWER is a toggle - sending again would switch it back on)")
         return
-    _tv_believed_off = True
     log(f"{source} -> turning TV off")
     try:
-        tv_control.power_off()
+        tv_control.power_off()  # sets the shared believed-off flag itself
     except Exception:
         log("power_off failed:\n" + traceback.format_exc())
 
 
 def _do_power_on(source: str) -> None:
-    global _last_power_on, _tv_believed_off
+    global _last_power_on
     now = time.time()
     if now - _last_power_on < POWER_ON_DEBOUNCE:
         log(f"{source} -> power_on suppressed "
             f"(already issued {now - _last_power_on:.1f}s ago)")
         return
     _last_power_on = now
-    _tv_believed_off = False
     log(f"{source} -> turning TV on")
     try:
         tv_control.power_on()

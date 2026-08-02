@@ -6,6 +6,7 @@ tv-config.json
 
 # Runtime state and logs (contain the TV's IP and MAC)
 tv-ip-cache.txt
+tv-state.json
 tv_listener.log
 
 __pycache__/

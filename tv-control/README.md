@@ -66,6 +66,19 @@ built-in timeout), and never comes back on by itself.
   After sending, the handler dwells ~300 ms and the socket sets `TCP_NODELAY`,
   because `ws.send()` only fills the socket buffer and the NIC can go down
   before those bytes are ever transmitted.
+- **Manual sleep should use `sleep_pc.py`, not the Start menu.** The suspend
+  hook is best-effort, not a guarantee. Measured on one machine:
+
+  | Sequence | Result |
+  |---|---|
+  | display-off, then suspend 23.5 s later | off command lands |
+  | straight to suspend, no display-off first | off command lost |
+
+  In the second case the network is gone before anything can be delivered,
+  and there is no way to detect the loss: this TV sends **no** acknowledgement
+  and does not even close the socket as it powers off (verified — it answered
+  nothing for 6.5 s while going into standby). `sleep_pc.py` inverts the
+  order instead of racing it: TV off → *confirmed* off (~2.6 s) → suspend.
 
 ## Requirements
 
@@ -184,7 +197,16 @@ repeating trigger as a self-healing watchdog**. `MultipleInstances IgnoreNew`
 means the repeat is a no-op while the listener is alive, and restarts it within
 5 minutes if it ever dies for any reason.
 
-### 9. Verify end-to-end
+### 9. Use `Sleep-PC.cmd` for manual sleep
+
+Bind `Sleep-PC.cmd` to a shortcut, hotkey, or voice-assistant "sleep" command
+and use it instead of the Start menu's Sleep. It switches the TV off, waits
+until the TV confirms it (typically ~2.6 s), and only then suspends.
+
+Idle-timeout sleep and wake-up are handled automatically by the listener and
+need no action.
+
+### 10. Verify end-to-end
 
 Let the monitors time out (or press Sleep): TV turns off. Wake the PC: TV
 turns on within ~15 s. Check `tv_listener.log` in the folder to see events:
@@ -202,7 +224,11 @@ turns on within ~15 s. Check `tv_listener.log` in the folder to see events:
 |---|---|
 | `tv_control.py` | Core library + CLI (`status` / `off` / `on`) |
 | `tv_listener.py` | Background event listener (run by Task Scheduler) |
+| `sleep_pc.py` | TV off → confirm → suspend. Use for manual sleep |
+| `Sleep-PC.cmd` | Launcher for the above (bind to a hotkey / voice command) |
+| `tv-config.json` | Your TV's MAC / IP / subnet (gitignored) |
 | `tv-token.txt` | Pairing token granted by the TV (created on first pair) |
+| `tv-state.json` | Believed power state, shared between processes |
 | `tv-ip-cache.txt` | Last verified TV IP (auto-managed) |
 | `tv_listener.log` | Listener activity log (auto-created) |
 

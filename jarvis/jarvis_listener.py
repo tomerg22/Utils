@@ -47,6 +47,9 @@ DEFAULT_CONFIG = {
     # Usage guards: keep voice commands from eating the Claude plan quota.
     "daily_claude_limit": 60,
     "session_idle_reset_seconds": 600,
+    # Barge-in: say "hey jarvis" while he's talking to cut him off.
+    "allow_barge_in": True,
+    "interrupt_threshold": 0.6,
     "voice_system_prompt": (
         "You are answering through a voice interface. Reply in at most two "
         "short conversational sentences unless the user explicitly asks for "
@@ -174,16 +177,28 @@ class Speaker:
         self.synth_to_file(text, mp3)
         self.play_file(mp3, wait=True)
 
-    def wait_idle(self):
+    def stop(self):
+        """Cut playback immediately (barge-in)."""
+        try:
+            import pygame
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
+
+    def wait_idle(self, interrupt=None):
         import pygame
 
         if pygame.mixer.get_init():
             while pygame.mixer.music.get_busy():
+                if interrupt is not None and interrupt.is_set():
+                    pygame.mixer.music.stop()
+                    return
                 time.sleep(0.05)
 
-    def speak_sentence(self, text):
+    def speak_sentence(self, text, interrupt=None):
         """Streamed speech: synth overlaps the previous sentence's playback."""
-        if not self.enabled:
+        if not self.enabled or (interrupt is not None and interrupt.is_set()):
             return
         text = clean_for_speech(text, 1000)
         if not text:
@@ -195,7 +210,9 @@ class Speaker:
             path = os.path.join(tempfile.gettempdir(),
                                 f"jarvis_tts_{self._idx % 2}.mp3")
             self.synth_to_file(text, path)
-            self.wait_idle()
+            self.wait_idle(interrupt)
+            if interrupt is not None and interrupt.is_set():
+                return
             self.play_file(path, wait=False)
         except Exception as e:
             log.warning("Streamed TTS failed (%s); falling back", e)
@@ -498,7 +515,11 @@ class Listener:
         self.cfg = cfg
         self.sd = sd
         self.oww = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
-        log.info("Wake-word model loaded")
+        # Second instance for barge-in: keeps its own audio history so it
+        # never fights the main detector's state.
+        self.oww_interrupt = Model(wakeword_models=["hey_jarvis"],
+                                   inference_framework="onnx")
+        log.info("Wake-word models loaded")
 
         from faster_whisper import WhisperModel
         self.whisper = WhisperModel(cfg["whisper_model"], device="cpu",
@@ -510,6 +531,10 @@ class Listener:
         self.noise_floor = None
         self.last_done = 0.0  # when the previous command finished
         self.usage_path = os.path.join(SCRIPT_DIR, "usage.json")
+        import threading
+        self.interrupt = threading.Event()
+        self._monitor_thread = None
+        self._monitor_stop = threading.Event()
         self.ack_path = self._prepare_ack()
 
     def _prepare_ack(self):
@@ -564,7 +589,15 @@ class Listener:
                     audio = self.record_command(stream, list(preroll))
                     preroll.clear()
                     self.oww.reset()
-                    self.handle_command(audio)
+                    # Barge-in can chain straight into a follow-up command.
+                    while audio is not None:
+                        self.handle_command(audio, stream)
+                        audio = None
+                        if self.interrupt.is_set():
+                            self.interrupt.clear()
+                            beep(880, 150)
+                            audio = self.record_command(stream)
+                    self.drain(stream)
                     log.info("Listening for 'hey jarvis'...")
 
     def record_command(self, stream, preroll=None):
@@ -597,6 +630,52 @@ class Listener:
                 if not heard_speech and i >= no_speech_frames:
                     break  # wake word fired but nothing followed
         return np.concatenate(frames) if frames else np.array([], dtype=np.int16)
+
+    def start_interrupt_monitor(self, stream):
+        """Watch for the wake word while Jarvis is talking, and cut him off.
+
+        Reads the same stream the main loop owns — safe because the main
+        thread is blocked in dispatch/TTS for the monitor's whole lifetime.
+        """
+        import threading
+
+        self.interrupt.clear()
+        self._monitor_stop.clear()
+        self.oww_interrupt.reset()
+
+        def monitor():
+            # Higher bar than normal: on speakers, Jarvis's own voice reaches
+            # the mic and must not trigger him.
+            threshold = self.cfg["interrupt_threshold"]
+            while not self._monitor_stop.is_set():
+                try:
+                    frame, _ = stream.read(CHUNK)
+                except Exception:
+                    return
+                score = self.oww_interrupt.predict(frame[:, 0])["hey_jarvis"]
+                if score >= threshold:
+                    log.info("Barge-in: wake word during speech (%.2f)", score)
+                    self.interrupt.set()
+                    self.speaker.stop()
+                    return
+
+        self._monitor_thread = threading.Thread(target=monitor, daemon=True)
+        self._monitor_thread.start()
+
+    def stop_interrupt_monitor(self):
+        self._monitor_stop.set()
+        if self._monitor_thread is not None:
+            self._monitor_thread.join(timeout=2)
+            self._monitor_thread = None
+
+    def drain(self, stream):
+        """Discard audio buffered while Jarvis was busy (incl. his own voice)."""
+        try:
+            while stream.read_available >= CHUNK:
+                stream.read(CHUNK)
+        except Exception:
+            pass
+        self.oww.reset()
 
     def claude_budget_left(self):
         """Remaining Claude dispatches today (local actions don't count)."""
@@ -644,7 +723,7 @@ class Listener:
                                               initial_prompt="Hey Jarvis,")
         return " ".join(s.text.strip() for s in segments).strip()
 
-    def handle_command(self, audio):
+    def handle_command(self, audio, stream=None):
         text = self.transcribe(audio)
         # Pre-roll may reintroduce the wake phrase, and Whisper decorates or
         # garbles it ("Welcome to Jarvis,", "this is Jarvis", "love is").
@@ -661,9 +740,14 @@ class Listener:
         if len(re.sub(r"[^a-zA-Z]", "", text)) < 3:
             beep(440, 120)  # heard nothing usable
             return
-        if re.fullmatch(r"(never mind|nevermind|cancel|stop)[.!]?",
-                        text.strip(), re.I):
+        if re.fullmatch(
+                r"(never ?mind|cancel|stop|stop talking|quiet|be quiet|"
+                r"shut up|enough|thanks|thank you|that's all|forget it)"
+                r"[.!]?", text.strip(), re.I):
+            log.info("Stop phrase: %r", text)
+            self.speaker.stop()
             beep(440, 120)
+            self.last_done = time.time()
             return
 
         action = match_local_action(text)
@@ -720,12 +804,12 @@ class Listener:
             return t.strip().rstrip(".!?").lower() in ("ok", "okay", "done")
 
         def on_sentence(s):
-            if is_trivial(s):
+            if is_trivial(s) or self.interrupt.is_set():
                 return  # bare action confirmation -> completion beep only
             if spoken_chars[0] >= self.cfg["max_speak_chars"]:
                 return  # cap reached; rest of the reply stays in the log
             spoken_chars[0] += len(s)
-            self.speaker.speak_sentence(s)
+            self.speaker.speak_sentence(s, self.interrupt)
 
         # Claude has no clock and can't run commands to get one; give it the
         # real local time so "what time is it" never guesses or tries a tool.
@@ -733,13 +817,22 @@ class Listener:
         now = datetime.datetime.now().strftime("%A, %B %d, %Y, %I:%M %p")
         prompt = f"(Context: user's local time is {now}.) {text}"
         self.record_claude_call(today, used)
-        reply = self.dispatcher.send(
-            prompt, on_sentence=on_sentence if self.cfg["speak_replies"] else None)
-        if spoken_chars[0] == 0 and reply and not is_trivial(reply):
-            # Nothing streamed (error path or speech disabled+re-enabled).
-            self.speaker.say(clean_for_speech(reply, self.cfg["max_speak_chars"]))
-        self.speaker.wait_idle()
-        beep(880, 120)  # done
+        if stream is not None and self.cfg["allow_barge_in"]:
+            self.start_interrupt_monitor(stream)
+        try:
+            reply = self.dispatcher.send(
+                prompt,
+                on_sentence=on_sentence if self.cfg["speak_replies"] else None)
+            if (spoken_chars[0] == 0 and reply and not is_trivial(reply)
+                    and not self.interrupt.is_set()):
+                # Nothing streamed (error path or speech disabled).
+                self.speaker.say(
+                    clean_for_speech(reply, self.cfg["max_speak_chars"]))
+            self.speaker.wait_idle(self.interrupt)
+        finally:
+            self.stop_interrupt_monitor()
+        if not self.interrupt.is_set():
+            beep(880, 120)  # done
         self.last_done = time.time()
 
 

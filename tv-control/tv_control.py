@@ -235,6 +235,20 @@ _warm_ever_up = False
 # the network is gone well before that completes.
 WARM_MAX_AGE = 20.0
 
+# Windows allows an application approximately two seconds to handle
+# PBT_APMSUSPEND before it may be interrupted, and that deadline is hard-coded
+# - it dropped from 20s to 2s in Vista and is not configurable:
+#   https://learn.microsoft.com/en-us/windows/win32/power/pbt-apmsuspend
+#   https://devblogs.microsoft.com/oldnewthing/20111124-00/?p=9043
+# ws.send() only fills the socket buffer, so the one useful thing to do with
+# that budget is keep running long enough for the NIC to transmit the segment.
+# Spend most of it dwelling, keeping a margin for the send itself, the socket
+# close and the rest of the handler. Previously only ~0.55s of the 2s was used
+# (0.25s here plus 0.3s in the listener), giving the segment far less time to
+# leave than Windows actually permits.
+SUSPEND_BUDGET = 2.0
+SUSPEND_DWELL = 1.5
+
 
 def warm_connect(force: bool = False) -> bool:
     """Ensure a live WebSocket to the TV is held open. Safe to call often."""
@@ -277,14 +291,16 @@ def warm_connect(force: bool = False) -> bool:
     return True
 
 
-def _send_key_warm(key: str, dwell: float = 0.25) -> bool:
+def _send_key_warm(key: str, dwell: float = SUSPEND_DWELL) -> bool:
     """Send on the already-open socket. Returns True if it went out.
 
-    `dwell` blocks briefly after the write: ws.send() only copies bytes into
-    the socket buffer, and when the system is suspending the NIC can go down
+    `dwell` blocks after the write: ws.send() only copies bytes into the
+    socket buffer, and when the system is suspending the NIC can go down
     before they are transmitted (observed: the send "succeeded" in 0ms and
     the TV never reacted). Windows waits for the suspend handler to return,
-    so this pause buys the segment time to actually leave.
+    so this pause buys the segment time to actually leave - and it is sized
+    to use most of the ~2s Windows really grants (SUSPEND_BUDGET) instead of
+    a fraction of it.
     """
     global _warm_ws
     with _warm_lock:

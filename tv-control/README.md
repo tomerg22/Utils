@@ -63,9 +63,14 @@ built-in timeout), and never comes back on by itself.
   (`HWND_MESSAGE`) window never receives broadcast `WM_POWERBROADCAST`, so
   suspend/resume events silently never arrive at all, while the targeted
   display-state notifications still do — a confusing half-working state.
-  After sending, the handler dwells ~300 ms and the socket sets `TCP_NODELAY`,
-  because `ws.send()` only fills the socket buffer and the NIC can go down
-  before those bytes are ever transmitted.
+  After sending, the handler dwells and the socket sets `TCP_NODELAY`, because
+  `ws.send()` only fills the socket buffer and the NIC can go down before those
+  bytes are ever transmitted. Windows grants roughly **2 s** to handle
+  `PBT_APMSUSPEND` and that deadline is [hard-coded and not
+  configurable](https://devblogs.microsoft.com/oldnewthing/20111124-00/?p=9043)
+  (it was 20 s until Vista), so the dwell is sized to spend most of it —
+  `SUSPEND_DWELL` (1.5 s) against a `SUSPEND_BUDGET` of 2 s, tuned in
+  `tv_control.py` alone rather than split across both files.
 - **Manual sleep should use `sleep_pc.py`, not the Start menu.** The suspend
   hook is best-effort, not a guarantee. Measured on one machine:
 
@@ -262,9 +267,14 @@ The interpreter copy `pyw_tvcontrol.exe` lives in the Python install directory
 - **TV never switches off on sleep** — read the log line at the moment of
   suspend. `warm send failed at socket age N` means the held socket was dead
   (shorten `WARM_MAX_AGE`); `sent on warm connection` with the TV still on
-  means the bytes did not reach the NIC in time, and the local approach is at
-  its limit — switch the suspend path to SmartThings' cloud `switch: off`,
-  which is delivered by Samsung's servers *after* the PC has suspended.
+  means the bytes did not reach the NIC in time. Raise `SUSPEND_DWELL` first —
+  but it cannot exceed `SUSPEND_BUDGET`, because Windows may interrupt the
+  handler at ~2 s and the deadline cannot be extended. Once the dwell is at the
+  budget the local approach really is at its limit: switch the suspend path to
+  SmartThings' cloud `switch: off`, which is delivered by Samsung's servers
+  *after* the PC has suspended. Note this path can never *confirm* delivery
+  (the TV sends no acknowledgement) — for sleeps you trigger yourself, use
+  `sleep_pc.py`, which does.
 - **TV IP changed and control stopped** — should self-heal via the ARP scan
   (watch for "ARP fallback" lines in the log). If your subnet isn't a /24 or
   differs from `SUBNET_PREFIX`, fix the constant.

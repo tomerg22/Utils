@@ -153,10 +153,12 @@ def wnd_proc(hwnd, msg, wparam, lparam):
             return 0
 
         if wparam == PBT_APMSUSPEND:
+            # Windows waits for this handler to return before it suspends, but
+            # only for ~2s. That whole budget is now spent inside power_off's
+            # warm send (tv_control.SUSPEND_DWELL), so it is accounted for in
+            # one place. A second dwell here would land *after* the socket
+            # close and push the total past the deadline for no gain.
             _do_power_off("System suspending (suspend hook)")
-            # Windows waits for this handler to return before it suspends;
-            # dwell so a just-sent TCP segment actually leaves the NIC.
-            time.sleep(0.3)
             return 0
 
         if wparam in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):

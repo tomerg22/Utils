@@ -253,7 +253,13 @@ class ClaudeDispatcher:
     IDLE_TIMEOUT = 180  # max seconds between stream events before giving up
 
     def __init__(self, cfg):
-        self.exe = find_claude()
+        # Resolved lazily: at logon Jarvis often starts before the Claude
+        # app has unpacked its CLI. Local voice actions must work anyway.
+        try:
+            self.exe = find_claude()
+        except FileNotFoundError:
+            self.exe = None
+            log.warning("claude CLI not found yet; will retry on first command")
         self.cfg = cfg
         self.proc = None
         self.lines = None  # queue fed by the stdout reader thread
@@ -261,7 +267,12 @@ class ClaudeDispatcher:
         self.stderr_file = open(os.path.join(SCRIPT_DIR, "claude_stderr.log"),
                                 "a", encoding="utf-8")
         log.info("Using claude CLI: %s", self.exe)
-        self._ensure()
+        if self.exe:
+            # Pre-warm so the first voice command doesn't pay spawn cost.
+            try:
+                self._ensure()
+            except FileNotFoundError:
+                pass
 
     def _ensure(self):
         if self.proc is not None and self.proc.poll() is None:
@@ -278,9 +289,9 @@ class ClaudeDispatcher:
 
         # Re-resolve on every respawn: the CLI auto-updates and deletes the
         # old version folder, invalidating a cached path mid-session.
-        if not os.path.exists(self.exe):
+        if self.exe is None or not os.path.exists(self.exe):
             self.exe = find_claude()
-            log.info("claude CLI moved; now using %s", self.exe)
+            log.info("claude CLI resolved: %s", self.exe)
 
         cmd = [self.exe, "-p",
                "--input-format", "stream-json",
@@ -321,7 +332,12 @@ class ClaudeDispatcher:
         import queue
 
         for attempt in (1, 2):
-            self._ensure()
+            try:
+                self._ensure()
+            except FileNotFoundError:
+                log.error("claude CLI still unavailable")
+                return ("Claude Code isn't available yet, sir. "
+                        "App and media controls still work.")
             msg = json.dumps({"type": "user",
                               "message": {"role": "user", "content": prompt}})
             try:
@@ -899,6 +915,15 @@ def main():
         guard.listen(1)
     except OSError:
         return  # another instance is already listening
+
+    # At logon the Claude app may still be unpacking its CLI; give it a
+    # grace period so the first commands aren't refused. Non-fatal.
+    for _ in range(30):
+        try:
+            find_claude()
+            break
+        except FileNotFoundError:
+            time.sleep(2)
 
     while True:  # outer loop survives audio-device hiccups (sleep/unplug)
         try:

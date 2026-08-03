@@ -70,7 +70,12 @@ built-in timeout), and never comes back on by itself.
   configurable](https://devblogs.microsoft.com/oldnewthing/20111124-00/?p=9043)
   (it was 20 s until Vista), so the dwell is sized to spend most of it —
   `SUSPEND_DWELL` (1.5 s) against a `SUSPEND_BUDGET` of 2 s, tuned in
-  `tv_control.py` alone rather than split across both files.
+  `tv_control.py` alone rather than split across both files. That long dwell
+  applies **only** on the suspend path (`power_off(suspending=True)`);
+  everywhere else `NORMAL_DWELL` (0.3 s) is enough, since nothing is racing
+  the send. On the suspend path the fallbacks are skipped entirely — a fresh
+  connect costs ~1.3 s and an ARP rediscovery ~2 s more, so neither can finish
+  before the deadline and they would only obscure the log.
 - **Manual sleep should use `sleep_pc.py`, not the Start menu.** The suspend
   hook is best-effort, not a guarantee. Measured on one machine:
 

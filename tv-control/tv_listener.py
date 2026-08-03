@@ -85,7 +85,7 @@ RESUME_IGNORE_WINDOW = 20.0
 POWER_ON_DEBOUNCE = 20.0
 
 
-def _do_power_off(source: str) -> None:
+def _do_power_off(source: str, suspending: bool = False) -> None:
     """Send the off toggle at most once per on/off cycle.
 
     This TV ignores KEY_POWEROFF, KEY_POWER_OFF and KEY_STANDBY (all verified
@@ -101,7 +101,8 @@ def _do_power_off(source: str) -> None:
         return
     log(f"{source} -> turning TV off")
     try:
-        tv_control.power_off()  # sets the shared believed-off flag itself
+        # sets the shared believed-off flag itself
+        tv_control.power_off(suspending=suspending)
     except Exception:
         log("power_off failed:\n" + traceback.format_exc())
 
@@ -158,7 +159,7 @@ def wnd_proc(hwnd, msg, wparam, lparam):
             # warm send (tv_control.SUSPEND_DWELL), so it is accounted for in
             # one place. A second dwell here would land *after* the socket
             # close and push the total past the deadline for no gain.
-            _do_power_off("System suspending (suspend hook)")
+            _do_power_off("System suspending (suspend hook)", suspending=True)
             return 0
 
         if wparam in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):

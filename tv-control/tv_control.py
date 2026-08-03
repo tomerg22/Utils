@@ -249,6 +249,12 @@ WARM_MAX_AGE = 20.0
 SUSPEND_BUDGET = 2.0
 SUSPEND_DWELL = 1.5
 
+# Everywhere else there is no deadline to spend and nothing racing the send,
+# so the dwell only needs to cover handing the segment to a healthy NIC.
+# Using SUSPEND_DWELL here would make `tv_control.py off` and the idle
+# display-off path block for 1.5s to no purpose.
+NORMAL_DWELL = 0.3
+
 
 def warm_connect(force: bool = False) -> bool:
     """Ensure a live WebSocket to the TV is held open. Safe to call often."""
@@ -291,7 +297,7 @@ def warm_connect(force: bool = False) -> bool:
     return True
 
 
-def _send_key_warm(key: str, dwell: float = SUSPEND_DWELL) -> bool:
+def _send_key_warm(key: str, dwell: float = NORMAL_DWELL) -> bool:
     """Send on the already-open socket. Returns True if it went out.
 
     `dwell` blocks after the write: ws.send() only copies bytes into the
@@ -341,7 +347,7 @@ def start_warm_keepalive(interval: float = 5.0) -> None:
     _log("warm keepalive thread started")
 
 
-def power_off(fast: bool = True) -> None:
+def power_off(fast: bool = True, suspending: bool = False) -> None:
     """Send the TV power key.
 
     fast=True skips the pre-flight REST checks. When the PC is suspending,
@@ -349,12 +355,27 @@ def power_off(fast: bool = True) -> None:
     (resolve + state) reliably lose that race. Sending to an already-off TV
     is harmless: its WebSocket server is unreachable, so the attempt simply
     fails and is logged.
+
+    suspending=True means this is running inside the PBT_APMSUSPEND handler,
+    under the hard ~2s budget: dwell for most of it (SUSPEND_DWELL), and skip
+    every fallback, since none of them can finish before the deadline.
     """
     set_believed_off(True)
 
     # Fastest path: reuse the already-open socket (~5ms). This is the only
     # path with any chance of completing while the system is suspending.
-    if fast and _send_key_warm("KEY_POWER"):
+    if fast and _send_key_warm(
+            "KEY_POWER", dwell=SUSPEND_DWELL if suspending else NORMAL_DWELL):
+        return
+
+    if suspending:
+        # Nothing below can complete inside the remaining budget: a fresh
+        # connect alone costs ~1.3s and an ARP rediscovery ~2s more, so they
+        # would be interrupted mid-flight and only obscure the log. Fail fast
+        # and record why - the recovery path is sleep_pc.py, which switches
+        # the TV off and confirms it *before* suspend is ever requested.
+        _log("power_off: no usable warm socket during suspend - skipping "
+             f"fallbacks (they cannot finish within {SUSPEND_BUDGET:.0f}s)")
         return
 
     ip = _read_cached_ip() if fast else resolve_tv_ip()

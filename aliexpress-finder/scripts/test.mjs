@@ -478,6 +478,186 @@ console.log('\nrank — --spread stratifies the shortlist across sold tiers');
     JSON.stringify(r.ranked.map((x) => [x.id, x.pick])));
 }
 
+// ------------------------------------------------- hard constraints (D1)
+/* The user said "must have wires". The requirement got demoted to a
+ * preference and traded against score, producing a recommendation that failed
+ * the one stated requirement — twice. A constraint is a filter, not a weight.
+ */
+console.log('\nrank — a stated constraint is a FILTER, never a weight');
+{
+  const pool = [
+    { id: 'nowires', title: 'great module', rating: 5, sold: 10000, reviews: 5000,
+      constraints: { wires: 'fail' } },
+    { id: 'wires', title: 'humbler module', rating: 4.5, sold: 200, reviews: 40,
+      constraints: { wires: 'pass' } },
+  ];
+  const r = rank(pool, ['--mode', 'final', '--top', '4', '--constraint', 'wires']);
+  const ids = r.ranked.map((x) => x.id);
+  ok('constraint-failing item is NEVER ranked, however good its score',
+    !ids.includes('nowires'), JSON.stringify(ids));
+  ok('constraint-passing item is ranked even though it scores lower',
+    ids.includes('wires'), JSON.stringify(ids));
+  eq('violation is counted', r.constraintViolations, 1);
+  ok('violation names the constraint',
+    Object.keys(r.droppedReasons).some((k) => k === 'violates:wires'),
+    JSON.stringify(r.droppedReasons));
+
+  // Without the flag nothing changes — constraints are opt-in.
+  const r0 = rank(pool, ['--mode', 'final', '--top', '4']);
+  ok('no --constraint means old behaviour', r0.ranked.map((x) => x.id).includes('nowires'));
+}
+{
+  // "I did not check" must not become "it qualifies".
+  const pool = [
+    { id: 'unchecked', title: 'module', rating: 4.9, sold: 5000, reviews: 900 },
+    { id: 'checked', title: 'module', rating: 4.2, sold: 300, reviews: 60,
+      constraints: { wires: 'pass' } },
+  ];
+  const r = rank(pool, ['--mode', 'final', '--top', '4', '--constraint', 'wires']);
+  const ids = r.ranked.map((x) => x.id);
+  ok('unverified item is held OUT of ranked', !ids.includes('unchecked'), JSON.stringify(ids));
+  ok('unverified item is surfaced, not silently dropped',
+    r.unverified.map((x) => x.id).includes('unchecked'));
+  eq('unverified is counted', r.unverifiedCount, 1);
+  ok('unverified raises a warning',
+    r.warnings.some((w) => /unverified-constraint/.test(w)), JSON.stringify(r.warnings));
+}
+{
+  // Nothing qualifies: the report must say so, not substitute a violator.
+  const pool = [
+    { id: 'a', title: 'module', rating: 5, sold: 10000, reviews: 900, constraints: { wires: 'fail' } },
+    { id: 'b', title: 'module', rating: 4.9, sold: 9000, reviews: 800, constraints: { wires: 'fail' } },
+  ];
+  const r = rank(pool, ['--mode', 'final', '--top', '4', '--constraint', 'wires']);
+  eq('nothing qualifies -> empty ranked', r.ranked.length, 0);
+  ok('note says constraints unsatisfied', /no candidate satisfies/.test(r.note || ''), r.note);
+  ok('warns against substituting a violator',
+    r.warnings.some((w) => /NEVER substitute/.test(w)), JSON.stringify(r.warnings));
+}
+
+// ------------------------------------- absence is not evidence (D2)
+/* A title regex for "wire" found nothing and that was reported as "wired 9V
+ * modules do not exist". Titles omit physical attributes. The warning fires
+ * in-band, where the false conclusion gets drawn.
+ */
+console.log('\nrank — a collapsed title filter is NOT evidence of absence');
+{
+  const pool = Array.from({ length: 30 }, (_, n) => ({
+    id: 'i' + n, title: 'ac dc power module 9v', rating: 4.8, sold: 500, reviews: 80,
+  }));
+  const r = rank(pool, ['--mode', 'final', '--top', '4', '--require', 'wire|כבל']);
+  eq('title filter really did collapse the pool', r.ranked.length, 0);
+  ok('absence warning is emitted',
+    r.warnings.some((w) => /absence-is-not-evidence/.test(w)), JSON.stringify(r.warnings));
+  ok('warning names the image/description check',
+    r.warnings.some((w) => /listing\.js|labels\.sh|IMAGES/.test(w)), JSON.stringify(r.warnings));
+
+  // A filter that keeps most of the pool must NOT cry wolf.
+  const r2 = rank(pool, ['--mode', 'final', '--top', '4', '--require', 'module']);
+  ok('no false alarm when the filter keeps the pool',
+    !r2.warnings.some((w) => /absence-is-not-evidence/.test(w)), JSON.stringify(r2.warnings));
+}
+
+// ------------------------------------------------- listing.js (D3 + D4)
+/* listing.js must (a) refuse to parse a wall, (b) return text AND images in
+ * ONE call so they cannot drift apart, (c) see images that live behind a
+ * shadow root, (d) tell you the page changed after expanding.
+ */
+console.log('\nlisting.js — text and images come back together, shadow DOM included');
+{
+  const listingSrc = readFileSync(join(HERE, 'listing.js'), 'utf8');
+
+  // Minimal DOM stub: enough for querySelectorAll('*'), shadowRoot, innerText.
+  const mkEl = (tag, props = {}) => ({
+    tagName: tag, children: props.children || [], childrenList: props.children || [],
+    textContent: props.text || '', className: props.cls || '',
+    naturalWidth: props.nw || 0, naturalHeight: props.nh || 0,
+    currentSrc: props.src || '', src: props.src || '',
+    shadowRoot: props.shadow || null,
+    // The carton qualifier lives in a SIBLING, so the reader must consult the
+    // parent's text — model that here or the regression cannot be caught.
+    parentElement: props.parent || null,
+    getAttribute: (k) => (props.attrs || {})[k] || null,
+    closest: () => null, click() { (props.onClick || (() => {}))(); },
+  });
+  const mkRoot = (els) => ({ querySelectorAll: () => els });
+
+  const runListing = ({ href, bodyText, els, shadowEls = [] }) => {
+    const host = mkEl('DIV', { shadow: mkRoot(shadowEls) });
+    const all = [...els, host];
+    const document = {
+      body: { scrollHeight: 5000, innerText: bodyText },
+      querySelectorAll: () => all,
+    };
+    const sandbox = {
+      window: { scrollTo() {} }, document, location: { href },
+      console,
+    };
+    sandbox.window.document = document;
+    const fn = new Function('window', 'document', 'location',
+      `${listingSrc}; return window.__aeListing;`);
+    return fn(sandbox.window, document, sandbox.location);
+  };
+
+  // (a) the wall must be detected before anything is parsed
+  const blockedApi = runListing({
+    href: 'https://he.aliexpress.com/_____tmd_____/punish?x5secdata=abc',
+    bodyText: 'Sorry, we have detected unusual traffic', els: [],
+  });
+  const blockedRes = blockedApi.read();
+  ok('listing.js reports a wall as blocked, not as empty data', blockedRes.blocked === true);
+  ok('blocked result tells the operator to stop this turn',
+    /STOP and tell the user/.test(blockedRes.note || ''), blockedRes.note);
+
+  // (b)+(c) text and images in one call, image hidden behind a shadow root
+  const shadowImg = mkEl('IMG', {
+    src: 'https://ae-pic-a1.aliexpress-media.com/kf/Sbig.jpg', nw: 800, nh: 800,
+  });
+  const api = runListing({
+    href: 'https://he.aliexpress.com/item/123.html',
+    bodyText: 'גודל: 8 ס"מ x 3.7 ס"מ x 2 ס"מ OUTPUT:9V1.6A',
+    els: [
+      mkEl('SPAN', { text: 'גודל: 8 ס"מ x 3.7 ס"מ x 2 ס"מ' }),
+      mkEl('SPAN', { text: 'OUTPUT:9V1.6A' }),
+      // The real page renders the carton size as a BARE leaf whose qualifier
+      // sits in the parent. Testing the leaf alone missed it on the live site.
+      mkEl('SPAN', {
+        text: '12×7×4 סמ',
+        parent: { textContent: 'גודל החבילה: 12×7×4 סמ, משקל: 0.059 קג' },
+      }),
+      mkEl('IMG', { src: 'https://ae-pic-a1.aliexpress-media.com/kf/Sicon.png', nw: 27, nh: 27 }),
+    ],
+    shadowEls: [shadowImg],
+  });
+  const res = api.read();
+  ok('image behind a shadow root IS found (bare querySelectorAll returns 1)',
+    res.gallery.some((u) => /Sbig\.jpg/.test(u)), JSON.stringify(res.gallery));
+  ok('27x27 icons are not mistaken for product images',
+    !res.gallery.some((u) => /Sicon/.test(u)), JSON.stringify(res.gallery));
+  ok('the SAME call also returns the size line', res.sizeLines.length > 0,
+    JSON.stringify(res.sizeLines));
+  ok('the size line that was missed is captured',
+    res.sizeLines.some((s) => /8 ס"מ x 3\.7/.test(s.text)), JSON.stringify(res.sizeLines));
+  ok('carton size is identified via the PARENT text, not the leaf',
+    res.packageSizeLines.some((t) => /12×7×4/.test(t)), JSON.stringify(res.packageSizeLines));
+  ok('carton size is kept OUT of the product sizes',
+    !res.productSizeLines.some((t) => /12×7×4/.test(t)), JSON.stringify(res.productSizeLines));
+  ok('the real product size IS in productSizeLines',
+    res.productSizeLines.some((t) => /8 ס"מ x 3\.7/.test(t)), JSON.stringify(res.productSizeLines));
+  ok('the electrical rating line is captured',
+    res.ratingLines.some((t) => /9V1\.6A/.test(t)), JSON.stringify(res.ratingLines));
+  ok('read() reminds that the photo label outranks text fields',
+    /outrank/.test(res.reminder || ''), res.reminder);
+  ok('text and images arrive in ONE result object',
+    typeof res.text === 'string' && Array.isArray(res.gallery));
+
+  // (d) a mutation must be detectable
+  ok('changed() reports true against a stale fingerprint',
+    api.changed({ height: 1, textLen: 1, imgs: 0, leaves: 0 }) === true);
+  ok('changed() reports false against a current fingerprint',
+    api.changed(api.fingerprint()) === false);
+}
+
 // -------------------------------------------------------------------------
 console.log(`\n${fails.length ? 'FAILED' : 'PASSED'} — ${pass} assertions ok, ${fails.length} failed`);
 if (fails.length) { fails.forEach((f) => console.log('  - ' + f)); process.exit(1); }

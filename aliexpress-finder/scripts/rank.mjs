@@ -54,6 +54,41 @@ const BRAND_DEFAULT = Number(arg('brand-default', 0.5));
 const REQUIRE = arg('require', null); // regex on title — drops off-category items
 const SPREAD = Math.max(0, Number(arg('spread', 0)));
 
+/* All occurrences of a repeatable flag, e.g. --constraint wires --constraint 9v */
+const argAll = (name) => {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) if (argv[i] === `--${name}`) out.push(argv[i + 1]);
+  return out.filter(Boolean);
+};
+
+/* WHY --constraint EXISTS (measured 2026-08-21, Tapo C222 session)
+ *
+ * The user said "must have wires". A search found only pin-terminal modules,
+ * so the requirement was silently demoted from a FILTER to a PREFERENCE and
+ * traded against things the ranker liked better (current headroom, brand).
+ * The result was a recommendation that failed the one stated requirement —
+ * twice, including once AFTER the user supplied a wired counter-example.
+ *
+ * A requirement the user states is a filter, not a weight. There is no score
+ * high enough to buy back a violated constraint.
+ *
+ * The second half matters as much: "I could not verify it" must never quietly
+ * become "it qualifies". An item whose constraint status is unknown is held
+ * OUT of `ranked` and listed in `unverified`, so the report cannot present it
+ * as satisfying a requirement nobody checked.
+ *
+ * Items declare status per constraint:
+ *   { constraints: { wires: 'pass' | 'fail' | 'unknown' } }
+ */
+const CONSTRAINTS = argAll('constraint');
+const constraintStatus = (item, name) => {
+  const c = item && item.constraints;
+  const v = c && typeof c === 'object' ? c[name] : undefined;
+  if (v === true || v === 'pass') return 'pass';
+  if (v === false || v === 'fail') return 'fail';
+  return 'unknown';
+};
+
 /* WHY --spread EXISTS (measured 2026-08-21)
  *
  * In shortlist mode the only volume signal is `sold`, which the storefront
@@ -120,17 +155,56 @@ const reqRe = REQUIRE ? new RegExp(REQUIRE, 'i') : null;
 
 const kept = [];
 const dropped = [];
+const unverified = [];
+let requireDropped = 0;
 for (const i of all) {
   const ev = evidenceOf(i);
-  if (reqRe && !reqRe.test(i.title || '')) dropped.push({ ...i, why: 'off-category' });
+  const violated = CONSTRAINTS.filter((n) => constraintStatus(i, n) === 'fail');
+  const unknown = CONSTRAINTS.filter((n) => constraintStatus(i, n) === 'unknown');
+  if (reqRe && !reqRe.test(i.title || '')) { dropped.push({ ...i, why: 'off-category' }); requireDropped++; }
+  else if (violated.length) dropped.push({ ...i, why: `violates:${violated.join('+')}` });
   else if (i.rating == null) dropped.push({ ...i, why: 'no rating' });
   else if (i.rating < MIN_RATING) dropped.push({ ...i, why: `rating<${MIN_RATING}` });
   else if (!ev || ev < MIN_EVIDENCE) dropped.push({ ...i, why: `evidence<${MIN_EVIDENCE}` });
+  // Unverified is held back LAST, so a genuinely bad item is reported as bad
+  // rather than as merely unchecked.
+  else if (unknown.length) unverified.push({ ...i, why: `unverified:${unknown.join('+')}` });
   else kept.push(i);
 }
 
+/* WHY THESE WARNINGS EXIST (measured 2026-08-21)
+ *
+ * A title-regex search for the word "wire" returned nothing, and that empty
+ * result was reported to the user as "wired 9V modules do not exist". They do.
+ * The user produced one within minutes. Titles simply do not mention physical
+ * attributes — wires, connector type, mounting, enclosure, size — so a title
+ * filter collapsing to zero says something about TITLES, never about the world.
+ *
+ * The warning is emitted in-band, at the exact moment the false conclusion
+ * gets drawn, because prose in a doc did not stop it.
+ */
+const warnings = [];
+const ABSENCE = 'absence-is-not-evidence: a title regex found nothing. Titles omit physical ' +
+  'attributes (wires, connectors, mounting, enclosure, dimensions). Do NOT report that the ' +
+  'product does not exist. Verify on the IMAGES and description of >=3 candidates first ' +
+  '(listing.js + labels.sh).';
+if (reqRe && all.length >= 10 && requireDropped >= 0.9 * all.length) warnings.push(ABSENCE);
+if (CONSTRAINTS.length && unverified.length)
+  warnings.push(`unverified-constraint: ${unverified.length} item(s) were NOT ranked because ` +
+    `their status for [${CONSTRAINTS.join(', ')}] is unknown. Check them, do not assume they pass.`);
+
 if (!kept.length) {
-  console.log(JSON.stringify({ mode: MODE, ranked: [], dropped, note: 'no candidates survived filters' }, null, 2));
+  if (reqRe && !warnings.includes(ABSENCE)) warnings.push(ABSENCE);
+  if (CONSTRAINTS.length)
+    warnings.push('no candidate satisfies the stated constraints. Report that plainly. ' +
+      'NEVER substitute an item that fails a constraint, not even as an alternative, ' +
+      'without saying in the same sentence that it fails it.');
+  console.log(JSON.stringify({
+    mode: MODE, constraints: CONSTRAINTS, ranked: [], unverified, warnings,
+    considered: all.length, dropped,
+    note: CONSTRAINTS.length ? 'no candidate satisfies the stated constraints'
+                             : 'no candidates survived filters',
+  }, null, 2));
   process.exit(0);
 }
 
@@ -236,6 +310,11 @@ console.log(
       spreadTiers: SPREAD
         ? ranked.filter((r) => r.pick === 'spread').map((r) => r.spreadTier)
         : [],
+      constraints: CONSTRAINTS,
+      constraintViolations: dropped.filter((d) => d.why.startsWith('violates:')).length,
+      unverifiedCount: unverified.length,
+      unverified,
+      warnings,
       considered: all.length,
       kept: kept.length,
       droppedCount: dropped.length,

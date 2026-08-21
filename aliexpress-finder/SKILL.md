@@ -28,6 +28,61 @@ node ~/.claude/skills/aliexpress-finder/scripts/test.mjs
 the headline.** Do not keep working and mention it later in a summary. See
 step 2. This is not a nicety — it happened, and it is why step 3 changed.
 
+## The second rule — a stated requirement is a filter, not a weight
+
+**Write the user's hard requirements down verbatim before searching, and pass
+each one to `rank.mjs` as `--constraint <name>`.** There is no score high
+enough to buy back a violated requirement, and no "but this one is better"
+that survives it.
+
+The failure this exists for: the user said **"they must be with wires"**. A
+search turned up only pin-terminal modules, so the requirement was quietly
+demoted to a preference and traded against things the ranker liked more —
+current headroom, brand, certification. The result was a recommendation that
+failed the one stated requirement, offered twice, the second time *after* the
+user had supplied a wired counter-example. Three separate corrections from the
+user ("not the socket type, wires", "must be with wires", "it's very simple AC
+DC") did not stop it.
+
+Three concrete obligations:
+
+- **Never present an item that fails a stated requirement** — not as the pick,
+  not as an alternative, not as "the one I would take" — unless the same
+  sentence says it fails the requirement and the user is asked whether to
+  relax it.
+- **"I could not verify it" is not "it qualifies."** `rank.mjs` holds
+  unverified items OUT of `ranked` and lists them under `unverified`. Check
+  them or report them as unchecked; never let unchecked drift into the table.
+- **If nothing satisfies the requirement, say exactly that.** An empty result
+  is a finding and a legitimate answer. Substituting a violator is not.
+
+Relaxing a requirement is the **user's** call. If you believe a requirement is
+expensive, say so in one sentence — "this rules out the whole Hi-Link family,
+which costs you X" — and let them decide.
+
+## The third rule — for hardware, the photo is the spec sheet
+
+**Read the label in the product images before quoting any rating.** Run
+`listing.js`, download `gallery` with `labels.sh`, and read it. Text fields on
+a listing are frequently absent, wrong, or junk; the silkscreen on the case is
+the manufacturer's own number.
+
+Measured: a RUIHONG RH-15W listing states its output current in **no** text
+field. The variant selector offers voltage only (labelled "Color"), and the
+spec table reads certification `NONE` and rated capacity `>1000VA` for a 59 g
+part. The real rating, `OUTPUT: 9V1.6A`, is printed on the case and legible in
+gallery image 1. Scraping text and inferring from a customer review produced
+"~5 W, ~0.55 A" — wrong by about 3x — and that invented number was used to
+argue against the product the user had chosen.
+
+Corollary: **never report that something does not exist because a keyword
+search missed it.** Titles omit physical attributes — wires, connector type,
+mounting, enclosure, dimensions. A title search for "wire" returning zero says
+something about titles, not about the world. `rank.mjs` now emits an
+`absence-is-not-evidence` warning when a `--require` regex collapses the pool;
+when you see it, go look at images and descriptions before writing a word
+about absence.
+
 ## Step 1 — Build the search URL
 
 Reduce the description to 2-4 English keywords. English queries work fine on the
@@ -283,6 +338,49 @@ For each selected item, navigate to its URL and run:
 JSON-LD carries rating, reviewCount, price and currency — but **not** sold count
 and **not** brand. Sold comes from the body text; brand comes from step 6.
 
+### Read the whole listing — both channels, one call
+
+JSON-LD is the review numbers only. For anything physical — ratings, current,
+dimensions, what is on the output — install `scripts/listing.js` and run:
+
+```js
+__aeListing.read()
+```
+
+It expands every "show more" first, then returns **text and images together**:
+`sizeLines`, `ratingLines`, `variants`, `gallery`, `text`, plus a
+`fingerprint`. One call, both channels, deliberately — see the defect below.
+
+Three things it encodes that cost real time to discover:
+
+- **`document.querySelectorAll('img')` returns ONE image on a detail page** (a
+  240x240 icon) while dozens are displayed. The gallery lives behind a shadow
+  root; a shadow-DOM walk finds ~74. `_dida_config_._init_data_` is **empty**
+  on detail pages (length 2) — it only carries data on search pages. Every
+  collector in `listing.js` recurses through `shadowRoot`.
+- **Any mutation invalidates your previous read.** Expanding a description or
+  selecting a variant changes the DOM. `changed(fp)` tells you whether a
+  re-read is owed. If you clicked anything, you owe one.
+- **A "size" line may be the shipping box.** `sizeLinesArePackage` separates
+  them. `12 x 7 x 4 cm / 59 g` was the carton; the product was `8 x 3.7 x 2 cm`.
+
+Then read the labels — this is not optional for hardware:
+
+```bash
+scripts/labels.sh fetch /tmp/labels <url1> <url2> ...
+```
+
+Downloads are **WebP even when the URL ends in .jpg**, so the script converts
+to PNG (`sips`; PIL is not installed here). If the case text is too small to
+read in the 800x800 shot — and it usually is — crop and upscale:
+
+```bash
+scripts/labels.sh crop /tmp/labels/img1.png 295 328 150 175
+```
+
+Reading the uncropped image is exactly how `OUTPUT: 9V1.6A` went unnoticed on
+the first pass.
+
 **Detail price often differs from search price** — the grid shows a
 cheapest-variant or promo figure. Observed gaps in one run: ₪22.30 → ₪37.44
 (+68%), ₪5.30 → ₪12.25, ₪11.30 → ₪21.82. **Always report the detail-page price**
@@ -322,11 +420,16 @@ rule promotes counterfeits, because the fakes wear the strongest brand names.
 
 ## Step 7 — Final rank
 
-Add `reviews` and any `brandScore` to each finalist, then:
+Add `reviews`, any `brandScore`, and a `constraints` status per hard
+requirement to each finalist, then pass every requirement as `--constraint`:
 
 ```bash
-node ~/.claude/skills/aliexpress-finder/scripts/rank.mjs --mode final --top 4 < finalists.json
+node ~/.claude/skills/aliexpress-finder/scripts/rank.mjs --mode final --top 4 --constraint wires < finalists.json
 ```
+
+Each item carries `{"constraints": {"wires": "pass" | "fail" | "unknown"}}`.
+`fail` is dropped and counted in `constraintViolations`; `unknown` is held out
+of `ranked` and listed under `unverified`. Both are reported — see step 8.
 
 When any item carries a `brandScore`, weights are 0.60 quality / 0.25 volume /
 0.15 brand, and items without one use the neutral `--brand-default` (0.5), are
@@ -339,6 +442,15 @@ data.
 Table of the 4: title, detail price ₪, rating, review count, sold, brand verdict,
 link. Then, briefly:
 
+- **the hard requirements, and that every listed item passes them.** If any
+  item in the table fails one, it does not belong in the table. If `ranked` is
+  empty, say plainly that nothing satisfies the requirement — that is the
+  answer, not a reason to substitute something else.
+- **anything in `unverified`** — named, with what is unchecked about it. Never
+  present an unverified item as satisfying a requirement.
+- **which specs came from the product photo** rather than a text field, and any
+  place where the two disagree. The photo wins; say so.
+- **dimensions**, and whether the figure is the product or the shipping carton.
 - why each won (cite the actual numbers)
 - **coverage, honestly**: whether the harvest was `exhausted-all-results` or
   `truncated`, how many unique items and how many pages. Never a percentage of
@@ -373,7 +485,9 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 |------|------|
 | `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until dry, reports `coverage.verdict`. |
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. `_init_data_` first, DOM fallback, reports `source` and `blocked`. |
-| `scripts/rank.mjs` | Ranker. Bayesian shrinkage, log volume, neutral brand default, `--require` filter, `--spread` tier stratification. |
+| `scripts/listing.js` | **Detail-page reader.** Expands, then returns text AND images in one call. Shadow-DOM aware, block-aware, separates product size from carton size, `changed()` proves a re-read is owed. |
+| `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). The label on the case is the spec sheet. |
+| `scripts/rank.mjs` | Ranker. Bayesian shrinkage, log volume, neutral brand default, `--require` filter, `--spread` tier stratification, `--constraint` hard filters, absence warning. |
 | `scripts/lib.mjs` | Pure helpers (`parseSold`, `median`, `clean`) shared by ranker and tests. |
 | `scripts/test.mjs` | Assertion suite incl. regression guards for every defect below. |
 
@@ -381,6 +495,45 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 each inlines `parseSold` between `@shared:parseSold` markers. `test.mjs` pulls
 **both** copies out and asserts they match `lib.mjs` on every fixture — keep all
 three in sync, the test will catch you if you don't.
+
+### Defects fixed 2026-08-21, second wave — the Tapo C222 session
+
+All four were found by the user, not by the skill. Each now has a guard in code
+plus an assertion in `test.mjs`, because the prose rules that should have
+prevented them were already written and were not enough.
+
+1. **A stated requirement was treated as a tradeable weight.** The user said
+   "must have wires"; a pin-terminal module was recommended anyway, twice —
+   the second time after the user had produced a wired counter-example, on the
+   strength of an invented current figure. Guard: `rank.mjs --constraint`
+   drops `fail` items and refuses to rank `unknown` ones; an empty result is
+   reported as an empty result. See "The second rule".
+
+2. **Absence declared from a single evidence channel.** A title-keyword search
+   for "wire" found nothing and was reported to the user as "wired 9 V modules
+   do not exist". They exist. Titles do not carry physical attributes. Guard:
+   `absence-is-not-evidence` warning fires in-band when a `--require` regex
+   collapses the pool.
+
+3. **The spec was read from text while the number was printed on the photo.**
+   A customer review saying "~15.1 V at 0.35 A" was turned into "this is a 5 W
+   part, ~0.55 A at 9 V" and used to steer a recommendation. The case label
+   said `OUTPUT: 9V1.6A` — off by about 3x. The photo had already been looked
+   at, for *shape*, and then abandoned in favour of text for *specs*. Guard:
+   `listing.js` always returns `gallery` next to the text and carries a
+   `reminder`; `labels.sh` makes the label readable.
+
+4. **The page was mutated and never re-read.** "Show more" was clicked three
+   times — page grew 6,567 → 11,172 px — and only an *image* scan was run on
+   the newly revealed content. The size line sat in that text. It was then
+   declared "not published anywhere" while visible on screen. Guard:
+   `listing.js.read()` expands first and returns both channels in one call, so
+   the gap cannot open; `changed(fp)` proves when a re-read is owed.
+
+The single sentence behind all four: **one channel drew a blank, and the blank
+was treated as a finding.** Text-only for the current, images-only for the
+size, titles-only for existence. Before writing "there is no X" or "X is not
+stated", check the other channel — and say which channels you actually checked.
 
 ### Defects fixed 2026-08-21 (do not reintroduce)
 

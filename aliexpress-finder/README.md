@@ -50,9 +50,11 @@ Claude Code only — not in cloud sessions or scheduled routines.
 | `SKILL.md` | The skill: 8-step workflow plus gotchas verified against the live site |
 | `scripts/harvest.js` | Browser-side paged harvester. Resumable, reads until the result stream is dry, and detects the anti-bot wall *before* parsing so a block can never be mistaken for a parse error |
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. Reads the embedded `_dida_config_._init_data_` payload (~60 records), falls back to DOM scraping, and flags captcha interstitials |
-| `scripts/rank.mjs` | Scoring: shrunk quality + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification |
+| `scripts/listing.js` | Detail-page reader. Expands the page, then returns text **and** images in one call; walks the shadow DOM (a bare `querySelectorAll('img')` sees 1 image of dozens), separates product size from carton size |
+| `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). For hardware the label on the case is the spec sheet |
+| `scripts/rank.mjs` | Scoring: shrunk quality + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification, `--constraint` hard requirement filters, absence-is-not-evidence warning |
 | `scripts/lib.mjs` | Pure helpers shared by the ranker and the tests |
-| `scripts/test.mjs` | Test suite — 115 assertions |
+| `scripts/test.mjs` | Test suite — 145 assertions |
 
 ## Tests
 

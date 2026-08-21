@@ -88,6 +88,12 @@
     soldRaw: o.soldRaw || null,
     sold: parseSold(o.soldRaw),
     soldBucketed: o.soldRaw ? /\+/.test(o.soldRaw) : null,
+    /* The grid thumbnail. Captured because physical attributes (wires,
+     * connector type, enclosure) are NEVER in the title — screening these
+     * costs nothing against the request budget, since the CDN is a different
+     * host from the search endpoint. Reporting "no wired module exists" from
+     * a title search was a real defect; this is the cheap way to check. */
+    image: o.image || null,
     freeShipping: null,
     reviews: null, // search page never exposes this; detail page JSON-LD does
     page: o.page != null ? o.page : null,
@@ -225,6 +231,11 @@
             rating: it.evaluation && typeof it.evaluation.starRating === 'number'
               ? it.evaluation.starRating : null,
             soldRaw: m ? m[1].replace(/\s/g, '') : null,
+            image: (() => {
+              const im = it.image || {};
+              const u = im.imgUrl || im.imgUrlOrigin || '';
+              return u ? (u.startsWith('//') ? 'https:' + u : u) : null;
+            })(),
             page: p,
           }));
         }

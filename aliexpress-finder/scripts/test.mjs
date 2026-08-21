@@ -478,6 +478,29 @@ console.log('\nrank — --spread stratifies the shortlist across sold tiers');
     JSON.stringify(r.ranked.map((x) => [x.id, x.pick])));
 }
 
+// ------------------------------------------- harvest.js captures thumbnails
+/* Physical attributes (wires, connector, enclosure) are never in the title, so
+ * the grid thumbnail is the cheap screen. The CDN is a different host from the
+ * search endpoint, so checking images costs nothing against the request budget.
+ */
+console.log('\nharvest.js — grid thumbnails are captured for image screening');
+{
+  const item = makeItem('t1');
+  item.image = { imgUrl: '//ae-pic-a1.aliexpress-media.com/kf/Sthumb.jpg' };
+  const h = loadHarvest(async () => reply(makePage({ items: [item], finished: true })));
+  h.start({ query: 'x' });
+  await h.step(1);
+  const got = JSON.parse(h.payload()).items[0];
+  eq('thumbnail captured and protocol-normalised', got.image,
+    'https://ae-pic-a1.aliexpress-media.com/kf/Sthumb.jpg');
+
+  const bare = makeItem('t2'); // no image field at all
+  const h2 = loadHarvest(async () => reply(makePage({ items: [bare], finished: true })));
+  h2.start({ query: 'x' });
+  await h2.step(1);
+  eq('missing image is null, not undefined', JSON.parse(h2.payload()).items[0].image, null);
+}
+
 // ------------------------------------------------- hard constraints (D1)
 /* The user said "must have wires". The requirement got demoted to a
  * preference and traded against score, producing a recommendation that failed

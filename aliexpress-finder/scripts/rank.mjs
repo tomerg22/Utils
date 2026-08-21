@@ -52,6 +52,39 @@ const W_BRAND = Number(arg('w-brand', 0.15));
 const PRIOR = Number(arg('prior', MODE === 'final' ? 50 : 300));
 const BRAND_DEFAULT = Number(arg('brand-default', 0.5));
 const REQUIRE = arg('require', null); // regex on title — drops off-category items
+const SPREAD = Math.max(0, Number(arg('spread', 0)));
+
+/* WHY --spread EXISTS (measured 2026-08-21)
+ *
+ * In shortlist mode the only volume signal is `sold`, which the storefront
+ * BUCKETS and saturates at "10,000+". So the head of the ranking is packed
+ * with saturated listings and a genuinely strong item at 700 sold sits far
+ * below them — even when its review evidence is much better.
+ *
+ * That is not a scoring bug. It is a MISSING-DATA problem: the fine-grained
+ * signal is the exact review count, and that only exists on the detail page,
+ * which step 5 fetches for the shortlist only. So anything the shortlist does
+ * not surface can never earn its review count. The failure is self-sealing.
+ *
+ * Real case: a 7-inch hand brush, 4.9 from 123 reviews and 700 sold, ranked
+ * 32nd of 147 inside its own product class, while a competitor with 10,000+
+ * sold and 28 reviews sat at the top. Top-10-by-score would never look at it.
+ *
+ * --spread K reserves K of the --top N slots for a STRATIFIED sample across
+ * sold tiers, taking the best-scoring candidate from each tier starting at the
+ * LOWEST (the head already covers the top). Step 5 then spends its detail
+ * fetches across the whole evidence range instead of only its peak.
+ */
+function soldTier(ev) {
+  // The storefront's own display buckets — the evidence range worth spanning.
+  if (ev >= 10000) return { key: '10000+', floor: 10000 };
+  if (ev >= 5000) return { key: '5000+', floor: 5000 };
+  if (ev >= 3000) return { key: '3000+', floor: 3000 };
+  if (ev >= 1000) return { key: '1000+', floor: 1000 };
+  if (ev >= 500) return { key: '500+', floor: 500 };
+  if (ev >= 100) return { key: '100+', floor: 100 };
+  return { key: '<100', floor: 0 };
+}
 
 const read = () =>
   new Promise((res) => {
@@ -116,7 +149,7 @@ const wq = anyBrand ? W_QUALITY : W_QUALITY / (W_QUALITY + W_VOLUME);
 const wv = anyBrand ? W_VOLUME : W_VOLUME / (W_QUALITY + W_VOLUME);
 const wb = anyBrand ? W_BRAND : 0;
 
-const ranked = kept
+const scored = kept
   .map((i) => {
     const ev = evidenceOf(i);
     const p = norm(i.rating);
@@ -147,8 +180,47 @@ const ranked = kept
       flags,
     };
   })
-  .sort((a, b) => b.score - a.score)
-  .slice(0, TOP);
+  .sort((a, b) => b.score - a.score);
+
+/* Selection. Without --spread this is exactly the old behaviour: top N by
+ * score. With --spread K, the last K slots are filled by walking sold tiers
+ * from the LOWEST upward and taking the best-scoring unpicked item in each,
+ * cycling until K are filled or the pool is exhausted. Every chosen item is
+ * labelled so the report can say which picks were stratified.
+ */
+const headCount = Math.max(1, TOP - Math.min(SPREAD, Math.max(0, TOP - 1)));
+const head = scored.slice(0, headCount).map((i) => ({ ...i, pick: 'score' }));
+const chosen = [...head];
+
+if (SPREAD > 0) {
+  const taken = new Set(head.map((i) => i.id));
+  const buckets = new Map();
+  for (const i of scored) {
+    if (taken.has(i.id)) continue;
+    const t = soldTier(evidenceOf(i));
+    if (!buckets.has(t.key)) buckets.set(t.key, { floor: t.floor, items: [] });
+    buckets.get(t.key).items.push(i);
+  }
+  // Lowest tier first: the head already represents the saturated top.
+  const order = [...buckets.entries()].sort((a, b) => a[1].floor - b[1].floor);
+  const want = TOP - chosen.length;
+  let added = 0;
+  while (added < want) {
+    let progressed = false;
+    for (const [key, b] of order) {
+      if (added >= want) break;
+      const next = b.items.shift();
+      if (!next) continue;
+      chosen.push({ ...next, pick: 'spread', spreadTier: key,
+                    flags: [...next.flags, 'spread-pick'] });
+      added++;
+      progressed = true;
+    }
+    if (!progressed) break; // every tier drained
+  }
+}
+
+const ranked = chosen;
 
 console.log(
   JSON.stringify(
@@ -159,6 +231,11 @@ console.log(
       brandDefault: anyBrand ? BRAND_DEFAULT : null,
       brandDefaulted,
       poolMeanRating: +(C * 4 + 1).toFixed(3),
+      spread: SPREAD || null,
+      spreadPicks: SPREAD ? ranked.filter((r) => r.pick === 'spread').length : 0,
+      spreadTiers: SPREAD
+        ? ranked.filter((r) => r.pick === 'spread').map((r) => r.spreadTier)
+        : [],
       considered: all.length,
       kept: kept.length,
       droppedCount: dropped.length,

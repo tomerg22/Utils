@@ -1,6 +1,6 @@
 ---
 name: aliexpress-finder
-description: Find the best AliExpress products for a described item. Ranks candidates by user rating, review count and units sold using Bayesian shrinkage, then checks brand reputation and counterfeit plausibility. Use when the user asks to find, compare, or shop for a product on AliExpress.
+description: Take a free-text product description and return the top listings with evidence, by paging AliExpress search and ranking on shrunk ratings + review counts.
 ---
 
 # AliExpress product finder
@@ -14,7 +14,7 @@ skills and the browser tools are both absent there.
 ## Before you start
 
 Read this whole file. The gotchas below are verified against the live site
-(last full run 2026-07-30); skipping them produces silently empty or wrong results.
+(last full run 2026-08-21); skipping them produces silently empty or wrong results.
 
 Sanity-check the tooling whenever you change it:
 
@@ -22,113 +22,248 @@ Sanity-check the tooling whenever you change it:
 node ~/.claude/skills/aliexpress-finder/scripts/test.mjs
 ```
 
+## The rule that matters most
+
+**If a human-verification wall appears, STOP and tell the user in that turn, as
+the headline.** Do not keep working and mention it later in a summary. See
+step 2. This is not a nicety — it happened, and it is why step 3 changed.
+
 ## Step 1 — Build the search URL
 
 Reduce the description to 2-4 English keywords. English queries work fine on the
 Hebrew storefront and return Hebrew titles with ILS prices.
 
 ```
-https://he.aliexpress.com/w/wholesale-<kebab-keywords>.html?SortType=total_tranpro_desc
+https://he.aliexpress.com/w/wholesale-<kebab-keywords>.html?SortType=total_tranpro_desc&selectedSwitches=filterCode%3A4StarRating
 ```
 
-`SortType=total_tranpro_desc` sorts by orders. **Always use it.** On default sort
-the top results included "Lenovo 225W 500000mAh" at ₪48 — a physically impossible
-capacity, i.e. a counterfeit. Sorting by orders removed those entirely.
+Two parameters, both mandatory.
 
-**Prefer a specific multi-word query.** `wholesale-milk-frother` returned 13 DOM
-cards of which 9 were junk; `wholesale-electric-milk-frother-handheld` returned
-**60 usable records** for the same category. If a query yields a thin pool, run a
-second, more specific one and merge — `rank.mjs` dedupes by id.
+`SortType=total_tranpro_desc` sorts by orders. On default sort the top results
+included "Lenovo 225W 500000mAh" at ₪48 — a physically impossible capacity, i.e.
+a counterfeit. Sorting by orders removed those entirely.
 
-**`&page=2` is not more of the same.** On a real run, page 2 of a frother search
-returned an eye cream, a makeup brush set, a wrinkle stick and an espresso
-machine — recommendations, not results. Always eyeball page-2+ titles for
-category drift before merging, and use `--require` (step 4).
+`selectedSwitches=filterCode%3A4StarRating` is the highest-value single
+parameter and it is easy to miss. Measured on `wire brush set`: it cut the pool
+from 18,655 to 7,206, and — the point — it took the share of returned rows that
+actually carry a rating from **13 of 60** at an unfiltered page 20 to **60 of
+60**. Across a full 20-page harvest, 1,166 of 1,166 rows were rated. `rank.mjs`
+discards every unrated item and everything below 4.0 anyway, so this filter
+removes nothing it would have kept. It roughly triples usable rows per request,
+and requests — not results — are the scarce resource here (see step 2).
 
-## Step 2 — Open the browser
+**BROADEN the query, do not narrow it.** This file used to say that a thin pool
+means running "a second, more specific one". That advice is deleted because it
+caused a real miss: narrowing restricts results to items whose titles match
+wording you guessed. A 7-inch hand wire brush at 4.9 from 123 reviews was absent
+from every specific query tried, yet sits at **page 6 of a plain `wire brush
+set` search**. Search broad, page deep (step 3), separate classes and filter
+locally (step 4).
+
+### Other URL levers, from the `searchRefineFilters` module
+
+The refine module on any search page exposes the catalogue's own filter
+vocabulary. Read it when you need to narrow by a real attribute rather than by
+guessed words:
+
+```js
+(() => window._dida_config_._init_data_.data.data.root.fields.mods
+  .searchRefineFilters.content.map(g => ({ title: g.title, paramName: g.paramName,
+    attributeId: g.attributeId,
+    opts: (g.content||[]).map(o => ({ text: o.text, value: o.selectedValue })) })))()
+```
+
+| Lever | URL param | Value form |
+|---|---|---|
+| Rating 4★+ | `selectedSwitches` | `filterCode:4StarRating` |
+| Free shipping / sale / Choice | `selectedSwitches` | `filterCode:freeshipping`, `:bigsale`, `:choice_atm` |
+| Any attribute (colour, material, brand) | `attr` | `<attributeId>-<valueId>`, e.g. `11795-4362329` |
+| Ship from | `shpf_co` | `IL`, `TR`, `CN` |
+| Price range | `pr` | range string |
+
+Multiple `selectedSwitches` values join with `,`. Pass extras through
+`__aeHarvest.start({ extra: '&shpf_co=CN' })`.
+
+## Step 2 — Open the browser, and respect the wall
 
 If no browser pane is open, `preview_start` with the URL. Otherwise `navigate`.
 `preview_start` is required first — `navigate` alone errors with "No preview is open".
 
-### If you hit the captcha wall
+### The anti-bot wall — detect it, alert, and stop
 
-AliExpress may serve an anti-bot interstitial: title `Captcha Interception`, URL
-path `/_____tmd_____/punish?x5secdata=…`, body "Sorry, we have detected unusual
-traffic from your network" with a **"Please slide to verify"** slider.
+AliExpress serves an interstitial after sustained automated requests: title
+`Captcha Interception`, URL path `/_____tmd_____/punish?x5secdata=…`, body
+"Sorry, we have detected unusual traffic from your network" with a **"Please
+slide to verify"** slider.
 
 - **Do not solve or bypass it.** Completing bot-detection challenges is off-limits.
+- **Tell the user immediately, in that turn, at the top of the reply**, and keep
+  saying it until they confirm it is cleared. Detecting it and reporting it at
+  the end of a long write-up is the same as not detecting it — that is exactly
+  what went wrong on 2026-08-21.
 - Ask the user to drag the slider in the browser pane themselves.
 - **Then do nothing but read.** Do NOT `navigate` or `navigate --force` while
   waiting or right after — a fresh request returns a fresh `x5secdata` token and
-  re-blocks the tab, discarding the state the user just cleared. Once solved the
-  punish page redirects itself to the target URL.
+  re-blocks the tab, discarding the state the user just cleared.
 - Each attempt returning a *different* `x5secdata` confirms genuine server-side
   rejection rather than a cached page.
-- `extract.js` reports `blocked: true` when it sees this page, so an empty result
-  is never mistaken for "no products found".
+- When they say it is cleared, verify with ONE cheap request and report what it
+  returned before resuming.
 
-## Step 3 — Extract
+**Budget your requests.** The wall tripped after roughly 50-60 rapid fetches in
+one session. That is a measured count, not a documented limit, so treat it as an
+order of magnitude. A normal task fits comfortably: one harvest of ~20 pages
+plus ~10 detail pages is ~30 requests. Two harvests plus detail pages is near
+the edge. Three is over it.
 
-Pass the **entire contents** of `scripts/extract.js` as the `text` argument of
-`javascript_tool`. It returns a JSON string and reports which source it used.
+**Every code path that can fetch MUST carry block detection with it.** A blocked
+response has no payload, so a naive parser returns null and the caller logs
+"parse failed" — which reads like a bug, not a wall. `harvest.js` checks
+`blockedBy()` *before* parsing and sets `stop: 'blocked'`; `extract.js` sets
+`blocked: true`. Never add a fetch path without one of them.
 
-It reads two sources, in order:
+## Step 3 — Harvest (paged)
 
-1. **`window._dida_config_._init_data_`** — the payload the page rendered from,
-   holding ~60 fully-structured records. **This is the good path.** It does not
-   depend on anything being painted.
-2. **DOM cards** — fallback only.
-
-**Why source 1 exists:** with the Browser pane hidden, the results container
-renders at `clientHeight: 0`, `IntersectionObserver` never fires, lazy loading
-stalls, and the DOM yields ~13 cards while the embedded JSON on the *same page*
-holds 60. Scrolling cannot fix this; the pane must be visible for DOM extraction
-to work at all.
-
-`__INIT_DATA__` really is undefined and `runParams` really is empty, whatever
-scraping blogs claim — but `_dida_config_._init_data_` is not. The known path is
-`data.data.root.fields.mods.itemList.content`; the extractor falls back to a
-bounded deep walk for any array of objects with a `productId`, so a path change
-degrades to slower rather than broken.
-
-If using the DOM fallback, check readiness before extracting — re-check until
-`cards` stops rising:
+Pass the **entire contents** of `scripts/harvest.js` as the `text` argument of
+`javascript_tool`. It installs `window.__aeHarvest` and returns a status string.
 
 ```js
-(() => ({ cards: document.querySelectorAll('a[href*="/item/"]').length,
-          bodyLen: (document.body.textContent||'').length }))()
+__aeHarvest.start({ query: 'wire brush set' })  // returns the plan + URL
+__aeHarvest.step(8)                             // repeat until .done
+__aeHarvest.payload()                           // JSON string for rank.mjs
 ```
 
-Repeat steps 2-3 per query/page and keep all payloads.
+`step(n)` is resumable because `javascript_tool` dies at 30s, which is about
+8-12 fetches. Call it repeatedly until `done: true`. It stops on `exhausted`,
+`page-cap`, `request-budget`, `blocked`, `fetch-error` or `parse-error` — and
+**`blocked` means go to step 2 and alert the user.**
 
-## Step 4 — Shortlist
+Defaults are `maxPages: 20`, `maxRequests: 24`, `fourStar: true`.
+
+**Read until the stream runs dry, then report which happened.** Do not assume a
+fixed depth — it varies enormously by query and is not even stable between runs:
+
+| Query | Served |
+|---|---|
+| `wire brush set` (4★) | 1,166 unique over 20 pages, still going at the cap |
+| `travel duffel bag` (4★) | 473 over 8 pages, 98% on-category, still going |
+| `balance board roller` (4★) | dry at page 5 — and page 7 an hour earlier |
+
+**`pageInfo.totalResults` is not a denominator.** The balance-board query
+claimed **160,188** results and served nothing past page 4. Never report
+coverage as a percentage of it. Report `coverage.verdict`:
+`exhausted-all-results` or `truncated`.
+
+**Paging works — the old warning was wrong.** This file used to claim `&page=2`
+returns recommendations rather than results. Measured: pages 1-12 of `wire brush
+set` gave 709 unique items with 59-60 fresh on *every* page, zero duplicates and
+zero category drift. Drift is real but only **deep** and only **unfiltered** —
+page 40 of an unfiltered brush search returns hair clips, and page 60 is the
+hard ceiling. With the 4★ filter, on-category stayed 97-100% through page 20.
+
+### Single-page fallback
+
+`scripts/extract.js` still reads the **currently loaded** page and is the right
+tool when you only need what is on screen, or when `harvest.js` cannot fetch. It
+reads `window._dida_config_._init_data_` first (~60 structured records) and
+falls back to DOM cards.
+
+With the Browser pane hidden the results container renders at `clientHeight: 0`,
+`IntersectionObserver` never fires, lazy loading stalls, and the DOM yields ~13
+cards while the embedded JSON on the *same page* holds 60. Scrolling cannot fix
+this. `__INIT_DATA__` really is undefined and `runParams` really is empty,
+whatever scraping blogs claim — but `_dida_config_._init_data_` is not.
+
+### Getting a large payload out of the browser
+
+A full harvest is ~90KB per 400 items and will exceed the tool-result limit.
+That is fine: the harness saves the oversized result to a file and prints the
+path. Slice `payload()` into parts, then decode locally — the saved text is
+**double-encoded** (a JSON file whose `text` field holds a JSON string):
+
+```js
+const raw = JSON.parse(fs.readFileSync(savedPath, 'utf8'));
+const t = raw.map(x => x.text).join('');
+const first = t.indexOf('"');
+for (let end = t.lastIndexOf('"'); end > first; end = t.lastIndexOf('"', end - 1)) {
+  try { obj = JSON.parse(JSON.parse(t.slice(first, end + 1))); break; } catch (e) {}
+}
+```
+
+## Step 4 — Shortlist, and split the classes
 
 ```bash
 node ~/.claude/skills/aliexpress-finder/scripts/rank.mjs --mode shortlist --top 10 < harvest.json
 ```
 
 Accepts one payload, an array of payloads, or a bare item array; dedupes by id.
+The `harvest.js` envelope is consumed directly.
 
-Drop off-category items with a title regex:
+**Class separation is mandatory once the pool is large, not optional.** With 60
+items a mixed pool was survivable. With 1,166 it is not: a `wire brush set`
+harvest contains hand brushes, drill-mounted wheel brushes, rotary/Dremel sets,
+bottle brushes, PCB anti-static brushes and gas-hob brushes. They are not
+substitutes. Filter to the class the user actually asked for:
 
 ```bash
-... --require 'מקציף|קצף'
+... --require 'ידית|יד |אינץ' 
 ```
 
-The no-rating filter removes AliExpress's SEO keyword-stuffing links (titles like
-"milk frother containeraliexpress milk frotherautomatic milk frother…", all
-fields null). Expect roughly 9 of 13 DOM cards to be junk — the `_init_data_`
-path avoids most of them.
+In the measured run, a hand-brush `--require` cut 1,166 to 187 and the ranking
+became answerable. Ask which class the user wants, or present both.
+
+The no-rating filter removes AliExpress's SEO keyword-stuffing links (titles
+like "milk frother containeraliexpress milk frother…", all fields null). The 4★
+URL filter from step 1 already removes nearly all of these upstream.
 
 Expect **ties**. Sold saturates at "10,000+", so top candidates score
 identically. That is exactly why step 5 exists.
 
 ## Step 5 — Fetch exact review counts (mandatory)
 
-Sold counts are bucketed ("1,000+", "5,000+") and saturate at "10,000+". The only
-fine-grained signal is the exact review count, in JSON-LD on the detail page.
+Sold counts are bucketed ("1,000+", "5,000+") and saturate at "10,000+". The
+only fine-grained signal is the exact review count, in JSON-LD on the detail page.
 
-For each shortlisted item, navigate to its URL and run:
+**Do not sample the shortlist by score alone.** This is a real defect found on
+2026-08-21 and it is the reason a good item can still be missed after paging
+fixed recall. Shortlist mode ranks on `sold`, so an item with 700 sold ranks
+below dozens with 10,000+ — even when its review evidence is far stronger. The
+7-inch hand brush (4.9, **123 reviews**, 700 sold) ranked **32 of 147** inside
+its own class, invisible to a top-10-by-score sample, while a competitor with
+10,000 sold and 28 reviews sat at the top. Review-per-sale is a signal the skill
+already believes in — it flags `few-reviews-for-sales` below 2% — but it cannot
+compute it until this step.
+
+So spend the step-5 budget on a **spread**, using the flag rather than by hand:
+
+```bash
+node .../rank.mjs --mode shortlist --top 10 --spread 4 < harvest.json
+```
+
+`--spread K` reserves K of the K+N slots for a stratified sample across sold
+tiers (`10000+`, `5000+`, `3000+`, `1000+`, `500+`, `100+`), taking the
+best-scoring candidate from each starting at the **lowest** — the head already
+covers the saturated top. Picks are labelled `pick: "spread"` and flagged
+`spread-pick`, and the output reports `spreadTiers`. In `final` mode the tiers
+follow `reviews` instead of `sold`. Without the flag, behaviour is byte-for-byte
+what it was.
+
+Measured on the real 187-item hand-brush pool: plain `--top 10` returned six
+listings at 10,000+ sold and nothing below 2,000. `--top 10 --spread 4` reached
+the `100+`, `500+`, `1000+` and `3000+` tiers and surfaced a 5.0-at-466-sold and
+a 4.9-at-900-sold listing that top-by-score never sees.
+
+**Know its limit — this is not a homing beacon.** Stratification samples the
+evidence range; it cannot single out one listing. The 7-inch hand brush above
+sits **6th inside a 500+ tier holding 27 items**, and `--spread 16` still does
+not reach it, because on search-page evidence alone it is genuinely
+indistinguishable from five near-identical tier-mates. Nothing but an actual
+review count separates them, and that costs one request each. If the user wants
+a specific listing evaluated, the honest lever is a larger `--top` with more
+step-5 fetches, not a cleverer sort. Say so rather than implying the tool found
+the best item when it sampled a tier.
+
+For each selected item, navigate to its URL and run:
 
 ```js
 (() => {
@@ -156,8 +291,8 @@ and call out any large gap; it is the number the user actually pays.
 ## Step 6 — Brand: plausibility first, reputation second
 
 Most listings are "No Brand", and there is no reliable brand field. Detect brand
-by matching the title against the category's brand filter vocabulary (embedded in
-the search page as `"text":"<Brand>"` entries) plus obvious names in the title.
+by matching the title against the category's brand filter vocabulary (the
+`מותג` group in `searchRefineFilters`, step 1) plus obvious names in the title.
 
 Do **not** read brand off the detail page spec row — that regex catches badges
 like "מוביל ב-AliExpress" (a ranking badge, not a brand).
@@ -199,17 +334,18 @@ flagged `brand-unresearched`, and are counted in `brandDefaulted`. When no item
 carries one, brand weight is redistributed to 0 so nothing is scored on absent
 data.
 
-**If the pool mixes product classes, split it and rank separately.** A handheld
-frothing wand and an automatic heating carafe both match "milk frother" but are
-not substitutes; ranking them together produces a top-4 the user cannot act on.
-Ask which class they want, or present both.
-
 ## Step 8 — Report
 
 Table of the 4: title, detail price ₪, rating, review count, sold, brand verdict,
 link. Then, briefly:
 
 - why each won (cite the actual numbers)
+- **coverage, honestly**: whether the harvest was `exhausted-all-results` or
+  `truncated`, how many unique items and how many pages. Never a percentage of
+  `totalResults`.
+- which product class was ranked, and what was excluded
+- that step-5 detail fetches were a spread (`--spread`), which tiers it reached,
+  and that stratification samples the range rather than proving one winner
 - any `flags` raised (`extreme-discount`, `price-outlier-low`, `sold-saturated`,
   `reviews-exceed-sold`, `few-reviews-for-sales`, `brand-unresearched`)
 - any large search-vs-detail price gap
@@ -228,21 +364,41 @@ item ranks below a genuine 4.9-with-4,790-reviews item and is flagged
 
 Note a real property of the math: when candidates share the same rating,
 shrinkage moves them all equally and **review volume alone decides the order**.
-That is correct, not a bug.
+That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
+`sold`, which is why step 5 must sample a spread rather than the head.
 
 ## Files
 
 | File | Role |
 |------|------|
-| `scripts/extract.js` | Browser-side extractor. `_init_data_` first, DOM fallback, reports `source` and `blocked`. |
-| `scripts/rank.mjs` | Ranker. Bayesian shrinkage, log volume, neutral brand default, `--require` filter. |
+| `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until dry, reports `coverage.verdict`. |
+| `scripts/extract.js` | Single-page extractor for the currently loaded page. `_init_data_` first, DOM fallback, reports `source` and `blocked`. |
+| `scripts/rank.mjs` | Ranker. Bayesian shrinkage, log volume, neutral brand default, `--require` filter, `--spread` tier stratification. |
 | `scripts/lib.mjs` | Pure helpers (`parseSold`, `median`, `clean`) shared by ranker and tests. |
-| `scripts/test.mjs` | 52-assertion suite incl. regression guards for all three 2026-07-30 defects. |
+| `scripts/test.mjs` | Assertion suite incl. regression guards for every defect below. |
 
-`extract.js` runs in the browser and cannot import `lib.mjs`, so it inlines
-`parseSold` between `@shared:parseSold` markers. `test.mjs` pulls that copy out
-and asserts it matches `lib.mjs` on every fixture — **keep both in sync, the
-test will catch you if you don't.**
+`harvest.js` and `extract.js` run in the browser and cannot import `lib.mjs`, so
+each inlines `parseSold` between `@shared:parseSold` markers. `test.mjs` pulls
+**both** copies out and asserts they match `lib.mjs` on every fixture — keep all
+three in sync, the test will catch you if you don't.
+
+### Defects fixed 2026-08-21 (do not reintroduce)
+
+1. **One page of 60 was the whole world.** Recall was a function of guessed
+   wording. Fixed by `harvest.js`. The false "`&page=2` is not more of the same"
+   claim that justified it has been deleted — it does not survive measurement.
+2. **"Narrow further when the pool is thin."** Backwards. Broaden and page.
+3. **A wall looked like a parse bug.** An ad-hoc fetch path bypassed
+   `extract.js`, so the punish page produced a null parse logged as
+   `carve-fail`, and the block was reported to the user only at the end of a
+   long write-up. Both halves fixed: detection lives in every fetch path, and
+   the alert is immediate (step 2).
+4. **`totalResults` treated as a denominator.** It is an estimate and often
+   fiction (160,188 claimed, 4 pages served). Report exhausted-vs-truncated.
+5. **Step 5 sampled only the head of the shortlist**, so a strong-review /
+   moderate-sold item could never earn its review count — a self-sealing
+   failure, since the signal that would promote it only exists on a page the
+   shortlist decides whether to fetch. Fixed by `rank.mjs --spread`.
 
 ### Defects fixed 2026-07-30 (do not reintroduce)
 
@@ -262,5 +418,6 @@ AliExpress Terms of Use §3.2(a) prohibits systematic retrieval of site content 
 compile a collection or database without written permission. robots.txt disallows
 `/items/*`, `/search/*` and `/product/*`; the paths used here (`/w/wholesale-*.html`
 and `/item/*.html`) are not in that disallow list, but robots.txt does not override
-the ToS. This is fine for occasional personal shopping. Do not build bulk
-harvesting on it.
+the ToS. This is fine for occasional personal shopping — one product search at a
+time, a few dozen requests. The `maxRequests` default exists partly for this
+reason. Do not build bulk harvesting on it, and do not run it unattended.

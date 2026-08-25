@@ -162,6 +162,40 @@ slide to verify"** slider.
   re-blocks the tab, discarding the state the user just cleared.
 - Each attempt returning a *different* `x5secdata` confirms genuine server-side
   rejection rather than a cached page.
+
+### The QUIET wall — and the screenshot that settles it
+
+**The wall does not always announce itself.** Measured 2026-08-25: detail pages
+came back with **279,005 bytes of HTML, 957 bytes of rendered body text and zero
+JSON-LD nodes**. No marker matched. The operator read the empty body, reported
+"**Not a wall** — a rendering fault", and built a product comparison on top of
+that false negative — including telling the user a review count was "not
+obtainable" when the page held **1,633**. The user found it, not the skill.
+
+Two hard rules come out of it, both now enforced by `wallVerdict()` in `lib.mjs`
+(inlined into all three browser files, drift-guarded by `test.mjs`):
+
+- **A fired marker is never dismissible by argument.** In that session `punish`
+  appeared in the HTML, and it was explained away as "the standard anti-bot SDK
+  that ships on normal pages" — a claim that was never checked with a single
+  command. *Constructing the explanation is the failure mode.* If a marker
+  fires and no data came back, the state is `suspect`, and only a check clears
+  it.
+- **Take the screenshot. It is ONE call.** A stalled render and an interstitial
+  are identical from the text channel — scraping harder can never separate
+  them. `computer{action:"screenshot"}` ends the ambiguity immediately. This is
+  the skill's own *"one channel drew a blank and the blank was treated as a
+  finding"* defect (see defect 4 below), finally applied to block detection
+  instead of only to product specs.
+
+**Never write "not blocked", "no data available", or "this product does not
+exist" from the text channel alone.** Look first.
+
+`wallVerdict()` returns one of three states, and the ordering is the point:
+`blocked` (loud markers — stop and headline), `suspect` (no data came back AND
+a positive reason to suspect a wall — screenshot before concluding anything),
+`clear` (data came back, so nothing withheld it — or the page is plainly a
+short malformed response, which keeps its more useful `parse-error` name).
 - When they say it is cleared, verify with ONE cheap request and report what it
   returned before resuming.
 
@@ -488,13 +522,33 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 | `scripts/listing.js` | **Detail-page reader.** Expands, then returns text AND images in one call. Shadow-DOM aware, block-aware, separates product size from carton size, `changed()` proves a re-read is owed. |
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). The label on the case is the spec sheet. |
 | `scripts/rank.mjs` | Ranker. Bayesian shrinkage, log volume, neutral brand default, `--require` filter, `--spread` tier stratification, `--constraint` hard filters, absence warning. |
-| `scripts/lib.mjs` | Pure helpers (`parseSold`, `median`, `clean`) shared by ranker and tests. |
+| `scripts/lib.mjs` | Pure helpers (`parseSold`, `median`, `clean`, **`wallVerdict`**) shared by ranker, browser files and tests. |
 | `scripts/test.mjs` | Assertion suite incl. regression guards for every defect below. |
 
-`harvest.js` and `extract.js` run in the browser and cannot import `lib.mjs`, so
-each inlines `parseSold` between `@shared:parseSold` markers. `test.mjs` pulls
-**both** copies out and asserts they match `lib.mjs` on every fixture — keep all
-three in sync, the test will catch you if you don't.
+`harvest.js`, `extract.js` and `listing.js` run in the browser and cannot import
+`lib.mjs`, so each inlines `parseSold` and `wallVerdict` between `@shared:*`
+markers. `test.mjs` pulls **every** copy out and asserts they match `lib.mjs` on
+every fixture — keep them in sync, the test will catch you if you don't. A
+drifted `wallVerdict` means one entry point silently stops detecting walls.
+
+### Defect fixed 2026-08-25 — the quiet wall (the jump-starter session)
+
+**A human-verification wall was hit and reported to the user as "Not a wall".**
+The detection ran, one marker (`punish` in the HTML) *fired*, and it was argued
+away with an unverified claim. No screenshot was ever taken, though the tool was
+available the whole time. The false negative then propagated: PAIVIROKU review
+counts were reported as "not obtainable" and a brand comparison was written on
+that basis. The page held 1,633 reviews and rendered fine minutes later.
+
+Three failures, one root: **a blank in one channel was treated as a finding.**
+
+Guards added: `wallVerdict()` replaces the old boolean `blockedBy()` in all
+three browser files; it returns `suspect` for the big-HTML/empty-body/no-data
+shape and for any quiet marker with no data, and its `note` mandates a
+screenshot in words. `test.mjs` asserts the exact 279,005/957/0 shape is not
+called clear, that a punish string with no data is not clear, that a page which
+*did* serve data stays clear (no false alarms), and that all three inlined
+copies agree with `lib.mjs`.
 
 ### Defects fixed 2026-08-21, second wave — the Tapo C222 session
 

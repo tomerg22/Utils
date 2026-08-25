@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { parseSold, median, clean } from './lib.mjs';
+import { parseSold, median, clean, wallVerdict } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RANK = join(HERE, 'rank.mjs');
@@ -70,6 +70,69 @@ for (const file of ['extract.js', 'harvest.js']) {
   const drift = SHARED_FIXTURES.filter((f) => JSON.stringify(inlined(f)) !== JSON.stringify(parseSold(f)));
   ok(`${file} copy agrees with lib.mjs on every fixture`, drift.length === 0, `drifted on ${JSON.stringify(drift)}`);
   eq(`${file} copy handles dot-thousands`, inlined('4.000+'), 4000);
+}
+
+// ------------------------------------------- browser files inline wallVerdict
+// Same reason as parseSold: three browser files cannot import lib.mjs, so each
+// carries a copy. They MUST agree, because a drifted copy means one entry point
+// silently stops detecting walls.
+console.log('\nbrowser files inline wallVerdict — assert no copy has drifted');
+const WALL_CASES = [
+  { name: 'punish url', sig: { url: 'https://he.aliexpress.com/_____tmd_____/punish?x5secdata=a' } },
+  { name: 'captcha in text', sig: { url: 'x', text: 'Captcha Interception' } },
+  { name: 'slider prompt', sig: { url: 'x', text: 'Please slide to verify' } },
+  { name: 'hebrew slider', sig: { url: 'x', text: 'יש להחליק כדי לאמת' } },
+  { name: 'served content', sig: { url: 'x', html: 'y'.repeat(300000), text: '', dataNodes: 4 } },
+  { name: 'THE MISS', sig: { url: 'https://he.aliexpress.com/item/1.html',
+                             html: 'y'.repeat(279005), text: 'y'.repeat(957), dataNodes: 0 } },
+  { name: 'punish string, no data', sig: { url: 'x', html: 'var punish=1;', text: '', dataNodes: 0 } },
+  { name: 'short malformed page', sig: { url: 'x', html: '<html>no payload</html>', text: '', dataNodes: 0 } },
+];
+for (const file of ['extract.js', 'harvest.js', 'listing.js']) {
+  const src2 = readFileSync(join(HERE, file), 'utf8');
+  const block = src2.match(/\/\* @shared:wallVerdict:start \*\/([\s\S]*?)\/\* @shared:wallVerdict:end \*\//);
+  ok(`${file} exposes the @shared:wallVerdict block`, !!block);
+  if (!block) continue;
+  const inlined = new Function(`${block[1]}; return wallVerdict;`)();
+  const drift = WALL_CASES.filter((c) =>
+    JSON.stringify(inlined(c.sig)) !== JSON.stringify(wallVerdict(c.sig)));
+  ok(`${file} copy agrees with lib.mjs on every wall case`, drift.length === 0,
+    `drifted on ${JSON.stringify(drift.map((d) => d.name))}`);
+}
+
+console.log('\nwallVerdict — the quiet wall that the old boolean check missed');
+{
+  // THE REGRESSION THIS EXISTS FOR (2026-08-25). Detail pages returned 279,005
+  // bytes of HTML, 957 bytes of body text and zero JSON-LD. The old check saw
+  // no marker, the operator called it "a rendering fault, not a wall", and then
+  // reported a review count as "not obtainable" when the page held 1,633.
+  const miss = wallVerdict({ url: 'https://he.aliexpress.com/item/1005009457140096.html',
+    html: 'y'.repeat(279005), text: 'y'.repeat(957), dataNodes: 0 });
+  eq('big html + empty body + no data is NOT called clear', miss.state, 'suspect');
+  ok('the miss names the shape that caused it',
+    miss.markers.includes('big-html-no-content'), JSON.stringify(miss.markers));
+  ok('a suspected wall MANDATES a screenshot, not more scraping',
+    /SCREENSHOT/.test(miss.note) && /screenshot/i.test(miss.note), miss.note);
+  ok('a suspected wall forbids reporting data as unavailable',
+    /do NOT report the\s+data as unavailable|unavailable/i.test(miss.note), miss.note);
+
+  // A quiet marker must never be dismissible by argument.
+  const quiet = wallVerdict({ url: 'x', html: 'window.punish=1', text: '', dataNodes: 0 });
+  eq('a punish string with no data is suspect, not clear', quiet.state, 'suspect');
+
+  // ...but content coming back IS proof no wall withheld it, so no false alarms.
+  const served = wallVerdict({ url: 'x', html: 'window.punish=1'.padEnd(300000, 'y'),
+    text: 'plenty of real text', dataNodes: 60 });
+  eq('a page that served data is clear even with punish in the html', served.state, 'clear');
+
+  // A loud wall still wins, and still says stop.
+  const loud = wallVerdict({ url: 'https://he.aliexpress.com/_____tmd_____/punish?x5secdata=a' });
+  eq('loud wall is blocked', loud.state, 'blocked');
+  ok('loud wall says stop this turn', /STOP and tell the user/.test(loud.note), loud.note);
+
+  // A short malformed page keeps its more useful name.
+  eq('short malformed page is not cried wolf over',
+    wallVerdict({ url: 'x', html: '<html>no payload</html>', text: '', dataNodes: 0 }).state, 'clear');
 }
 
 // ------------------------------------------------------------- misc helpers
@@ -605,12 +668,16 @@ console.log('\nlisting.js — text and images come back together, shadow DOM inc
   });
   const mkRoot = (els) => ({ querySelectorAll: () => els });
 
-  const runListing = ({ href, bodyText, els, shadowEls = [] }) => {
+  const runListing = ({ href, bodyText, els, shadowEls = [], html = '', ldCount = null }) => {
     const host = mkEl('DIV', { shadow: mkRoot(shadowEls) });
     const all = [...els, host];
     const document = {
       body: { scrollHeight: 5000, innerText: bodyText },
-      querySelectorAll: () => all,
+      documentElement: { outerHTML: html },
+      // ldCount lets a test express "big page, zero JSON-LD" — the shape of
+      // the quiet wall that walked through the old boolean check.
+      querySelectorAll: (sel) =>
+        (ldCount !== null && /ld\+json/.test(sel || '')) ? new Array(ldCount) : all,
     };
     const sandbox = {
       window: { scrollTo() {} }, document, location: { href },

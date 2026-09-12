@@ -775,8 +775,10 @@ dell_install_bios() {
     # The catalog carries a size but no per-file hash for BIOS components, so
     # size is the only integrity check available here. It still catches a
     # truncated transfer or an HTML error page saved as the payload.
+    # `wc -c` rather than `stat -c %s`: the -c flag is GNU-only and errors out
+    # on BSD stat, which is what the test suite runs under on macOS.
     local actual_size
-    actual_size=$(stat -c %s "$staged")
+    actual_size=$(wc -c < "$staged" | tr -d ' ')
     if [[ "$EXPECTED_SIZE" != "0" && "$actual_size" != "$EXPECTED_SIZE" ]]; then
         echo -e "${RED}Size mismatch: expected ${EXPECTED_SIZE} bytes, got ${actual_size}${NC}" >&2
         return 1

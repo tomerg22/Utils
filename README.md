@@ -77,21 +77,27 @@ Keep the charger connected. Do not power off during the flash.
 ### Tests
 
 ```bash
-./BIOS-update/test-update-bios.sh          # 25 tests, ASUS code path
+./BIOS-update/test-update-bios.sh          # 51 tests, both vendors
 pwsh -File ./BIOS-update/Test-UpdateAsusBios.ps1 # 18 tests
 ```
 
 Both suites run on any machine — no root/Administrator, no ASUS board, no USB
 drive, no network. `lsblk`, `dmidecode`, `curl` and the BIOS archive are
-stubbed, and the shell suite sets `VENDOR=asus` to pin the code path it covers.
-The scripts return early when sourced, so the tests exercise their functions
-without running `main`.
+stubbed, Dell's catalog is a local XML fixture, and the suite sets `VENDOR`
+directly so both code paths run anywhere. The scripts return early when
+sourced, so the tests exercise their functions without running `main`.
 
-What the tests do **not** cover: the actual flash, and the Dell code path.
-The Dell half was run end to end against a real XPS 15 9500 (correctly reports
-1.40.0 as both current and latest, and downloads `XPS_9500_1.40.0.exe` at the
-size the catalog declares), but EZ Flash and the Dell F12 flasher are untested
-by definition.
+The suite is mutation-checked: reverting `cleanup_mounts` to the old array,
+dropping the common-dependency install from `main`, making the catalog parser
+take the last entry instead of the highest version, disabling the Dell size
+gate, or removing the early return from the dotted version compare each make
+it fail.
+
+What the tests do **not** cover: the actual flash. The Dell half was also run
+end to end against a real XPS 15 9500 (correctly reports 1.40.0 as both current
+and latest, and downloads `XPS_9500_1.40.0.exe` at the size the catalog
+declares), but EZ Flash and the Dell F12 flasher are untested by definition,
+and the ASUS path has never run on an ASUS board.
 
 ### Notes
 

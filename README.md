@@ -4,77 +4,104 @@ Personal utilities.
 
 ## BIOS-update
 
-Detects the ASUS motherboard model, queries ASUS for the latest BIOS, verifies
-the download against ASUS's published SHA-256, and stages the `.CAP` file on a
-FAT32 USB drive for EZ Flash.
+Finds the newest BIOS your machine's vendor publishes, verifies the download,
+and stages it on a FAT32 USB drive. The flash itself is always done by the
+machine's own firmware, so no vendor tool and no Windows is involved.
 
-Two equivalent implementations:
+| Script | Platform | Covers | Requires |
+|--------|----------|--------|----------|
+| `BIOS-update/update-bios.sh` | Ubuntu/Debian | ASUS + Dell | root (`dmidecode`, `mount`) |
+| `BIOS-update/Update-AsusBios.ps1` | Windows | ASUS | PowerShell, run as Administrator |
 
-| Script | Platform | Requires |
-|--------|----------|----------|
-| `BIOS-update/Update-AsusBios.ps1` | Windows | PowerShell, run as Administrator |
-| `BIOS-update/update-asus-bios.sh` | Ubuntu/Debian | root (`dmidecode`, `mount`) |
+### Ubuntu
+
+```bash
+sudo ./BIOS-update/update-bios.sh
+```
+
+The vendor is detected from SMBIOS and decides the code path. Missing
+dependencies are installed via `apt-get`: `curl`, `dmidecode` and `jq` plus
+`unzip` on ASUS, `cabextract`, `iconv` and `python3` on Dell.
 
 ### Windows
 
 1. Open PowerShell as admin
 2. `powershell -ExecutionPolicy Bypass -File Update-AsusBios.ps1`
 
-### Ubuntu
+### What the script does
 
-```bash
-sudo ./BIOS-update/update-asus-bios.sh
-```
-
-Installs `curl`, `jq`, `dmidecode`, `unzip` via `apt-get` if missing.
-
-### What both scripts do
-
-1. Read the board model and current BIOS version from SMBIOS
-2. Query the ASUS support API for the latest BIOS
+1. Read the vendor, model and current BIOS version from SMBIOS
+2. Look up the newest published BIOS (see below, it differs per vendor)
 3. Exit early if already up to date
-4. Find a FAT32 USB drive (mounting it if it has no mount point / drive letter)
-5. Download the package and **verify its SHA-256 against the hash ASUS
-   publishes** — a mismatch aborts before anything touches the USB drive
-6. Extract the `.CAP`, keeping ASUS's original filename
-7. Print the EZ Flash steps and offer to reboot
+4. Find a FAT32 USB drive, mounting it if it has no mount point
+5. Download and verify before anything touches the USB drive
+6. Stage the file and print that vendor's flash steps, then offer to reboot
 
-### Tests
+### Where the version comes from
 
-Both suites run on any machine — no root/Administrator, no ASUS board, no USB
-drive, no network. `lsblk`, `dmidecode`, `curl` and the BIOS archive are stubbed.
+**ASUS** queries the support API, which returns the version, a download URL and
+a published SHA-256 in one JSON response. The `.zip` is hash-verified, then the
+`.CAP` inside it is extracted. When ASUS publishes no hash, the archive is
+integrity-tested with `unzip -t` instead. A mismatch aborts before anything is
+written.
 
-```bash
-./BIOS-update/test-update-asus-bios.sh          # 25 tests
-pwsh -File ./BIOS-update/Test-UpdateAsusBios.ps1 # 18 tests
-```
+**Dell** reads `downloads.dell.com/catalog`, the feed Dell Command Update
+consumes. Not `dell.com/support`: that page renders its driver table only after
+you enter a service tag or pick the "All \<model\>" tab, it ships the payload
+Caesar-shifted, and each `driverid` is a permalink to one historical release
+rather than to the latest. An XPS 15 9500 has 31 BIOS releases listed, so
+picking a link off that page picks a version at random.
 
-Each case pins down behaviour that was previously wrong — the comments in the
-test files say what broke. Both scripts return early when sourced/dot-sourced,
-so the tests exercise their functions without running `main`.
+The catalog keys models on Dell's four-hex **System ID** (the SMBIOS SKU
+number, `097D` for an XPS 15 9500), because the model name is not a stable key:
+SMBIOS says `XPS 15 9500` while the catalog says `XPS Notebook 9500`. The
+per-model catalog is SHA-256 verified against the index before it is parsed.
+The catalog carries no per-file hash for BIOS components, so the downloaded
+`.exe` is checked against the size the catalog declares.
 
-What the tests do **not** cover: the actual flash. Nothing here has been run
-end to end against a real ASUS board, and EZ Flash itself is untested by
-definition.
+`fwupd` is not an option on Dell consumer laptops. They are not published to
+LVFS, so `fwupdmgr get-releases` for System Firmware returns nothing whatever
+version of fwupd is installed.
 
 ### Applying the update
 
-Reboot, enter BIOS (F2 or Del), then **Tool → ASUS EZ Flash 3 Utility**, and
+**ASUS** — reboot, enter BIOS (F2 or Del), **Tool → ASUS EZ Flash 3 Utility**,
 select the `.CAP` file from the USB drive.
 
-Do not power off during the flash.
+**Dell** — reboot, tap **F12**, **BIOS Update → Flash from file**, select the
+`.exe` from the USB drive. The file is a Windows executable but the F12 flasher
+runs it from firmware, so no Windows is needed.
+
+Keep the charger connected. Do not power off during the flash.
+
+### Tests
+
+```bash
+./BIOS-update/test-update-bios.sh          # 25 tests, ASUS code path
+pwsh -File ./BIOS-update/Test-UpdateAsusBios.ps1 # 18 tests
+```
+
+Both suites run on any machine — no root/Administrator, no ASUS board, no USB
+drive, no network. `lsblk`, `dmidecode`, `curl` and the BIOS archive are
+stubbed, and the shell suite sets `VENDOR=asus` to pin the code path it covers.
+The scripts return early when sourced, so the tests exercise their functions
+without running `main`.
+
+What the tests do **not** cover: the actual flash, and the Dell code path.
+The Dell half was run end to end against a real XPS 15 9500 (correctly reports
+1.40.0 as both current and latest, and downloads `XPS_9500_1.40.0.exe` at the
+size the catalog declares), but EZ Flash and the Dell F12 flasher are untested
+by definition.
 
 ### Notes
 
-- The original `.CAP` filename is preserved deliberately. It already encodes
-  board and version (e.g. `PRIME-B760M-K-D4-ASUS-1838.CAP`), and **USB BIOS
-  FlashBack** — the rear-panel button method — expects a specific board name.
-  Renaming to `<version>.CAP` would break it. If ASUS ships `BIOSRenamer.exe`
-  in the archive, it is copied to the USB drive too; that tool produces the
-  exact name FlashBack needs.
-- Only ASUS boards are supported; the scripts refuse to run on anything else.
-- The USB drive must be **FAT32**. EZ Flash cannot read NTFS or exFAT.
-
+- The staged ASUS file is renamed to `<version>.CAP` (e.g. `1838.CAP`), which
+  EZ Flash 3 accepts and which is easy to pick in the utility. **USB BIOS
+  FlashBack**, the rear-panel button method, is different: it needs a
+  board-specific name that ASUS's `BIOSRenamer.exe` derives from the *original*
+  download filename. For FlashBack, run BIOSRenamer on the unzipped download
+  rather than using the staged file.
+- Only ASUS and Dell are supported; the script refuses to run on anything else.
 ## jarvis
 
 Always-on "Hey Jarvis" voice assistant for Claude Code on Windows. Wake word

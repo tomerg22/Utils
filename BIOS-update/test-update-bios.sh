@@ -1,11 +1,11 @@
 #!/bin/bash
 #
-# Tests for update-asus-bios.sh
+# Tests for update-bios.sh (ASUS code path)
 #
 # Runs on any machine: no root, no ASUS board, no USB drive, no network.
 # lsblk / dmidecode / curl / sha256sum are stubbed per test.
 #
-#   ./test-update-asus-bios.sh
+#   ./test-update-bios.sh
 #
 # Each case below exists because the behaviour it pins down was previously
 # wrong. See the comments for what actually broke.
@@ -13,8 +13,13 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=./update-asus-bios.sh
-source "${SCRIPT_DIR}/update-asus-bios.sh"
+# shellcheck source=./update-bios.sh
+source "${SCRIPT_DIR}/update-bios.sh"
+
+# The dispatchers in update-bios.sh route on $VENDOR. These tests pin the
+# ASUS code path and run on any machine, so set it rather than letting
+# detect_vendor decide from the hardware underneath.
+VENDOR=asus
 
 # The sourced script sets `-e` and installs an EXIT trap for its own run. Both
 # have to go here: several tests deliberately exercise failure paths, which

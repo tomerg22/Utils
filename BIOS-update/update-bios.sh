@@ -256,18 +256,8 @@ require_vendor() {
     fi
 }
 
-check_dependencies() {
-    require_vendor || return 1
-
-    local missing=() packages=() needed=(curl dmidecode sha256sum lsblk)
-
-    case "$VENDOR" in
-        asus) needed+=(jq unzip) ;;
-        # iconv is needed because Dell ships the catalog XML as UTF-16; grep
-        # and python both read it as NUL-separated bytes otherwise and match
-        # nothing.
-        dell) needed+=(cabextract iconv python3) ;;
-    esac
+install_missing() {
+    local missing=() packages=() needed=("$@")
 
     for cmd in "${needed[@]}"; do
         if ! command -v "$cmd" &> /dev/null; then
@@ -301,6 +291,27 @@ check_dependencies() {
         echo -e "${GREEN}Dependencies installed successfully${NC}"
     fi
 }
+
+# Dependency installation is split in two because detect_vendor itself shells
+# out to dmidecode. Installing everything after vendor detection means a
+# machine without dmidecode reports "Unsupported system manufacturer: unknown"
+# and exits, instead of offering to install the thing it is missing. Measured
+# on a box with dmidecode removed from PATH.
+check_common_dependencies() {
+    install_missing curl dmidecode sha256sum lsblk
+}
+
+check_vendor_dependencies() {
+    require_vendor || return 1
+    case "$VENDOR" in
+        asus) install_missing jq unzip ;;
+        # iconv is needed because Dell ships the catalog XML as UTF-16; grep
+        # and python both read it as NUL-separated bytes otherwise and match
+        # nothing.
+        dell) install_missing cabextract iconv python3 ;;
+    esac
+}
+
 
 # --- dispatchers -----------------------------------------------------------
 #
@@ -833,13 +844,14 @@ main() {
     echo ""
 
     check_root
+    check_common_dependencies
 
     if ! VENDOR=$(detect_vendor); then
         exit 1
     fi
     echo -e "${WHITE}Vendor: ${VENDOR}${NC}"
 
-    check_dependencies
+    check_vendor_dependencies
 
     if ! identify_system; then
         exit 1

@@ -312,19 +312,42 @@ const reply = (html, url = 'https://he.aliexpress.com/w/x.html') =>
 {
   const H = loadHarvest(async () => reply(makePage()));
   const plan = H.start({ query: 'wire brush set' });
+  const url = H.debugUrl();
   ok('slugifies the query into the wholesale path',
-    plan.url.includes('/w/wholesale-wire-brush-set.html'), plan.url);
-  ok('always sorts by orders', plan.url.includes('SortType=total_tranpro_desc'));
+    url.includes('/w/wholesale-wire-brush-set.html'), url);
+  eq('plan names the path without the query string', plan.searchPath, '/w/wholesale-wire-brush-set.html');
+  ok('always sorts by orders', url.includes('SortType=total_tranpro_desc'));
   ok('applies the 4-star filter by default',
-    plan.url.includes('selectedSwitches=filterCode%3A4StarRating'), plan.url);
-  const plan2 = H.start({ query: 'a b', fourStar: false });
+    url.includes('selectedSwitches=filterCode%3A4StarRating'), url);
+  H.start({ query: 'a b', fourStar: false });
   ok('fourStar:false omits the rating filter',
-    !plan2.url.includes('4StarRating'), plan2.url);
+    !H.debugUrl().includes('4StarRating'), H.debugUrl());
   const plan3 = H.start({ query: 'a b', extra: '&shpf_co=CN' });
-  ok('extra params are appended', plan3.url.includes('&shpf_co=CN'));
+  ok('extra params are appended', H.debugUrl().includes('&shpf_co=CN'));
+  ok('plan reports that extras were applied without echoing them', plan3.extraApplied === true);
   let threw = false;
   try { H.start({ query: '   ' }); } catch (e) { threw = true; }
   ok('empty query throws rather than fetching a broken URL', threw);
+}
+
+/* WHY THIS GUARD EXISTS (measured 2026-09-14). The Chrome connector's
+ * javascript_tool replaces a whole result with "[BLOCKED: Cookie/query string
+ * data]" when the returned text carries a query string. start() used to
+ * return the full first-page URL, and payload() the base URL — both carry
+ * "?SortType=…&page=" — so in Chrome neither the plan nor the harvest could
+ * ever be read back. Everything an operator is told to return must be free
+ * of "?" and of cookie text; only debugUrl() may carry the URL. */
+console.log('\nharvest.js — nothing returned to the operator carries a query string');
+{
+  const H = loadHarvest(async () => reply(makePage({ items: [makeItem('q1')], finished: true })));
+  const plan = H.start({ query: 'wire brush set', extra: '&shpf_co=CN' });
+  await H.step(1);
+  for (const [name, text] of [['start()', JSON.stringify(plan)], ['status()', JSON.stringify(H.status())],
+                              ['payload()', H.payload()]]) {
+    ok(`${name} output has no "?"`, !text.includes('?'), text.slice(0, 120));
+    ok(`${name} output has no "&shpf"`, !text.includes('shpf'), text.slice(0, 120));
+  }
+  ok('debugUrl() is the one place the full URL lives', H.debugUrl().includes('?SortType='));
 }
 
 console.log('\nharvest.js — a WALL must never look like a parse bug');
@@ -746,6 +769,275 @@ console.log('\nlisting.js — text and images come back together, shadow DOM inc
     api.changed({ height: 1, textLen: 1, imgs: 0, leaves: 0 }) === true);
   ok('changed() reports false against a current fingerprint',
     api.changed(api.fingerprint()) === false);
+}
+
+// ------------------------------------------ two browsers, two locales (2026-09-14)
+/* A signed-in account renders its own locale: the same item that reads
+ * "1,000+ נמכרו" logged out reads "10,000+ sold" for a USD/English account,
+ * and grid prices come back as USD. The harvester must parse both without
+ * being told which browser it is in — nobody flips a flag correctly every
+ * time, and a wrong flag means every sold count silently parses to null.
+ */
+console.log('\nharvest.js — English pages parse like Hebrew ones');
+{
+  const enItem = (id, sold, price, cur) => ({
+    productId: id, title: { displayTitle: 'Disposable Dry Sweeping Cloths ' + id },
+    prices: { salePrice: { minPrice: price, discount: 50, currencyCode: cur }, originalPrice: { minPrice: 9.9 } },
+    evaluation: { starRating: 4.9 }, trade: { tradeDesc: sold + ' sold' },
+  });
+  const H = loadHarvest(async () => reply(makePage({
+    items: [enItem('en1', '10,000+', 4.92, 'USD'), enItem('en2', '4.000+', 3.1, 'USD'),
+            makeItem('he1', { soldRaw: '1,000+', price: 6.38 })],
+    finished: true,
+  })));
+  H.start({ query: 'electrostatic dust cloth' });
+  await H.step(1);
+  const by = Object.fromEntries(JSON.parse(H.payload()).items.map((i) => [i.id, i]));
+  eq('"10,000+ sold" parses', by.en1.sold, 10000);
+  eq('"4.000+ sold" parses (dot thousands, English marker)', by.en2.sold, 4000);
+  eq('"1,000+ נמכרו" still parses', by.he1.sold, 1000);
+  eq('currency recorded from the grid payload', by.en1.currency, 'USD');
+  eq('currency is null when the payload has none', by.he1.currency, null);
+}
+
+console.log('\nharvest.js — forceEnglish() writes the three locale cookies (in-app browser only)');
+{
+  const jar = [];
+  const fakeWin = { document: { set cookie(v) { jar.push(v); }, get cookie() { return jar.join('; '); } } };
+  // harvest.js reads window.document; give the fake window one.
+  const src = readFileSync(join(HERE, 'harvest.js'), 'utf8');
+  new Function('window', 'fetch', src)(fakeWin, async () => reply(makePage()));
+  const msg = fakeWin.__aeHarvest.forceEnglish();
+  ok('three cookies written', jar.length === 3, JSON.stringify(jar));
+  ok('locale cookie asks for en_US', jar.some((c) => /^aep_usuc_f=.*b_locale=en_US/.test(c)), jar[0]);
+  ok('default currency/region are ILS/IL', /c_tp=ILS&region=IL/.test(jar[0]), jar[0]);
+  ok('cookies are scoped to .aliexpress.com', jar.every((c) => /domain=\.aliexpress\.com/.test(c)));
+  const jar2 = []; const win2 = { document: { set cookie(v) { jar2.push(v); } } };
+  new Function('window', 'fetch', src)(win2, async () => reply(makePage()));
+  win2.__aeHarvest.forceEnglish({ currency: 'USD', region: 'US' });
+  ok('currency and region are parameters', /c_tp=USD&region=US/.test(jar2[0]), jar2[0]);
+  ok('return text does not echo a cookie value', !/aep_usuc_f|b_locale/.test(msg), msg);
+}
+
+/* WHY expose() EXISTS (measured 2026-09-14). The Chrome connector's
+ * javascript_tool returns at most 1,000 characters, so payload() (90 KB per
+ * 400 items) can never come back through it. get_page_text returns up to
+ * 50,000 characters of page text, so the payload is written into a <pre>
+ * placed FIRST in <body> — page text after it may be cut, the chunk is not —
+ * and read back one chunk at a time. */
+console.log('\nharvest.js — expose() chunks the payload into the page for get_page_text');
+{
+  const src = readFileSync(join(HERE, 'harvest.js'), 'utf8');
+  const els = {};
+  const body = { children: [], get firstChild() { return this.children[0] || null; },
+    insertBefore(el, ref) { this.children = [el, ...this.children.filter((c) => c !== el)]; return el; } };
+  const doc = {
+    body,
+    getElementById: (id) => els[id] || null,
+    createElement: (tag) => { const el = { tag, id: '', textContent: '', attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } };
+      // register lazily so a second expose() finds the same element
+      Object.defineProperty(el, 'id', { set(v) { els[v] = el; el._id = v; }, get() { return el._id; } });
+      return el; },
+  };
+  const win = { document: doc };
+  new Function('window', 'fetch', src)(win, async () => reply(makePage({
+    items: Array.from({ length: 40 }, (_, i) => makeItem('big' + i, { title: 'x'.repeat(120) })), finished: true,
+  })));
+  const H = win.__aeHarvest;
+  H.start({ query: 'wire brush set' });
+  await H.step(1);
+  const full = H.payload();
+  const info = H.chunks(3000);
+  ok('chunks() reports total, size and count', info.total === full.length && info.count === Math.ceil(full.length / 3000), JSON.stringify(info));
+  const msgs = [];
+  for (let i = 0; i < info.count; i++) {
+    const msg = H.expose(i, 3000);
+    msgs.push(msg);
+    const pre = els.__aePayload;
+    ok(`chunk ${i} lands in a <pre> that is the first child of body`, body.children[0] === pre);
+    ok(`chunk ${i} is wrapped in markers`, new RegExp(`^AEPAYLOAD ${i}/${info.count} START\\n[\\s\\S]*\\nAEPAYLOAD END$`).test(pre.textContent));
+  }
+  ok('expose() return text is short enough for the 1,000-char cap', msgs.every((m) => m.length < 200));
+  ok('one <pre> is reused, not one per chunk', body.children.length === 1);
+}
+
+// ------------------------------------------------- send() + receiver.mjs
+/* The primary export: the page POSTs the payload to a loopback receiver that
+ * writes it to disk. Tested end to end — the real receiver on an ephemeral
+ * port, the real send() with Node's fetch — not a mocked pair. */
+console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both ends real');
+{
+  const { startReceiver, validate } = await import('./receiver.mjs');
+  const { mkdtempSync, readdirSync, readFileSync: rf } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'ae-recv-'));
+  const logs = [];
+  const recv = await startReceiver({ dir, port: 0, count: 1, idle: 30, log: (m) => logs.push(m) });
+  ok('receiver picks an ephemeral port', recv.port > 0, String(recv.port));
+
+  const src = readFileSync(join(HERE, 'harvest.js'), 'utf8');
+  const win = {};
+  new Function('window', 'fetch', src)(win, async (url, init) => {
+    if (typeof url === 'string' && url.startsWith('http://127.0.0.1:')) return fetch(url, init); // the real loopback POST
+    return reply(makePage({ items: [makeItem('r1', { title: 'brush r1', soldRaw: '2,000+' })], finished: true }));
+  });
+  const H = win.__aeHarvest;
+  H.start({ query: 'wire brush set' });
+  await H.step(1);
+  const msg = await H.send(recv.port);
+  ok('send() reports the receiver reply', /receiver replied 200: saved /.test(msg), msg);
+  ok('send() reply carries no query string', !msg.includes('?'), msg);
+  ok('send() reply is under the 1,000-char Chrome cap', msg.length < 400, String(msg.length));
+  const files = readdirSync(dir).filter((f) => f.startsWith('harvest-wire-brush-set-') && f.endsWith('.json'));
+  eq('one file written, named after the query', files.length, 1);
+  eq('file content is the payload byte for byte', rf(join(dir, files[0]), 'utf8'), H.payload());
+  await new Promise((r) => setTimeout(r, 120));
+  ok('receiver closed itself after --count payloads', recv.server.listening === false);
+
+  eq('garbage is rejected before touching disk', validate('nope').err, 'body is not JSON');
+  eq('JSON without items[] is rejected', validate('{"a":1}').err, 'JSON has no items[] — not a payload');
+
+  /* Chrome 153 holds a fetch() from a public https page to loopback behind
+   * its local-network permission (the request never arrived in 45 s), while
+   * a top-level form POST arrives. So send() races fetch against a timeout
+   * and falls back to a text/plain form, whose body reaches the receiver as
+   * "payload=<json>\r\n" — unwrap() must strip that, and only that. */
+  const { unwrap } = await import('./receiver.mjs');
+  eq('form-encoded body is unwrapped', unwrap('payload={"query":"x","items":[]}\r\n'), '{"query":"x","items":[]}');
+  eq('raw JSON is left alone', unwrap('{"a":"b=c","items":[]}'), '{"a":"b=c","items":[]}');
+  eq('an = inside the JSON is not the wrapper', unwrap('payload={"a":"b=c"}'), '{"a":"b=c"}');
+  {
+    const recvF = await startReceiver({ dir, port: 0, count: 1, idle: 30 });
+    const formBody = 'payload=' + H.payload() + '\r\n';
+    const r = await fetch('http://127.0.0.1:' + recvF.port + '/harvest', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: formBody });
+    eq('form-encoded POST is accepted', r.status, 200);
+    const saved = readdirSync(dir).filter((f) => f.startsWith('harvest-wire-brush-set-')).sort();
+    eq('form-encoded POST is saved as bare JSON', rf(join(dir, saved[saved.length - 1]), 'utf8'), H.payload());
+    await new Promise((r2) => setTimeout(r2, 120));
+  }
+  {
+    // send(): a held fetch falls back to the form; a working fetch does not.
+    const forms = [];
+    const doc = { createElement: (tag) => ({ tag, appendChild(c) { (this.children = this.children || []).push(c); }, submit() { this.submitted = true; forms.push(this); } }),
+      body: { appendChild() {} } };
+    const winHeld = { document: doc };
+    new Function('window', 'fetch', src)(winHeld, (url) => url.startsWith('http://127.0.0.1:') ? new Promise(() => {}) : Promise.resolve(reply(makePage({ items: [makeItem('h1')], finished: true }))));
+    winHeld.__aeHarvest.start({ query: 'wire brush set' });
+    await winHeld.__aeHarvest.step(1);
+    const msg2 = await winHeld.__aeHarvest.send(9999, { timeoutMs: 50 });
+    ok('a held fetch falls back to a form POST', /^form-posted /.test(msg2), msg2);
+    eq('the form targets the receiver URL', forms[0].action, 'http://127.0.0.1:9999/harvest');
+    eq('the form is text/plain (no preflight, one field)', forms[0].enctype, 'text/plain');
+    eq('the textarea carries the payload verbatim', forms[0].children[0].value, winHeld.__aeHarvest.payload());
+    ok('the form was submitted', forms[0].submitted === true);
+    ok('form reply names the next two steps', /get_page_text.*navigate back/.test(msg2), msg2);
+    const winOk = { document: doc };
+    new Function('window', 'fetch', src)(winOk, (url, init) => url.startsWith('http://127.0.0.1:')
+      ? Promise.resolve({ status: 200, text: async () => 'saved /tmp/x.json' })
+      : Promise.resolve(reply(makePage({ items: [makeItem('h2')], finished: true }))));
+    winOk.__aeHarvest.start({ query: 'wire brush set' });
+    await winOk.__aeHarvest.step(1);
+    const msg3 = await winOk.__aeHarvest.send(9999, { timeoutMs: 50 });
+    ok('a working fetch returns the reply and posts no form', /receiver replied 200: saved/.test(msg3) && forms.length === 1, msg3);
+  }
+  const recv2 = await startReceiver({ dir, port: 0, count: 1, idle: 30 });
+  const bad = await fetch('http://127.0.0.1:' + recv2.port + '/harvest', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{"a":1}' });
+  eq('receiver answers 400 to a non-payload', bad.status, 400);
+  const pre = await fetch('http://127.0.0.1:' + recv2.port + '/harvest', { method: 'OPTIONS' });
+  eq('CORS preflight answered', pre.status, 204);
+  eq('CORS origin header present', pre.headers.get('access-control-allow-origin'), '*');
+  await recv2.close();
+}
+
+// ---------------------------------------------------------------- decode.mjs
+/* decode.mjs reassembles the payload from either channel. It is the ONLY
+ * decoder — the inline snippet SKILL.md used to carry was retyped by hand
+ * every run, which is how the double-encoding got mis-parsed. */
+console.log('\ndecode.mjs — one decoder for the in-app file and the Chrome chunks');
+{
+  const { assemble, textsOf } = await import('./decode.mjs');
+  const src = readFileSync(join(HERE, 'harvest.js'), 'utf8');
+  const els = {};
+  const body = { children: [], get firstChild() { return this.children[0] || null; },
+    insertBefore(el) { this.children = [el]; return el; } };
+  const doc = { body, getElementById: (id) => els[id] || null,
+    createElement: () => { const el = { textContent: '', setAttribute() {} };
+      Object.defineProperty(el, 'id', { set(v) { els[v] = el; }, get() { return '__aePayload'; } }); return el; } };
+  const win = { document: doc };
+  new Function('window', 'fetch', src)(win, async () => reply(makePage({
+    items: Array.from({ length: 12 }, (_, i) => makeItem('dec' + i, { title: 'brush ' + 'y'.repeat(80) })), finished: true,
+  })));
+  const H = win.__aeHarvest;
+  H.start({ query: 'wire brush set' });
+  await H.step(1);
+  const payload = H.payload();
+
+  // Channel 1: the in-app harness file — a JSON array of {type,text} where the
+  // text is the JSON *string* returned by payload() (double-encoded).
+  const inApp = JSON.stringify([{ type: 'text', text: 'aeHarvest ready' }, { type: 'text', text: JSON.stringify(payload) }]);
+  const r1 = assemble(textsOf(inApp));
+  eq('in-app file decodes to the payload', JSON.stringify(r1.payload), payload);
+  eq('in-app channel named', r1.via, 'in-app-file');
+
+  // Channel 2: Chrome get_page_text dumps, one per chunk, in the wrong order,
+  // each surrounded by unrelated page text — as the real tool returns them.
+  const n = H.chunks(2000).count;
+  ok('fixture needs several chunks to be a real test', n >= 3, String(n));
+  const dumps = [];
+  for (let i = 0; i < n; i++) { H.expose(i, 2000); dumps.push('Title: x\nURL: y\n---\n' + els.__aePayload.textContent + '\nAliExpress footer'); }
+  const r2 = assemble([dumps[2], dumps[0], ...dumps.slice(3), dumps[1]]);
+  eq('chunks reassemble in order regardless of arrival order', JSON.stringify(r2.payload), payload);
+  eq('chunk channel named with the count', r2.via, `page-text-chunks(${n})`);
+  let err = null;
+  try { assemble(dumps.slice(1)); } catch (e) { err = e.message; }
+  ok('a missing chunk is an error that names it', /missing chunk\(s\) 0/.test(err || ''), err);
+
+  // Channel 3: a plain payload file passes through.
+  const r3 = assemble([payload]);
+  eq('plain payload passes through', r3.via, 'plain-json');
+  let err2 = null;
+  try { assemble(['nothing useful here']); } catch (e) { err2 = e.message; }
+  ok('garbage is refused, not returned as an empty payload', /no payload found/.test(err2 || ''), err2);
+}
+
+// ------------------------------------------- extract.js on an English page
+console.log('\nextract.js — English grid, USD prices, path-only URL');
+{
+  const extractSrc = readFileSync(join(HERE, 'extract.js'), 'utf8');
+  // extract.js is a bare IIFE expression; wrap it in parentheses so the leading
+  // comment's newlines cannot trigger ASI after `return`.
+  const run = (win, doc, loc) => JSON.parse(new Function('window', 'document', 'location', 'return (' + extractSrc + '\n)')(win, doc, loc));
+  const card = (id, text) => ({ href: 'https://he.aliexpress.com/item/' + id + '.html', parentElement: { parentElement: null, textContent: text } });
+  const domDoc = (cards) => ({
+    querySelectorAll: (sel) => /ld\+json/.test(sel) ? [] : cards,
+    body: { innerText: 'grid page ' + 'x'.repeat(3000) }, documentElement: { outerHTML: '<html>grid</html>' }, title: 't',
+  });
+  const loc = { href: 'https://he.aliexpress.com/w/wholesale-clip-flat-mop.html?SortType=total_tranpro_desc&page=2',
+    origin: 'https://he.aliexpress.com', pathname: '/w/wholesale-clip-flat-mop.html', search: '?SortType=total_tranpro_desc&page=2' };
+  // init-data path with an English payload
+  const win = { _dida_config_: { _init_data_: { data: { data: { root: { fields: { mods: { itemList: { content: [
+    { productId: 'e1', title: { displayTitle: 'Clip Flat Mop 25cm' }, prices: { salePrice: { minPrice: 9.5, discount: 40, currencyCode: 'USD' }, originalPrice: { minPrice: 15 } },
+      evaluation: { starRating: 4.8 }, trade: { tradeDesc: '3,000+ sold' } },
+  ] } } } } } } } } };
+  const r = run(win, domDoc([]), loc);
+  eq('init-data: English sold parses', r.items[0].sold, 3000);
+  eq('init-data: currency carried', r.items[0].currency, 'USD');
+  eq('page number still read from the query', r.page, 2);
+  ok('returned url has no query string (Chrome connector would block it)', !r.url.includes('?'), r.url);
+  // DOM fallback with an English card: "4.8 1,000+ sold US $4.92 US $9.90 Free shipping"
+  const r2 = run({}, domDoc([card('1005000000000001', 'Automatic Cloth Clip Mop 69.5cm 4.81,000+ sold US $4.92 US $9.90 -50% Free shipping')]), loc);
+  eq('dom fallback used', r2.source, 'dom');
+  eq('dom: rating split from glued sold (English)', r2.items[0].rating, 4.8);
+  eq('dom: English sold parses', r2.items[0].sold, 1000);
+  eq('dom: USD price read', r2.items[0].price, 4.92);
+  eq('dom: original price read', r2.items[0].wasPrice, 9.9);
+  eq('dom: currency from the symbol', r2.items[0].currency, 'USD');
+  eq('dom: discount read from "-50%"', r2.items[0].discountPct, 50);
+  ok('dom: free shipping detected in English', r2.items[0].freeShipping === true);
+  const r3 = run({}, domDoc([card('1005000000000002', 'מגב שטוח עם קליפס 4.9 2,000+ נמכרו ₪18.30 ₪36.60 50%- משלוח חינם')]), loc);
+  eq('dom: Hebrew card still parses (sold)', r3.items[0].sold, 2000);
+  eq('dom: Hebrew card still parses (price)', r3.items[0].price, 18.3);
+  eq('dom: Hebrew card currency', r3.items[0].currency, 'ILS');
 }
 
 // -------------------------------------------------------------------------

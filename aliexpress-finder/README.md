@@ -40,21 +40,36 @@ Then invoke it in Claude Code:
 /aliexpress-finder cordless drill with one battery
 ```
 
-Requires the in-app browser tools (`mcp__Claude_Browser__*`), so it runs in local
-Claude Code only — not in cloud sessions or scheduled routines.
+Runs in the user's own signed-in Chrome when the Claude in Chrome connector
+(`mcp__claude-in-chrome__*`) is present — the account sees its real prices and
+locale — and falls back to the in-app browser (`mcp__Claude_Browser__*`)
+otherwise, where it forces English pages with the region's currency. If Chrome
+is connected but logged out of AliExpress, the skill asks the user to sign in
+or to say `fallback`. Either way it is local Claude Code only — not cloud
+sessions or scheduled routines.
+
+The Chrome connector's script tool cuts results at 1,000 characters, blocks any
+result carrying a cookie or a query string, and returns `{}` for an async IIFE
+(all measured 2026-09-14). The harvester never returns a URL with a query
+string, POSTs its payload to a loopback receiver that writes the file
+(`send()` + `receiver.mjs`; page-text chunks are the fallback), and is driven
+with a top-level `await`. The signed-in account's language and currency are
+read as they are, never changed.
 
 ## Layout
 
 | File | Role |
 |------|------|
 | `SKILL.md` | The skill: 8-step workflow plus gotchas verified against the live site |
-| `scripts/harvest.js` | Browser-side paged harvester. Resumable, reads until the result stream is dry, and detects the anti-bot wall *before* parsing so a block can never be mistaken for a parse error |
-| `scripts/extract.js` | Single-page extractor for the currently loaded page. Reads the embedded `_dida_config_._init_data_` payload (~60 records), falls back to DOM scraping, and flags captcha interstitials |
+| `scripts/harvest.js` | Browser-side paged harvester. Resumable, reads until the result stream is dry, detects the anti-bot wall *before* parsing so a block can never be mistaken for a parse error. Runs unchanged in both browsers: `forceEnglish()` for the logged-out in-app browser, `expose()`/`chunks()` to export through the Chrome connector, both `sold` and `נמכר` parsed, currency per item |
+| `scripts/extract.js` | Single-page extractor for the currently loaded page. Reads the embedded `_dida_config_._init_data_` payload (~60 records), falls back to DOM scraping (`₪`, `US $`, `€`, `£`), and flags captcha interstitials |
+| `scripts/receiver.mjs` | Loopback HTTP receiver: `__aeHarvest.send(port)` POSTs the harvest payload to it from either browser and it writes `harvest-<query>-<stamp>.json`, replying with the path. No retyping, no chunking. Exits after one payload or 15 idle minutes |
+| `scripts/decode.mjs` | Fallback decoder: reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps in any order (refuses a partial set), or from a plain payload JSON |
 | `scripts/listing.js` | Detail-page reader. Expands the page, then returns text **and** images in one call; walks the shadow DOM (a bare `querySelectorAll('img')` sees 1 image of dozens), separates product size from carton size |
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). For hardware the label on the case is the spec sheet |
 | `scripts/rank.mjs` | Scoring: shrunk quality + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification, `--constraint` hard requirement filters, absence-is-not-evidence warning |
 | `scripts/lib.mjs` | Pure helpers shared by the ranker and the tests |
-| `scripts/test.mjs` | Test suite — 145 assertions |
+| `scripts/test.mjs` | Test suite — 244 assertions |
 
 ## Tests
 
@@ -77,6 +92,12 @@ found during live runs:
 - the site's own `totalResults` used as a coverage denominator
 - a shortlist sampled only at its head, so a strong-review listing could never
   earn the review count that would promote it
+- a search URL returned to the operator, which the Chrome connector blocks
+  outright; and a payload returned through a channel that cuts it at 1,000
+  characters — the tests assert no `?` in any returned value and round-trip
+  the chunked export through the decoder, chunks arriving out of order
+- an English page parsing every sold count to `null` because only the Hebrew
+  marker was known — an English and a Hebrew grid are parsed side by side
 
 `harvest.js` and `extract.js` run in the browser and cannot import `lib.mjs`, so
 each inlines `parseSold` between `@shared:parseSold` markers. The test suite

@@ -7,9 +7,11 @@ description: Take a free-text product description and return the top listings wi
 
 Take a free-text product description, return the top 4 listings with evidence.
 
-Runs on the in-app browser (`mcp__Claude_Browser__*`). **Local Claude Code only** —
-does not work in Cowork, cloud sessions, or scheduled routines, because personal
-skills and the browser tools are both absent there.
+Runs on the **Chrome connector** (`mcp__claude-in-chrome__*`, the user's own
+signed-in browser) when one is connected, and on the in-app browser
+(`mcp__Claude_Browser__*`) otherwise — step 0 decides. **Local Claude Code
+only** — does not work in Cowork, cloud sessions, or scheduled routines,
+because personal skills and both browser tool sets are absent there.
 
 ## Before you start
 
@@ -83,10 +85,73 @@ something about titles, not about the world. `rank.mjs` now emits an
 when you see it, go look at images and descriptions before writing a word
 about absence.
 
+## Step 0 — Pick the browser: signed-in Chrome first, in-app browser as fallback
+
+A signed-in account sees the prices it will actually pay and the site's own
+locale; the logged-out in-app browser sees geo defaults and new-buyer promo
+prices capped at "1 per customer" (measured 2026-09-14: the same item read
+`₪3.42` logged out and `US $9.37` in the signed-in cart). So prefer the
+user's Chrome when it is there. Order:
+
+1. **Detect the connector.** Load its tools in ONE ToolSearch call:
+   `select:mcp__claude-in-chrome__list_connected_browsers,mcp__claude-in-chrome__tabs_context_mcp,mcp__claude-in-chrome__tabs_create_mcp,mcp__claude-in-chrome__tabs_close_mcp,mcp__claude-in-chrome__navigate,mcp__claude-in-chrome__javascript_tool,mcp__claude-in-chrome__computer,mcp__claude-in-chrome__get_page_text,mcp__claude-in-chrome__browser_batch`.
+   If the names are absent, or `list_connected_browsers` returns no browser
+   with `isLocal: true`, go to the in-app browser (step 2) and say so in one
+   line.
+2. **Open a tab and check sign-in.** `tabs_context_mcp{createIfEmpty:true}`,
+   then `navigate` to the first detail page you need anyway (never a wasted
+   request). Read the header from the body text: a signed-in page shows
+   `Hi, <name>` and `Account`; a logged-out one shows `Sign in / Register`
+   (Hebrew: `התחבר / הרשמה`). Do this with text, not cookies — the connector
+   blocks a result that contains cookie data.
+3. **Signed in → use Chrome for the whole run.** Report which account name
+   you saw and which locale/currency the header shows (`EN/ USD` etc.).
+4. **Not signed in → stop and ask, as the headline of that turn:** "Chrome is
+   connected but AliExpress is logged out there. Sign in in that tab, or say
+   `fallback` to use the in-app browser (logged out, promo prices)." Do
+   nothing until the answer. After a sign-in, re-read the header once to
+   confirm before continuing.
+5. **No connector → in-app browser**, exactly as before, plus
+   `__aeHarvest.forceEnglish()` (step 2) so titles come back in English.
+
+### Chrome connector rules — every one measured on 2026-09-14
+
+The same scripts run in both browsers, but the connector's `javascript_tool`
+has four hard limits that the in-app tool does not. Each is handled in code;
+this list is so you do not fight the symptoms:
+
+| Limit | Symptom | What to do |
+|---|---|---|
+| Result cut at **1,000 characters** | `…[TRUNCATED]` | Never return `payload()`. Use `__aeHarvest.expose(i)` + `get_page_text` (step 3). |
+| Result with a cookie or a **query string** is replaced | `[BLOCKED: Cookie/query string data]` | Never return `document.cookie`, `location.href` of a search page, or any URL with `?`. `start()`/`status()`/`payload()` are already clean; `debugUrl()` is in-app only. |
+| An async IIFE returns `{}` | `(async () => {...})()` → `{}` | Use a **top-level `await`**: `await __aeHarvest.step(6)`. |
+| Call timeout between 25 s and 45 s | `CDP Runtime.evaluate timed out after 45000ms` | Keep `step(6)`; 25 s passed, 45 s failed. In-app dies at 30 s, so the unit of work is the same. |
+
+Also: tab ids are **numbers** and must be passed explicitly inside
+`browser_batch`; `get_page_text` returns at most 50,000 characters (the
+`max_chars` argument is ignored there); close the tab you opened when done.
+
+**Never change the account's language or currency in the signed-in browser.**
+No `forceEnglish()` there, no settings clicks. The parsers accept both
+`sold` and `נמכר`, and every item carries `currency`, so the account's own
+locale is simply read as it is. A wall hit in the signed-in browser lands on
+the user's own account session — the request budget (step 2) is not looser
+there, it is the same number.
+
+What was verified to work identically in the connector: JSON-LD on detail
+pages, the shadow-DOM image walk, `fetch()` of search pages with the
+account's cookies (page 1 of `clip flat mop` came back with 60 items in USD),
+window state surviving between calls, screenshots, `find`/`read_page`.
+
 ## Step 1 — Build the search URL
 
-Reduce the description to 2-4 English keywords. English queries work fine on the
-Hebrew storefront and return Hebrew titles with ILS prices.
+Reduce the description to 2-4 English keywords. English queries work on
+every storefront locale. Titles come back in the **page language**: Hebrew
+with ILS prices in the logged-out in-app browser (unless `forceEnglish()`
+was called), the account's language and currency in signed-in Chrome.
+The host stays `he.aliexpress.com` even for English pages — the site
+redirects `www.aliexpress.com/item/…` there with `gatewayAdapt=glo2isr` and
+only the locale changes.
 
 ```
 https://he.aliexpress.com/w/wholesale-<kebab-keywords>.html?SortType=total_tranpro_desc&selectedSwitches=filterCode%3A4StarRating
@@ -141,8 +206,18 @@ Multiple `selectedSwitches` values join with `,`. Pass extras through
 
 ## Step 2 — Open the browser, and respect the wall
 
-If no browser pane is open, `preview_start` with the URL. Otherwise `navigate`.
-`preview_start` is required first — `navigate` alone errors with "No preview is open".
+**Chrome connector:** `tabs_context_mcp{createIfEmpty:true}` then `navigate`
+with the numeric `tabId` (step 0 already did this for the sign-in check —
+reuse that tab).
+
+**In-app browser:** if no browser pane is open, `preview_start` with the URL.
+Otherwise `navigate`. `preview_start` is required first — `navigate` alone
+errors with "No preview is open". Then, right after installing `harvest.js`
+(step 3) and before `start()`, run `__aeHarvest.forceEnglish()` once: it
+writes the three cookies the site's own language panel writes, so every later
+fetch and page load is English with ILS prices (verified 2026-09-14: page
+lang `en`, `₪6.38`, JSON-LD unchanged). Pass `{currency, region}` to change
+the defaults `ILS`/`IL`. **Never call it in the signed-in Chrome.**
 
 ### The anti-bot wall — detect it, alert, and stop
 
@@ -217,14 +292,21 @@ Pass the **entire contents** of `scripts/harvest.js` as the `text` argument of
 `javascript_tool`. It installs `window.__aeHarvest` and returns a status string.
 
 ```js
-__aeHarvest.start({ query: 'wire brush set' })  // returns the plan + URL
-__aeHarvest.step(8)                             // repeat until .done
-__aeHarvest.payload()                           // JSON string for rank.mjs
+__aeHarvest.forceEnglish()                      // in-app browser ONLY, once
+__aeHarvest.start({ query: 'wire brush set' })  // returns the plan (path, flags — no URL)
+await __aeHarvest.step(6)                       // repeat until .done (top-level await)
+__aeHarvest.payload()                           // in-app browser: JSON string for decode.mjs
 ```
 
-`step(n)` is resumable because `javascript_tool` dies at 30s, which is about
-8-12 fetches. Call it repeatedly until `done: true`. It stops on `exhausted`,
-`page-cap`, `request-budget`, `blocked`, `fetch-error` or `parse-error` — and
+`start()` deliberately returns the search **path** and flags, not the URL —
+the Chrome connector blocks any result carrying a query string.
+`__aeHarvest.debugUrl()` has the full URL when you are in the in-app browser.
+
+`step(n)` is resumable because `javascript_tool` dies at 30 s in-app (and
+between 25 s and 45 s in Chrome), which is about 8-12 fetches. Drive it with a
+**top-level `await`** — an async IIFE comes back as `{}` in Chrome. Call it
+repeatedly until `done: true`. It stops on `exhausted`, `page-cap`,
+`request-budget`, `blocked`, `fetch-error` or `parse-error` — and
 **`blocked` means go to step 2 and alert the user.**
 
 Defaults are `maxPages: 20`, `maxRequests: 24`, `fourStar: true`.
@@ -265,19 +347,52 @@ whatever scraping blogs claim — but `_dida_config_._init_data_` is not.
 
 ### Getting a large payload out of the browser
 
-A full harvest is ~90KB per 400 items and will exceed the tool-result limit.
-That is fine: the harness saves the oversized result to a file and prints the
-path. Slice `payload()` into parts, then decode locally — the saved text is
-**double-encoded** (a JSON file whose `text` field holds a JSON string):
+A full harvest is ~90KB per 400 items. **Primary channel, both browsers:**
+the page POSTs it to a loopback receiver that writes the file. Start the
+receiver as a background Bash task *before* the harvest so the harness
+tracks it (it exits after one payload or 15 idle minutes):
+
+```bash
+node ~/.claude/skills/aliexpress-finder/scripts/receiver.mjs --dir <scratchpad> --port 8765
+```
+
+then in the browser:
 
 ```js
-const raw = JSON.parse(fs.readFileSync(savedPath, 'utf8'));
-const t = raw.map(x => x.text).join('');
-const first = t.indexOf('"');
-for (let end = t.lastIndexOf('"'); end > first; end = t.lastIndexOf('"', end - 1)) {
-  try { obj = JSON.parse(JSON.parse(t.slice(first, end + 1))); break; } catch (e) {}
-}
+await __aeHarvest.send(8765)
+// in-app:  "sent 91234 chars; receiver replied 200: saved <path> (…)"
+// Chrome:  "form-posted 91234 chars to http://127.0.0.1:8765/harvest - the tab
+//           now shows the receiver reply: get_page_text, then navigate back"
 ```
+
+`send()` tries a `fetch()` POST first and, if Chrome holds it (its
+local-network permission gate held such a request for 45 s without it ever
+reaching the receiver, measured on Chrome 153), submits a top-level
+`text/plain` form to the same URL. A form POST is a navigation, and it
+arrived. The tab then shows `saved <path> (…)`: read it with
+`get_page_text`, and `navigate` back to AliExpress. Window state is gone
+after that navigation — export once, at the end of the harvest. Nothing is
+retyped and nothing is chunked; the saved file is `harvest.json`.
+
+**Fallbacks**, decoded by the one decoder:
+
+```bash
+node ~/.claude/skills/aliexpress-finder/scripts/decode.mjs <file...> > harvest.json
+node ~/.claude/skills/aliexpress-finder/scripts/decode.mjs --check <file...>   # coverage only
+```
+
+- *In-app browser:* call `__aeHarvest.payload()`. The result exceeds the
+  tool-result limit, the harness saves it to a file and prints the path —
+  that file is the input to `decode.mjs` (double-encoded: a JSON array whose
+  `text` field holds a JSON string; the decoder knows).
+- *Chrome connector:* `payload()` would come back as 1,000 characters plus
+  `[TRUNCATED]`. Export through the page: `__aeHarvest.chunks()` reports
+  `{ total, chunkSize: 40000, count }`; `__aeHarvest.expose(0)` writes chunk
+  0 into a `<pre>` placed FIRST in `<body>`; `get_page_text` reads it (its
+  50,000-character cap cuts the page's own text, never the chunk); save the
+  output to a file and repeat for `expose(1)`, `expose(2)`… Feed every dump
+  to `decode.mjs` in any order — it checks all chunks arrived and refuses a
+  partial payload.
 
 ## Step 4 — Shortlist, and split the classes
 
@@ -295,11 +410,15 @@ bottle brushes, PCB anti-static brushes and gas-hob brushes. They are not
 substitutes. Filter to the class the user actually asked for:
 
 ```bash
-... --require 'ידית|יד |אינץ' 
+... --require 'handle|hand |inch'        # English titles (signed-in Chrome, or in-app after forceEnglish())
+... --require 'ידית|יד |אינץ'             # Hebrew titles (in-app browser without forceEnglish())
 ```
 
-In the measured run, a hand-brush `--require` cut 1,166 to 187 and the ranking
-became answerable. Ask which class the user wants, or present both.
+Write the regex in the language the titles came back in — check one title
+first. A regex in the wrong language drops the whole pool and the
+`absence-is-not-evidence` warning fires. In the measured run, a hand-brush
+`--require` cut 1,166 to 187 and the ranking became answerable. Ask which
+class the user wants, or present both.
 
 The no-rating filter removes AliExpress's SEO keyword-stuffing links (titles
 like "milk frother containeraliexpress milk frother…", all fields null). The 4★
@@ -365,12 +484,18 @@ For each selected item, navigate to its URL and run:
     rating:p?.aggregateRating?Number(p.aggregateRating.ratingValue):null,
     reviews:p?.aggregateRating?Number(p.aggregateRating.reviewCount):null,
     price:p?.offers?Number(p.offers.price):null,
-    sold:(body.match(/([\d.,]+\+?)\s*נמכר/)||[])[1]||null });
+    currency:p?.offers?p.offers.priceCurrency:null,
+    sold:(body.match(/([\d.,]+\+?)\s*(?:sold|נמכר)/i)||[])[1]||null,
+    ownReviews:/Review for this item/.test(body), pooled:/Review for similar item/.test(body) });
 })()
 ```
 
 JSON-LD carries rating, reviewCount, price and currency — but **not** sold count
-and **not** brand. Sold comes from the body text; brand comes from step 6.
+and **not** brand. Sold comes from the body text (`sold` on an English page,
+`נמכר` on a Hebrew one); brand comes from step 6. The `ownReviews`/`pooled`
+flags matter: many listings show "Review for similar item", meaning the
+review count is **pooled from other sellers' similar items** (the page says
+so under the reviews). Report which kind a count is.
 
 ### Read the whole listing — both channels, one call
 
@@ -517,7 +642,9 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 
 | File | Role |
 |------|------|
-| `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until dry, reports `coverage.verdict`. |
+| `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until dry, reports `coverage.verdict`. Runs unchanged in both browsers; `forceEnglish()` (in-app only), `expose()`/`chunks()` (Chrome export), `debugUrl()` (in-app only). |
+| `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; `__aeHarvest.send(port)` POSTs the payload to it and it writes `harvest-<query>-<stamp>.json`, replying with the path. Exits after one payload or 15 idle minutes. |
+| `scripts/decode.mjs` | **Fallback decoder.** Reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps (any order, refuses a partial set), or from a plain payload JSON. |
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. `_init_data_` first, DOM fallback, reports `source` and `blocked`. |
 | `scripts/listing.js` | **Detail-page reader.** Expands, then returns text AND images in one call. Shadow-DOM aware, block-aware, separates product size from carton size, `changed()` proves a re-read is owed. |
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). The label on the case is the spec sheet. |
@@ -530,6 +657,48 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 markers. `test.mjs` pulls **every** copy out and asserts they match `lib.mjs` on
 every fixture — keep them in sync, the test will catch you if you don't. A
 drifted `wallVerdict` means one entry point silently stops detecting walls.
+
+### Changes 2026-09-14 — signed-in Chrome first, English pages, one decoder
+
+Not defects found by the user this time; a feature request, built only on
+measured behaviour of the two browsers (the mop-and-sheets session).
+
+1. **Chrome connector preferred when signed in** (step 0). Reason: a
+   logged-out session sees geo defaults and 1-per-customer promo prices;
+   the signed-in cart showed `US $9.37` for an item the logged-out page
+   listed at `₪3.42`. The connector was tested for parity call by call
+   before the skill was pointed at it; the four differences it has are in
+   the step-0 table, and each is handled in code, not by operator memory.
+2. **Locale-tolerant parsing.** `sold`/`נמכר` both match; `currency` is
+   recorded per item from `salePrice.currencyCode` (grid) or
+   `offers.priceCurrency` (JSON-LD); the DOM fallback reads `₪`, `US $`,
+   `€`, `£`. A signed-in account's own locale is read as it is — never
+   changed. Guard: test.mjs parses an English and a Hebrew grid side by side.
+3. **`forceEnglish()`** for the logged-out in-app browser: the three cookies
+   the site's language panel writes, verified to turn a Hebrew page into an
+   English one with ILS prices and unchanged JSON-LD. Never for Chrome.
+4. **No query strings in any returned value.** The connector replaces such a
+   result with `[BLOCKED: Cookie/query string data]`; `start()` and
+   `payload()` used to carry the full search URL, so in Chrome neither could
+   ever be read back. Guard: test.mjs asserts no `?` in `start()`,
+   `status()`, `payload()`.
+5. **`send()` + `receiver.mjs`, with `expose()` + `decode.mjs` as fallback.**
+   The connector cuts a `javascript_tool` result at exactly 1,000 characters
+   (measured with position markers) and `get_page_text` at 50,000 (its
+   `max_chars` is ignored), so no payload can come back through a tool
+   result without hand-copying. The page now POSTs the payload to a loopback
+   receiver that writes the file and replies with its path — no retyping, no
+   chunking, same in both browsers. Chrome 153 held a `fetch()` to loopback
+   behind its local-network permission (never arrived in 45 s), so `send()`
+   races the fetch against a timeout and falls back to a top-level form POST,
+   which arrived. If loopback is unreachable altogether, the payload is
+   written into the page 40,000 characters at a time and read back by
+   `get_page_text`; the decoder checks every chunk arrived. The same decoder
+   replaces the inline double-decoding snippet for the in-app file, so there
+   is one decoder, tested, instead of a snippet retyped per run.
+6. **Pooled reviews flagged.** Many detail pages show "Review for similar
+   item": the review count is aggregated across sellers. The step-5 snippet
+   now returns `ownReviews`/`pooled` so the report can say which it is.
 
 ### Defect fixed 2026-08-25 — the quiet wall (the jump-starter session)
 

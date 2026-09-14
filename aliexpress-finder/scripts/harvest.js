@@ -43,6 +43,24 @@
  * roughly 50-60 rapid fetches in one session. Hence maxRequests, and hence
  * the 4-star filter (see start()), which roughly triples usable rows per
  * request instead of spending more requests.
+ *
+ * TWO BROWSERS, ONE FILE (measured 2026-09-14). This runs unchanged in the
+ * in-app browser (mcp__Claude_Browser__javascript_tool) and in the Chrome
+ * connector (mcp__claude-in-chrome__javascript_tool). The connector differs
+ * in four ways, and every one of them is handled here rather than in prose:
+ *   1. It cuts a result at 1,000 characters -> payload() is never returned
+ *      through it; send() POSTs it to scripts/receiver.mjs on loopback
+ *      (both browsers), and expose() + get_page_text is the fallback.
+ *   2. It blocks any result holding a cookie or a query string -> start(),
+ *      status() and payload() carry no URL with a "?"; debugUrl() is the
+ *      in-app-only escape hatch.
+ *   3. An async IIFE comes back as "{}" -> drive step() with a TOP-LEVEL
+ *      await: `await __aeHarvest.step(6)`, not `(async () => ...)()`.
+ *   4. A 25 s call passed and a 45 s call hit the CDP timeout -> step(6)
+ *      stays the unit of work (about 8-12 s).
+ * A signed-in account renders its own locale (English/USD for a USD
+ * account), so the sold marker is matched in both languages and the
+ * currency is recorded per item.
  */
 (() => {
   const BIDI_RE = new RegExp("[\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]", "g");
@@ -74,7 +92,12 @@
   }
   /* @shared:parseSold:end */
 
-  const SOLD_RE = /([\d.,]+\s*\+?)\s*נמכר/;
+  /* The sold marker follows the page language: "1,000+ נמכרו" on a Hebrew
+   * page, "10,000+ sold" on an English one (measured 2026-09-14, same item,
+   * same host, only the locale cookie differed). Accept both — a signed-in
+   * browser renders whatever locale the account uses, and that must not be
+   * changed by us (see SKILL.md, Chrome connector rules). */
+  const SOLD_RE = /([\d.,]+\s*\+?)\s*(?:נמכר|sold)/i;
 
   /* Same record shape as extract.js, so rank.mjs consumes either. */
   const mk = (o) => ({
@@ -82,6 +105,10 @@
     url: 'https://he.aliexpress.com/item/' + o.id + '.html',
     title: (o.title || '').slice(0, 140),
     price: o.price != null ? o.price : null,
+    // The account's currency (USD when signed in with a USD account, ILS on
+    // the logged-out Israeli storefront). Prices are only comparable within
+    // one currency, so it is carried on every record.
+    currency: o.currency || null,
     wasPrice: o.wasPrice != null ? o.wasPrice : null,
     discountPct: o.discountPct != null ? o.discountPct : null,
     rating: o.rating != null ? o.rating : null,
@@ -251,14 +278,127 @@ function wallVerdict(sig) {
       this.st = {
         query: opts.query, slug, base,
         fourStar: opts.fourStar !== false,
+        extra: opts.extra || null,
         maxPages: opts.maxPages || 20,
         maxRequests: opts.maxRequests || 24,
         page: 0, requests: 0,
         seen: new Set(), items: [], pages: [],
         claimedTotal: null, stop: null, lastErr: null, wall: null,
       };
-      return { query: this.st.query, url: base + '&page=1',
+      /* No query string in anything returned to the operator. The Chrome
+       * connector replaces a whole result with "[BLOCKED: Cookie/query string
+       * data]" when it contains one (measured 2026-09-14); the in-app browser
+       * does not care. debugUrl() has the full URL for the in-app browser. */
+      return { query: this.st.query,
+               searchPath: '/w/wholesale-' + slug + '.html',
+               sort: 'total_tranpro_desc', fourStar: this.st.fourStar,
+               extraApplied: !!this.st.extra,
                maxPages: this.st.maxPages, maxRequests: this.st.maxRequests };
+    },
+
+    /* The full first-page URL. In-app browser only: the Chrome connector
+     * blocks this output because of the query string. */
+    debugUrl() {
+      return this.st ? this.st.base + '&page=1' : null;
+    },
+
+    /* Make the LOGGED-OUT storefront serve English pages while keeping the
+     * region's currency. Sets the three cookies the site's own language panel
+     * writes (verified 2026-09-14: page lang "en", ILS prices, JSON-LD
+     * unchanged, host stays he.aliexpress.com). Fetches made after this call
+     * carry the cookies, so the harvest comes back with English titles.
+     *
+     * NEVER call this in a signed-in browser (the Chrome connector): it would
+     * overwrite the account's own language/currency settings. Parse whatever
+     * locale a signed-in account uses instead — SOLD_RE accepts both. */
+    forceEnglish(opts) {
+      opts = opts || {};
+      const cur = opts.currency || 'ILS';
+      const region = opts.region || 'IL';
+      const doc = window.document;
+      const exp = 'expires=' + new Date(Date.now() + 365 * 864e5).toUTCString();
+      const tail = '; domain=.aliexpress.com; path=/; ' + exp;
+      doc.cookie = 'aep_usuc_f=site=glo&c_tp=' + cur + '&region=' + region + '&b_locale=en_US' + tail;
+      doc.cookie = 'xman_us_f=x_locale=en_US&x_l=0&x_c_chg=1&intl_locale=en_US' + tail;
+      doc.cookie = 'intl_locale=en_US' + tail;
+      return 'english-cookies-set (' + cur + '/' + region + '); later fetches and page loads are English';
+    },
+
+    /* PRIMARY export, both browsers: POST the payload to scripts/receiver.mjs
+     * on loopback, which writes it to disk and replies with the path. Start
+     * the receiver first:
+     *   node scripts/receiver.mjs --dir <outdir> --port 8765
+     *
+     * Two transports, tried in order (measured 2026-09-14, Chrome 153):
+     *   fetch()  — held indefinitely by Chrome's local-network permission
+     *              gate when the page is a public https site: the request
+     *              never reached the receiver in 45 s. Kept because other
+     *              browsers may allow it; raced against a short timeout.
+     *   form     — a top-level <form method=POST enctype=text/plain> to the
+     *              same URL is a navigation, not a subresource request, and
+     *              it DID reach the receiver. The tab then shows the
+     *              receiver's reply ("saved <path> …"): read it with
+     *              get_page_text, then navigate back. Window state is gone
+     *              after that, which is fine — the payload is on disk.
+     * The return value is short and has no query string, so the Chrome
+     * connector shows it in full. */
+    async send(port, opts) {
+      opts = opts || {};
+      const host = opts.host || '127.0.0.1';
+      const url = 'http://' + host + ':' + (port || 8765) + '/harvest';
+      const p = this.payload();
+      const via = opts.via || 'auto';
+      if (via !== 'form') {
+        const timeoutMs = opts.timeoutMs || 3000;
+        const attempt = fetch(url, { method: 'POST', mode: 'cors', headers: { 'Content-Type': 'text/plain' }, body: p })
+          .then(async (r) => 'sent ' + p.length + ' chars; receiver replied ' + r.status + ': ' + (await r.text()).slice(0, 220))
+          .catch((e) => 'FETCH-ERROR ' + String(e).slice(0, 120));
+        const held = new Promise((resolve) => setTimeout(() => resolve('FETCH-HELD'), timeoutMs));
+        const res = await Promise.race([attempt, held]);
+        if (via === 'fetch' || !/^FETCH-(HELD|ERROR)/.test(res)) return res;
+      }
+      const doc = window.document;
+      const f = doc.createElement('form');
+      f.method = 'POST'; f.action = url; f.enctype = 'text/plain';
+      const ta = doc.createElement('textarea');
+      ta.name = 'payload'; ta.value = p;
+      f.appendChild(ta);
+      doc.body.appendChild(f);
+      f.submit();
+      return 'form-posted ' + p.length + ' chars to ' + url +
+             ' - the tab now shows the receiver reply: get_page_text, then navigate back';
+    },
+
+    /* FALLBACK export for the Chrome connector when loopback is unreachable.
+     * Its javascript_tool cuts every result at 1,000 characters (measured
+     * 2026-09-14) and get_page_text at 50,000, so: write one chunk of the
+     * payload into a <pre> that is the FIRST child of <body> (page text after
+     * it may be cut, the chunk never is), read it with get_page_text, repeat
+     * for each chunk, then reassemble with scripts/decode.mjs.
+     *
+     * The in-app browser has its own fallback: an oversized payload() result
+     * is saved to a file by the harness, and decode.mjs reads that file. */
+    chunks(size) {
+      const p = this.payload();
+      const n = size || 40000;
+      return { total: p.length, chunkSize: n, count: Math.ceil(p.length / n) };
+    },
+
+    expose(i, size) {
+      const doc = window.document;
+      const n = size || 40000;
+      const p = this.payload();
+      const count = Math.ceil(p.length / n);
+      const idx = i || 0;
+      let el = doc.getElementById('__aePayload');
+      if (!el) { el = doc.createElement('pre'); el.id = '__aePayload'; }
+      el.textContent = 'AEPAYLOAD ' + idx + '/' + count + ' START\n' +
+                       p.slice(idx * n, (idx + 1) * n) + '\nAEPAYLOAD END';
+      el.setAttribute('style',
+        'position:absolute;left:0;top:0;font-size:1px;white-space:pre-wrap;word-break:break-all;');
+      if (doc.body.firstChild !== el) doc.body.insertBefore(el, doc.body.firstChild);
+      return 'exposed chunk ' + idx + '/' + count + ' (' +
+             Math.max(0, Math.min(n, p.length - idx * n)) + ' chars) - read it with get_page_text';
     },
 
     /* Fetch up to n more pages. Safe to call repeatedly; returns progress.
@@ -318,6 +458,7 @@ function wallVerdict(sig) {
             id,
             title: clean((it.title && it.title.displayTitle) || ''),
             price: typeof sale.minPrice === 'number' ? sale.minPrice : null,
+            currency: typeof sale.currencyCode === 'string' ? sale.currencyCode : null,
             wasPrice: typeof orig.minPrice === 'number' ? orig.minPrice : null,
             discountPct: typeof sale.discount === 'number' ? sale.discount : null,
             rating: it.evaluation && typeof it.evaluation.starRating === 'number'
@@ -363,7 +504,11 @@ function wallVerdict(sig) {
       if (!s) return JSON.stringify({ err: 'not started' });
       return JSON.stringify({
         query: s.query,
-        url: s.base,
+        // Path only. The full URL carries a query string, which makes the
+        // Chrome connector block the whole result — see start().
+        searchPath: '/w/wholesale-' + s.slug + '.html',
+        sort: 'total_tranpro_desc',
+        extraApplied: !!s.extra,
         source: 'harvest-paged',
         blocked: s.stop === 'blocked',
         suspectedWall: s.stop === 'suspect-wall',

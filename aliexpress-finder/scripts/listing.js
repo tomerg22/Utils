@@ -222,10 +222,14 @@ function wallVerdict(sig) {
         url: url, text: bodyText, html: pageHtml,
         dataNodes: ldCount || (bodyText.length > 2000 ? 1 : 0),
       });
+      // Path only in every result: a punish URL carries x5secdata=... and the
+      // Chrome connector blocks any result holding a query string. The path
+      // (/_____tmd_____/punish) still names the wall.
+      const pageUrl = (location.origin || '') + (location.pathname || '');
       if (verdict.state !== 'clear') {
         return { blocked: verdict.state === 'blocked',
                  suspectedWall: verdict.state === 'suspect',
-                 wall: verdict, url: url.slice(0, 120), note: verdict.note };
+                 wall: verdict, url: pageUrl.slice(0, 120), note: verdict.note };
       }
 
       const before = this.fingerprint();
@@ -302,7 +306,7 @@ function wallVerdict(sig) {
 
       return {
         blocked: false,
-        url: url.slice(0, 140),
+        url: pageUrl.slice(0, 140),
         expandedClicks: expanded,
         fingerprintBefore: before,
         fingerprint: after,

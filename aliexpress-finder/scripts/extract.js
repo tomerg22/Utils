@@ -150,13 +150,19 @@ function wallVerdict(sig) {
   }
   /* @shared:parseSold:end */
 
-  const SOLD_RE = /([\d.,]+\s*\+?)\s*נמכר/;
+  /* "1,000+ נמכרו" on a Hebrew page, "10,000+ sold" on an English one — the
+   * marker follows the page locale, which a signed-in account controls. */
+  const SOLD_RE = /([\d.,]+\s*\+?)\s*(?:נמכר|sold)/i;
+  /* Grid prices: "₪22.30" on the Israeli storefront, "US $4.92" for a USD
+   * account, "€3.10" elsewhere. One regex, currency symbol captured. */
+  const MONEY_RE = /(₪|US\s?\$|\$|€|£)\s*([\d,]+(?:\.\d+)?)/g;
 
   const mk = (o) => ({
     id: o.id,
     url: 'https://he.aliexpress.com/item/' + o.id + '.html',
     title: (o.title || '').slice(0, 140),
     price: o.price != null ? o.price : null,
+    currency: o.currency || null,
     wasPrice: o.wasPrice != null ? o.wasPrice : null,
     discountPct: o.discountPct != null ? o.discountPct : null,
     rating: o.rating != null ? o.rating : null,
@@ -216,6 +222,7 @@ function wallVerdict(sig) {
         id,
         title: clean((it.title && it.title.displayTitle) || ''),
         price: typeof sale.minPrice === 'number' ? sale.minPrice : null,
+        currency: typeof sale.currencyCode === 'string' ? sale.currencyCode : null,
         wasPrice: typeof orig.minPrice === 'number' ? orig.minPrice : null,
         discountPct: typeof sale.discount === 'number' ? sale.discount : null,
         rating: it.evaluation && typeof it.evaluation.starRating === 'number'
@@ -247,23 +254,28 @@ function wallVerdict(sig) {
       if (text.length < 25) return;
       seen.add(id);
 
-      // Rating and sold are glued together: "<rating><sold> נמכרו"
-      const rs = text.match(/([1-5]\.\d)\s*([\d.,]+\s*\+?)\s*נמכר/);
-      // Every shekel amount, in order: [current, original]
-      const money = [...text.matchAll(/₪\s*([\d,]+(?:\.\d+)?)/g)]
-        .map((m) => Number(m[1].replace(/,/g, '')))
+      // Rating and sold are glued together: "<rating><sold> נמכרו" / "... sold"
+      const rs = text.match(/([1-5]\.\d)\s*([\d.,]+\s*\+?)\s*(?:נמכר|sold)/i);
+      // Every price, in order: [current, original]; the symbol says the currency
+      const moneyM = [...text.matchAll(MONEY_RE)];
+      const money = moneyM
+        .map((m) => Number(m[2].replace(/,/g, '')))
         .filter((n) => Number.isFinite(n));
-      const pct = (text.match(/(\d+)%-/) || [])[1];
+      const sym = moneyM.length ? moneyM[0][1] : '';
+      const currency = /₪/.test(sym) ? 'ILS' : /\$/.test(sym) ? 'USD'
+        : sym === '€' ? 'EUR' : sym === '£' ? 'GBP' : null;
+      const pct = (text.match(/(\d+)%-|-(\d+)%/) || []).slice(1).find(Boolean);
 
       items.push(mk({
         id,
-        title: clean(text.split('₪')[0]),
+        title: clean(sym ? text.split(sym)[0] : text),
         price: money[0] != null ? money[0] : null,
+        currency,
         wasPrice: money[1] != null ? money[1] : null,
         discountPct: pct ? Number(pct) : null,
         rating: rs ? Number(rs[1]) : null,
         soldRaw: rs ? rs[2].replace(/\s/g, '') : null,
-        freeShipping: /משלוח חינם/.test(text),
+        freeShipping: /משלוח חינם|free shipping/i.test(text),
       }));
     });
     return items;
@@ -292,7 +304,9 @@ function wallVerdict(sig) {
   const blocked = verdict.state === 'blocked';
 
   return JSON.stringify({
-    url: location.href,
+    // Path only: the Chrome connector blocks a result that carries a query
+    // string, and a search URL always has one.
+    url: location.origin + location.pathname,
     page: Number(new URLSearchParams(location.search).get('page') || 1),
     source,
     blocked,

@@ -727,7 +727,8 @@ def parse_args(argv=None):
                    help="stop after writing <work>/book.txt and the report")
     g = ap.add_argument_group("voice")
     g.add_argument("--voice", default="he_shaul")
-    g.add_argument("--speed", type=float, default=1.0, help="1.0 = natural pace")
+    g.add_argument("--speed", type=float, default=0.9,
+                   help="1.0 = natural pace, lower is slower")
     g.add_argument("--gap", type=float, default=1.2, help="seconds of silence before a chapter")
     g.add_argument("--max-chars", type=int, default=220, help="max characters per spoken chunk")
     g.add_argument("--workers", type=int, default=0, help="parallel speech processes (0 = auto)")

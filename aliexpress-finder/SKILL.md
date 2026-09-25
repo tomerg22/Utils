@@ -424,13 +424,21 @@ The no-rating filter removes AliExpress's SEO keyword-stuffing links (titles
 like "milk frother containeraliexpress milk frother…", all fields null). The 4★
 URL filter from step 1 already removes nearly all of these upstream.
 
-Expect **ties**. Sold saturates at "10,000+", so top candidates score
-identically. That is exactly why step 5 exists.
+Expect **ties**. Sold is bucketed ("10,000+", "50,000+", "100K+"), so top
+candidates score identically. That is exactly why step 5 exists.
+
+**A sold text the parser cannot read is set aside, never judged.** `rank.mjs`
+drops such an item as `sold-unparsed` and names the text in a warning. On
+2026-09-25 "100K+ sold" was unreadable, and the two best sellers of a
+1,228-item pool were dropped as `evidence<100` with no warning. If the warning
+fires, fix `parseSold`/`SOLD_RE` or open those items' detail pages.
 
 ## Step 5 — Fetch exact review counts (mandatory)
 
-Sold counts are bucketed ("1,000+", "5,000+") and saturate at "10,000+". The
-only fine-grained signal is the exact review count, in JSON-LD on the detail page.
+Sold counts are bucketed ("1,000+", "5,000+", "10,000+", "50,000+", "100K+").
+The only fine-grained signal is the listing's own rating count on the detail
+page. It is NOT the JSON-LD `reviewCount`: that number is usually pooled across
+other sellers' similar items (see the reader below).
 
 **Do not sample the shortlist by score alone.** This is a real defect found on
 2026-08-21 and it is the reason a good item can still be missed after paging
@@ -471,35 +479,92 @@ a specific listing evaluated, the honest lever is a larger `--top` with more
 step-5 fetches, not a cleverer sort. Say so rather than implying the tool found
 the best item when it sampled a tier.
 
-For each selected item, navigate to its URL and run:
+For each selected item, navigate to its URL, scroll to the middle of the page,
+wait 2-3 s (the review block renders late), and run the reader below. Its
+output stays under the Chrome connector's 1,000-character limit. `test.mjs`
+pulls this code out of this file and runs it against sample pages, so edit it
+here, between the markers, and run the tests after any change.
 
+<!-- @snippet:step5:start -->
 ```js
 (() => {
-  const el = document.querySelector('script[type="application/ld+json"]');
-  if (!el) return JSON.stringify({error:'not loaded yet'});
-  const arr = JSON.parse(el.textContent);
-  const p = (Array.isArray(arr)?arr:[arr]).find(x => x['@type']==='Product');
-  const body = (document.body.textContent||'').replace(/\s+/g,' ');
-  return JSON.stringify({ id:(location.pathname.match(/(\d+)\.html/)||[])[1],
-    rating:p?.aggregateRating?Number(p.aggregateRating.ratingValue):null,
-    reviews:p?.aggregateRating?Number(p.aggregateRating.reviewCount):null,
-    price:p?.offers?Number(p.offers.price):null,
-    currency:p?.offers?p.offers.priceCurrency:null,
-    sold:(body.match(/([\d.,]+\+?)\s*(?:sold|נמכר)/i)||[])[1]||null,
-    ownReviews:/Review for this item/.test(body), pooled:/Review for similar item/.test(body) });
+  /* @shared:soldRe:start */
+  const SOLD_RE = /([\d.,]+\s*[KkMm]?\s*\+?)\s*(?:נמכר|sold)/i;
+  /* @shared:soldRe:end */
+  /* @shared:reviewBlock:start */
+  function parseReviewBlock(text) {
+    const t = String(text || '').replace(/\s+/g, ' ');
+    const num = (s) => Number(String(s).replace(/[.,](?=\d{3}(?:\D|$))/g, ''));
+    const blk = t.match(/(\d\.\d)\s+(\d[\d,.]*)\s+ratings?\b(?=\s*All from verified)/i) ||
+                t.match(/(\d\.\d)\s+(\d[\d,.]*)\s+ratings?\b/i);
+    const head = t.match(/Reviews\s*\((\d[\d,.]*)\)/i) || t.match(/(\d[\d,.]*)\s+Reviews\b/i);
+    const own = blk ? num(blk[2]) : null;
+    const header = head ? num(head[1]) : null;
+    return {
+      own: Number.isFinite(own) ? own : null,
+      ownRating: blk ? Number(blk[1]) : null,
+      header: Number.isFinite(header) ? header : null,
+      pooledNote: /from various sellers for similar items/i.test(t),
+    };
+  }
+  /* @shared:reviewBlock:end */
+  const path = location.pathname;
+  const tx = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+  if (/_____tmd_____/.test(path) || /Captcha/i.test(document.title || '') ||
+      /slide to verify|unusual traffic/i.test(tx)) throw new Error('WALL: stop and tell the user (step 2)');
+  let p = null;
+  for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
+    try { const a = JSON.parse(el.textContent); p = p || (Array.isArray(a) ? a : [a]).find((x) => x && x['@type'] === 'Product'); } catch (e) {}
+  }
+  if (!p) return JSON.stringify({ error: 'no JSON-LD: take a SCREENSHOT before concluding anything', path, bodyLen: tx.length });
+  const o = p.offers || {}, ar = p.aggregateRating || {}, rv = parseReviewBlock(tx);
+  const sold = tx.match(new RegExp('Reviews\\s*\\S?\\s*' + SOLD_RE.source, 'i')) || tx.match(SOLD_RE);
+  const opts = [];
+  const walk = (r) => { for (const e of r.querySelectorAll('*')) {
+    const c = String(e.className || '');
+    if (/sku-item--(image|text)|sku-property-item/.test(c)) {
+      const im = e.querySelector && e.querySelector('img');
+      opts.push(((im && im.getAttribute('alt')) || e.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 22) + (/selected/.test(c) ? '*' : ''));
+    }
+    if (e.shadowRoot) walk(e.shadowRoot);
+  } };
+  walk(document);
+  return JSON.stringify({ id: (path.match(/(\d+)\.html/) || [])[1],
+    rating: ar.ratingValue != null ? Number(ar.ratingValue) : null,
+    reviews: rv.own, ownRating: rv.ownRating,
+    pooledReviews: ar.reviewCount != null ? Number(ar.reviewCount) : null, pooledNote: rv.pooledNote,
+    price: o.price != null ? Number(o.price) : null, currency: o.priceCurrency || null,
+    soldRaw: sold ? sold[1].replace(/\s/g, '') : null, options: [...new Set(opts)].slice(0, 8) });
 })()
 ```
+<!-- @snippet:step5:end -->
 
-JSON-LD carries rating, reviewCount, price and currency — but **not** sold count
-and **not** brand. Sold comes from the body text (`sold` on an English page,
-`נמכר` on a Hebrew one); brand comes from step 6. The `ownReviews`/`pooled`
-flags matter: many listings show "Review for similar item", meaning the
-review count is **pooled from other sellers' similar items** (the page says
-so under the reviews). Report which kind a count is.
+What comes back, and why each field is there (all measured 2026-09-25):
+
+- **`reviews` is the listing's own rating count**, read from the review block
+  ("4.9 1090 ratings"). `pooledReviews` is the JSON-LD `reviewCount`. It equals
+  the header "N Reviews" and the "Reviews (N)" tab, and on most listings it is
+  pooled across similar items from other sellers. The page says so:
+  "Reviews displayed are from various sellers for similar items"
+  (`pooledNote: true`). Header vs own: 5,479 vs 1,090, 9,460 vs 1,914,
+  4,779 vs 488. On the one listing without that note the two were equal
+  (37 vs 37). **Rank on `reviews`, and report both numbers.** That `reviews` is
+  the own count is read from the page, not from any AliExpress documentation.
+- **`reviews: null` means unknown**, for example on a Hebrew page, where the
+  wording of the review block has not been observed yet. Never put the pooled
+  number in its place. `rank.mjs` sets such a finalist aside as
+  `own-reviews-unknown`.
+- **`soldRaw`** comes from the header ("... Reviews 100K+ sold"), with the first
+  sold text on the page as the fallback. From 100,000 up it carries a K.
+- **`options`** are the listing's own options, read from the option selector;
+  `*` marks the selected one. The JSON-LD `price` is the selected option's
+  price, so say which option it is. A "$2.14 keychain" was the 1-key option,
+  not the 9-key pad in its title.
+- Brand is not here. It comes from step 6.
 
 ### Read the whole listing — both channels, one call
 
-JSON-LD is the review numbers only. For anything physical — ratings, current,
+The step-5 reader gives review counts, price, sold and options only. For anything physical — ratings, current,
 dimensions, what is on the output — install `scripts/listing.js` and run:
 
 ```js
@@ -507,10 +572,17 @@ __aeListing.read()
 ```
 
 It expands every "show more" first, then returns **text and images together**:
-`sizeLines`, `ratingLines`, `variants`, `gallery`, `text`, plus a
-`fingerprint`. One call, both channels, deliberately — see the defect below.
+`sizeLines`, `ratingLines`, `variants`, `selectedVariant`, `reviews`,
+`gallery`, `text`, plus a `fingerprint`. One call, both channels, deliberately —
+see the defect below.
 
-Three things it encodes that cost real time to discover:
+Four things it encodes that cost real time to discover:
+
+- **Options come only from the option selector** (`sku-item--image`,
+  `sku-item--text`; the selected one also carries `sku-item--selected`). It
+  used to read any element whose class mentioned "sku", which returned the
+  variant lines of reviews, often of other sellers' items, and missed every
+  image option.
 
 - **`document.querySelectorAll('img')` returns ONE image on a detail page** (a
   240x240 icon) while dozens are displayed. The gallery lives behind a shadow
@@ -579,8 +651,11 @@ rule promotes counterfeits, because the fakes wear the strongest brand names.
 
 ## Step 7 — Final rank
 
-Add `reviews`, any `brandScore`, and a `constraints` status per hard
-requirement to each finalist, then pass every requirement as `--constraint`:
+Add `reviews` (the listing's OWN count from the step-5 reader), `pooledReviews`,
+any `brandScore`, and a `constraints` status per hard requirement to each
+finalist, then pass every requirement as `--constraint`. Never copy the pooled
+count into `reviews`. A finalist with `reviews: null` is set aside as
+`own-reviews-unknown` and named in a warning; re-read its review block.
 
 ```bash
 node ~/.claude/skills/aliexpress-finder/scripts/rank.mjs --mode final --top 4 --constraint wires < finalists.json
@@ -598,8 +673,10 @@ data.
 
 ## Step 8 — Report
 
-Table of the 4: title, detail price ₪, rating, review count, sold, brand verdict,
-link. Then, briefly:
+Table of the 4: title, detail price (in the currency the account shows),
+rating, OWN rating count, sold, brand verdict, link. Say once that the header
+count on the page is pooled across other sellers, with one example pair. Then,
+briefly:
 
 - **the hard requirements, and that every listed item passes them.** If any
   item in the table fails one, it does not belong in the table. If `ranked` is
@@ -618,7 +695,9 @@ link. Then, briefly:
 - that step-5 detail fetches were a spread (`--spread`), which tiers it reached,
   and that stratification samples the range rather than proving one winner
 - any `flags` raised (`extreme-discount`, `price-outlier-low`, `sold-saturated`,
-  `reviews-exceed-sold`, `few-reviews-for-sales`, `brand-unresearched`)
+  `reviews-exceed-sold`, `few-reviews-for-sales`, `brand-unresearched`), and
+  any `sold-unparsed` or `own-reviews-unknown` warning, with the items it names
+- which option the detail price belongs to (the selected one in `options`)
 - any large search-vs-detail price gap
 - anything dropped for a notable reason (off-category, SEO junk, thin evidence)
 
@@ -646,17 +725,56 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 | `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; `__aeHarvest.send(port)` POSTs the payload to it and it writes `harvest-<query>-<stamp>.json`, replying with the path. Exits after one payload or 15 idle minutes. |
 | `scripts/decode.mjs` | **Fallback decoder.** Reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps (any order, refuses a partial set), or from a plain payload JSON. |
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. `_init_data_` first, DOM fallback, reports `source` and `blocked`. |
-| `scripts/listing.js` | **Detail-page reader.** Expands, then returns text AND images in one call. Shadow-DOM aware, block-aware, separates product size from carton size, `changed()` proves a re-read is owed. |
+| `scripts/listing.js` | **Detail-page reader.** Expands, then returns text AND images in one call. Shadow-DOM aware, block-aware, separates product size from carton size, reads options only from the option selector (`selectedVariant` too), returns the own vs pooled review counts, `changed()` proves a re-read is owed. |
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). The label on the case is the spec sheet. |
-| `scripts/rank.mjs` | Ranker. Bayesian shrinkage, log volume, neutral brand default, `--require` filter, `--spread` tier stratification, `--constraint` hard filters, absence warning. |
-| `scripts/lib.mjs` | Pure helpers (`parseSold`, `median`, `clean`, **`wallVerdict`**) shared by ranker, browser files and tests. |
-| `scripts/test.mjs` | Assertion suite incl. regression guards for every defect below. |
+| `scripts/rank.mjs` | Ranker. Bayesian shrinkage, log volume, neutral brand default, `--require` filter, `--spread` tier stratification, `--constraint` hard filters, absence warning, `sold-unparsed` and `own-reviews-unknown` set-asides with warnings. |
+| `scripts/lib.mjs` | Pure helpers (`parseSold`, `SOLD_RE`, `parseReviewBlock`, `median`, `clean`, **`wallVerdict`**) shared by ranker, browser files, the step-5 reader and tests. |
+| `scripts/test.mjs` | Assertion suite incl. regression guards for every defect below. It also runs the step-5 reader, pulled out of this file. |
 
 `harvest.js`, `extract.js` and `listing.js` run in the browser and cannot import
-`lib.mjs`, so each inlines `parseSold` and `wallVerdict` between `@shared:*`
-markers. `test.mjs` pulls **every** copy out and asserts they match `lib.mjs` on
-every fixture — keep them in sync, the test will catch you if you don't. A
-drifted `wallVerdict` means one entry point silently stops detecting walls.
+`lib.mjs`, so each inlines the helpers it needs (`parseSold`, `SOLD_RE`,
+`parseReviewBlock`, `wallVerdict`) between `@shared:*` markers, and so does the
+step-5 reader in this file. `test.mjs` pulls **every** copy out and asserts it
+matches `lib.mjs` on every fixture — keep them in sync, the test will catch you
+if you don't. A drifted `wallVerdict` means one entry point silently stops
+detecting walls; a drifted `SOLD_RE` means best sellers silently lose their
+sold count.
+
+### Defects fixed 2026-09-25 (the fidget-toys and stress-ball sessions)
+
+Found during a live run, then checked on 17 detail pages across two searches.
+Each one has a guard in code, and its tests fail on the old code.
+
+1. **"100K+ sold" could not be read, so the best sellers vanished.** From
+   100,000 up the storefront writes a K. `SOLD_RE` allowed no letter before
+   "sold" and `parseSold` knew no K, so the two best sellers of a 1,228-item
+   harvest (orders-sort positions 1 and 2) got `sold: null`, and `rank.mjs`
+   dropped them as `evidence<100` without a word. They were found only because
+   positions 1 and 2 were missing from the fetch list. Guard: K and M in
+   `parseSold` and `SOLD_RE`, every copy drift-guarded; the harvester keeps an
+   unreadable sold text as `soldText`; `rank.mjs` sets such items aside as
+   `sold-unparsed` and names the text in a warning. Checked live: the fixed
+   harvester read both 100K+ listings of a "stress ball" harvest as 100,000.
+2. **Step 5 ranked on a pooled review count.** The JSON-LD `reviewCount`
+   equals the header "N Reviews", and on most listings it combines similar
+   items from other sellers. The page says "Reviews displayed are from various
+   sellers for similar items". The review block's "N ratings" is the listing's
+   own count: 5,479 vs 1,090, 9,460 vs 1,914, 4,779 vs 488, and 37 vs 37 on the
+   one listing without the note. A first ranking built on the pooled numbers
+   was wrong. Guard: `parseReviewBlock` (lib.mjs, inlined in `listing.js` and
+   in the step-5 reader); the reader returns `reviews` (own) and
+   `pooledReviews` separately; `rank.mjs` sets a finalist that has only the
+   pooled count aside as `own-reviews-unknown`. `test.mjs` runs the step-5
+   reader from this file against sample pages.
+3. **Options were read from reviews.** `listing.js` took any element whose
+   class mentioned "sku". That returned review lines ("Color:D Ships
+   From:China Mainland", often from other sellers' items) and the property
+   title, and it missed every image option. It matters because JSON-LD reports
+   the selected option's price: a "$2.14 keychain" was the 1-key option, not
+   the 9-key pad in its title. Guard: options only from `sku-item--image` and
+   `sku-item--text`, plus `selectedVariant`.
+
+Common cause: a number was used without checking what it counted.
 
 ### Changes 2026-09-14 — signed-in Chrome first, English pages, one decoder
 

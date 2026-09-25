@@ -1,9 +1,12 @@
 /* Pure helpers shared by rank.mjs and the test suite.
  *
- * extract.js runs inside the browser and CANNOT import this file, so it
- * inlines a copy of parseSold between @shared markers. test.mjs pulls that
- * copy out and asserts it agrees with this one on every fixture, so the two
- * cannot silently drift apart.
+ * extract.js, harvest.js and listing.js run inside the browser and CANNOT
+ * import this file, so they inline copies of the helpers they need
+ * (parseSold, SOLD_RE, parseReviewBlock, wallVerdict) between @shared
+ * markers, and so does the step-5 snippet in SKILL.md. test.mjs pulls
+ * every copy out and
+ * asserts it agrees with this one on every fixture, so they cannot silently
+ * drift apart.
  */
 
 export const BIDI_RE = /[‎‏‪-‮⁦-⁩]/g;
@@ -24,6 +27,12 @@ export function clean(s) {
  * A separator is only treated as a thousands mark when exactly 3 digits
  * follow it, so a genuine decimal ("1.5") is left alone rather than
  * misread as 15.
+ *
+ * From 100,000 up the storefront writes a K: "100K+ sold" (measured
+ * 2026-09-25, the two best sellers of a 1,228-item harvest). This used to
+ * return null, and rank.mjs then dropped both best sellers as
+ * "evidence<100" without a word. K and M multiply. Before them, one
+ * separator followed by 1-2 digits is a decimal mark ("1.2K", "1,2K").
  */
 function parseSold(raw) {
   if (raw == null) return null;
@@ -32,12 +41,59 @@ function parseSold(raw) {
     .replace(/\s+/g, '')
     .replace(/\+/g, '');
   if (!s) return null;
-  const cleaned = s.replace(/[.,](?=\d{3}(?:\D|$))/g, '');
+  const unit = s.slice(-1).toLowerCase();
+  const mult = unit === 'k' ? 1e3 : unit === 'm' ? 1e6 : 1;
+  let body = mult === 1 ? s : s.slice(0, -1);
+  if (mult !== 1) body = body.replace(/[.,](?=\d{1,2}$)/, '.');
+  const cleaned = body.replace(/[.,](?=\d{3}(?:\D|$))/g, '');
   if (!/^\d+(\.\d+)?$/.test(cleaned)) return null;
-  const n = Number(cleaned);
-  return Number.isFinite(n) ? n : null;
+  const n = Number(cleaned) * mult;
+  if (!Number.isFinite(n)) return null;
+  return mult === 1 ? n : Math.round(n);
 }
 /* @shared:parseSold:end */
+
+/* @shared:soldRe:start */
+/* The sold marker follows the page language: "1,000+ נמכרו" on a Hebrew
+ * page, "10,000+ sold" on an English one. From 100,000 up the number carries
+ * a K ("100K+ sold", measured 2026-09-25). Without [KkMm] the match failed
+ * and soldRaw came back null for the best sellers of the pool. */
+const SOLD_RE = /([\d.,]+\s*[KkMm]?\s*\+?)\s*(?:נמכר|sold)/i;
+/* @shared:soldRe:end */
+
+/* @shared:reviewBlock:start */
+/* Read a detail page's review counts from its rendered text.
+ *
+ * WHY (measured 2026-09-25, 17 listings in two searches): the JSON-LD
+ * reviewCount, the header "N Reviews" and the "Reviews (N)" tab are one and
+ * the same number, and on most listings it is POOLED across similar items
+ * from other sellers. The page says so: "Reviews displayed are from various
+ * sellers for similar items on AliExpress". The review block carries a
+ * second, smaller figure, "4.9 1090 ratings", which is the listing's own
+ * count. Header vs own: 5,479 vs 1,090; 9,460 vs 1,914; 4,779 vs 488. On
+ * the one listing without that note the two were equal (37 vs 37). Ranking
+ * on the header ranked the pool, not the listing. "own" is inferred from the
+ * page; no AliExpress documentation was found.
+ *
+ * own is null when the block is not found (the Hebrew wording has not been
+ * observed). Null means UNKNOWN: never fall back to the pooled number.
+ */
+function parseReviewBlock(text) {
+  const t = String(text || '').replace(/\s+/g, ' ');
+  const num = (s) => Number(String(s).replace(/[.,](?=\d{3}(?:\D|$))/g, ''));
+  const blk = t.match(/(\d\.\d)\s+(\d[\d,.]*)\s+ratings?\b(?=\s*All from verified)/i) ||
+              t.match(/(\d\.\d)\s+(\d[\d,.]*)\s+ratings?\b/i);
+  const head = t.match(/Reviews\s*\((\d[\d,.]*)\)/i) || t.match(/(\d[\d,.]*)\s+Reviews\b/i);
+  const own = blk ? num(blk[2]) : null;
+  const header = head ? num(head[1]) : null;
+  return {
+    own: Number.isFinite(own) ? own : null,
+    ownRating: blk ? Number(blk[1]) : null,
+    header: Number.isFinite(header) ? header : null,
+    pooledNote: /from various sellers for similar items/i.test(t),
+  };
+}
+/* @shared:reviewBlock:end */
 
 /* @shared:wallVerdict:start */
 /* Decide how far to trust a page read: 'clear', 'blocked', or 'suspect'.
@@ -128,7 +184,7 @@ function wallVerdict(sig) {
 }
 /* @shared:wallVerdict:end */
 
-export { parseSold, wallVerdict };
+export { parseSold, SOLD_RE, parseReviewBlock, wallVerdict };
 
 /** Median of a numeric array, or null when empty. */
 export function median(xs) {

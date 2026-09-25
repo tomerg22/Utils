@@ -9,9 +9,11 @@ AliExpress ranking signals are easy to misread:
 
 - **Raw rating is not comparable.** 5.0 from 3 reviews is weaker evidence than
   4.8 from 5,000. Ratings are shrunk toward the pool mean, weighted by evidence.
-- **Sold counts are bucketed** and saturate at `10,000+`, so the top of any
-  category ties. The tie-break is the exact review count, read from JSON-LD on
-  the detail page.
+- **Sold counts are bucketed** (`10,000+`, `50,000+`, `100K+`), so the top of
+  any category ties. The tie-break is the listing's own rating count, read
+  from the review block on the detail page. The JSON-LD review count is not
+  it: on most listings that number is pooled across other sellers' similar
+  items (header 5,479 vs own 1,090 on one listing).
 - **A real brand name does not mean a real product.** Listings are checked for
   price/spec plausibility, so a counterfeit wearing a strong brand is demoted
   rather than promoted.
@@ -65,11 +67,11 @@ read as they are, never changed.
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. Reads the embedded `_dida_config_._init_data_` payload (~60 records), falls back to DOM scraping (`₪`, `US $`, `€`, `£`), and flags captcha interstitials |
 | `scripts/receiver.mjs` | Loopback HTTP receiver: `__aeHarvest.send(port)` POSTs the harvest payload to it from either browser and it writes `harvest-<query>-<stamp>.json`, replying with the path. No retyping, no chunking. Exits after one payload or 15 idle minutes |
 | `scripts/decode.mjs` | Fallback decoder: reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps in any order (refuses a partial set), or from a plain payload JSON |
-| `scripts/listing.js` | Detail-page reader. Expands the page, then returns text **and** images in one call; walks the shadow DOM (a bare `querySelectorAll('img')` sees 1 image of dozens), separates product size from carton size |
+| `scripts/listing.js` | Detail-page reader. Expands the page, then returns text **and** images in one call; walks the shadow DOM (a bare `querySelectorAll('img')` sees 1 image of dozens), separates product size from carton size, reads options only from the option selector, returns own vs pooled review counts |
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). For hardware the label on the case is the spec sheet |
-| `scripts/rank.mjs` | Scoring: shrunk quality + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification, `--constraint` hard requirement filters, absence-is-not-evidence warning |
-| `scripts/lib.mjs` | Pure helpers shared by the ranker and the tests |
-| `scripts/test.mjs` | Test suite — 244 assertions |
+| `scripts/rank.mjs` | Scoring: shrunk quality + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification, `--constraint` hard requirement filters, absence-is-not-evidence warning, `sold-unparsed` and `own-reviews-unknown` set-asides |
+| `scripts/lib.mjs` | Pure helpers shared by the ranker, the browser files, the step-5 reader and the tests |
+| `scripts/test.mjs` | Test suite — 333 assertions, including the step-5 reader pulled out of `SKILL.md` |
 
 ## Tests
 
@@ -98,11 +100,20 @@ found during live runs:
   the chunked export through the decoder, chunks arriving out of order
 - an English page parsing every sold count to `null` because only the Hebrew
   marker was known — an English and a Hebrew grid are parsed side by side
+- `100K+ sold` read as `null`, so the two best sellers of a 1,228-item pool
+  were dropped as thin evidence without a warning; an unreadable sold text is
+  now set aside as `sold-unparsed` and named
+- the step-5 review count taken from JSON-LD, which is pooled across other
+  sellers' similar items; the reader now returns the listing's own count and
+  the pooled one separately, and the ranker refuses to rank on the pooled one
+- listing options read from reviews of other sellers' items instead of the
+  option selector
 
-`harvest.js` and `extract.js` run in the browser and cannot import `lib.mjs`, so
-each inlines `parseSold` between `@shared:parseSold` markers. The test suite
-pulls both copies out and asserts they agree with `lib.mjs` on every fixture, so
-they cannot silently drift.
+`harvest.js`, `extract.js` and `listing.js` run in the browser and cannot import
+`lib.mjs`, so each inlines the helpers it needs (`parseSold`, `SOLD_RE`,
+`parseReviewBlock`, `wallVerdict`) between `@shared:*` markers, and so does the
+step-5 reader in `SKILL.md`. The test suite pulls every copy out and asserts it
+agrees with `lib.mjs` on every fixture, so they cannot silently drift.
 
 The harvester's own logic is tested by loading the real file with a fake
 `window` and `fetch` — not by reimplementing it in the test, which is how a

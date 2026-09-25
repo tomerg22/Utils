@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { parseSold, median, clean, wallVerdict } from './lib.mjs';
+import { parseSold, SOLD_RE, parseReviewBlock, median, clean, wallVerdict } from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RANK = join(HERE, 'rank.mjs');
@@ -55,12 +55,31 @@ eq('short group is not a thousands sep', parseSold('10,00'), null);
 ok('dot-thousands value clears the shortlist evidence floor',
   parseSold('4.000+') >= 100, `parsed ${parseSold('4.000+')}`);
 
+/* WHY (measured 2026-09-25, the fidget-toys session). From 100,000 up the
+ * storefront writes "100K+ sold". The parser returned null for it, so the two
+ * best sellers of a 1,228-item harvest (orders-sort positions 1 and 2) came
+ * through with sold = null and rank.mjs dropped them as "evidence<100". */
+console.log('\nparseSold — "100K+" (the K suffix used to drop the best sellers)');
+eq('"100K+"  (the bug: used to yield null)', parseSold('100K+'), 100000);
+eq('lower-case "100k"', parseSold('100k'), 100000);
+eq('decimal "1.2K"', parseSold('1.2K'), 1200);
+eq('decimal comma "1,2K"', parseSold('1,2K'), 1200);
+eq('"12.5K+"', parseSold('12.5K+'), 12500);
+eq('"1.1K" has no float noise', parseSold('1.1K'), 1100);
+eq('"2M+"', parseSold('2M+'), 2000000);
+eq('bidi marks around "100K+"', parseSold('‎100K+‏'), 100000);
+eq('a bare "K" is not a number', parseSold('K'), null);
+eq('"K100" is not a number', parseSold('K100'), null);
+eq('the bucket below is unchanged: "50,000+"', parseSold('50,000+'), 50000);
+ok('"100K+" clears the shortlist evidence floor', parseSold('100K+') >= 100);
+
 // --------------------------------- browser-side files: parseSold drift guard
 // extract.js AND harvest.js each inline a copy because they run in the browser
 // and cannot import lib.mjs. Both copies must agree with lib.mjs.
 console.log('\nbrowser files inline parseSold — assert no copy has drifted');
 const SHARED_FIXTURES = ['10,000+', '4.000+', '3.000+', '456', '1,000+', '900+', '1,234,567',
-  '', 'abc', '1.5', '10,00', '‎10,000+‏', '10, 000 +'];
+  '', 'abc', '1.5', '10,00', '‎10,000+‏', '10, 000 +',
+  '100K+', '100k', '1.2K', '1,2K', '12.5K+', '1.1K', '2M+', '‎100K+‏', 'K', 'K100', '50,000+'];
 for (const file of ['extract.js', 'harvest.js']) {
   const src = readFileSync(join(HERE, file), 'utf8');
   const block = src.match(/\/\* @shared:parseSold:start \*\/([\s\S]*?)\/\* @shared:parseSold:end \*\//);
@@ -70,6 +89,29 @@ for (const file of ['extract.js', 'harvest.js']) {
   const drift = SHARED_FIXTURES.filter((f) => JSON.stringify(inlined(f)) !== JSON.stringify(parseSold(f)));
   ok(`${file} copy agrees with lib.mjs on every fixture`, drift.length === 0, `drifted on ${JSON.stringify(drift)}`);
   eq(`${file} copy handles dot-thousands`, inlined('4.000+'), 4000);
+  eq(`${file} copy handles "100K+"`, inlined('100K+'), 100000);
+}
+
+// ----------------------------------- browser-side files: SOLD_RE drift guard
+/* The K defect had two halves: parseSold did not know "100K+", and before
+ * that SOLD_RE never even captured it, because it allowed no letter between
+ * the number and "sold". The regex is inlined in two browser files, so it
+ * gets the same drift guard as parseSold. */
+console.log('\nSOLD_RE — captures "100K+ sold", and no inlined copy has drifted');
+const SOLD_TEXTS = [['100K+ sold', '100K+'], ['10,000+ sold', '10,000+'], ['50,000+ sold', '50,000+'],
+  ['4.000+ נמכרו', '4.000+'], ['1,000+ נמכרו', '1,000+'], ['100K+ נמכרו', '100K+'], ['1.2K sold', '1.2K'],
+  ['2M+ sold', '2M+'], ['302 sold', '302'], ['sold out', null], ['', null]];
+const soldOf = (re, t) => { const m = t.match(re); return m ? m[1].replace(/\s/g, '') : null; };
+for (const [t, want] of SOLD_TEXTS) eq(`lib SOLD_RE on ${JSON.stringify(t)}`, soldOf(SOLD_RE, t), want);
+for (const file of ['extract.js', 'harvest.js']) {
+  const src = readFileSync(join(HERE, file), 'utf8');
+  const block = src.match(/\/\* @shared:soldRe:start \*\/([\s\S]*?)\/\* @shared:soldRe:end \*\//);
+  ok(`${file} exposes the @shared:soldRe block`, !!block);
+  if (!block) continue;
+  const re = new Function(`${block[1]}; return SOLD_RE;`)();
+  eq(`${file} SOLD_RE is the lib.mjs pattern`, [re.source, re.flags], [SOLD_RE.source, SOLD_RE.flags]);
+  const drift = SOLD_TEXTS.filter(([t]) => soldOf(re, t) !== soldOf(SOLD_RE, t)).map(([t]) => t);
+  ok(`${file} SOLD_RE agrees with lib.mjs on every text`, drift.length === 0, `drifted on ${JSON.stringify(drift)}`);
 }
 
 // ------------------------------------------- browser files inline wallVerdict
@@ -494,6 +536,56 @@ console.log('\nharvest.js — payload feeds rank.mjs unchanged');
   eq('the good item survives', r.ranked.map((x) => x.id), ['good']);
 }
 
+/* The regression itself, end to end (measured 2026-09-25): the two best
+ * sellers of the pool read "100K+ sold" and were dropped as "evidence<100".
+ * They must now reach the shortlist, and a sold text nobody can parse must be
+ * set aside out loud, never dropped as if the item did not sell. */
+console.log('\nharvest.js + rank.mjs — "100K+ sold" best sellers reach the shortlist');
+{
+  const withDesc = (id, title, desc) => ({ ...makeItem(id, { title, rating: 4.9 }), trade: { tradeDesc: desc } });
+  const H = loadHarvest(async () => reply(makePage({
+    items: [
+      withDesc('k1', 'glitter dumpling squishy', '100K+ sold'),
+      withDesc('k2', 'nice cube squishy', '100K+ נמכרו'),
+      withDesc('odd', 'odd squishy', 'lots sold'),
+      makeItem('n1', { title: 'plain squishy', rating: 4.9, soldRaw: '50,000+' }),
+      withDesc('none', 'brand new squishy', ''),
+    ],
+    finished: true,
+  })));
+  H.start({ query: 'stress ball' });
+  await H.step(1);
+  const p = JSON.parse(H.payload());
+  const by = Object.fromEntries(p.items.map((i) => [i.id, i]));
+  eq('"100K+ sold" -> 100000', by.k1.sold, 100000);
+  eq('soldRaw keeps the page text', by.k1.soldRaw, '100K+');
+  eq('a K bucket is still a bucket', by.k1.soldBucketed, true);
+  eq('K with the Hebrew marker', by.k2.sold, 100000);
+  eq('unreadable sold text: sold stays null', by.odd.sold, null);
+  eq('unreadable sold text is kept verbatim for the ranker', by.odd.soldText, 'lots sold');
+  eq('a parsed sold carries no soldText', by.n1.soldText, null);
+  eq('no sold text at all is not a parse failure', by.none.soldText, null);
+  const r = rank(p, ['--mode', 'shortlist']);
+  ok('both 100K+ best sellers survive the shortlist',
+    ['k1', 'k2'].every((id) => r.ranked.some((x) => x.id === id)), JSON.stringify(r.ranked.map((x) => x.id)));
+  eq('the unreadable one is set aside as sold-unparsed, not "evidence<100"', r.droppedReasons['sold-unparsed'], 1);
+  eq('the item with no sold text is still thin evidence', r.droppedReasons['evidence<100'], 1);
+  ok('the ranker warns about the unreadable text by name',
+    r.warnings.some((w) => w.startsWith('sold-unparsed') && w.includes('lots sold')), JSON.stringify(r.warnings));
+}
+{
+  // A hand-built finalist that carries only soldRaw (no parsed sold) is scored on its number.
+  const r = rank([
+    { id: 'f1', title: 'dumpling', rating: 4.9, soldRaw: '100K+', reviews: 488 },
+    { id: 'f2', title: 'cube', rating: 4.9, sold: 50000, soldRaw: '50,000+', reviews: 794 },
+  ], ['--mode', 'final']);
+  const f1 = r.ranked.find((x) => x.id === 'f1');
+  eq('final mode re-parses soldRaw "100K+"', f1 && f1.sold, 100000);
+  ok('few-reviews-for-sales now sees the real sold number',
+    f1 && f1.flags.includes('few-reviews-for-sales'), JSON.stringify(f1 && f1.flags));
+  eq('nothing unparsed, so no sold-unparsed warning', r.warnings.filter((w) => w.startsWith('sold-unparsed')), []);
+}
+
 
 // ---------------------------------------------------------------- --spread
 /* --spread reserves slots for a stratified sample across SOLD TIERS, because
@@ -687,6 +779,9 @@ console.log('\nlisting.js — text and images come back together, shadow DOM inc
     // parent's text — model that here or the regression cannot be caught.
     parentElement: props.parent || null,
     getAttribute: (k) => (props.attrs || {})[k] || null,
+    // Option tiles hold their name in a child <img alt>; model that lookup.
+    querySelector: (sel) => (sel === 'img'
+      ? (props.children || []).find((c) => c.tagName === 'IMG') || null : null),
     closest: () => null, click() { (props.onClick || (() => {}))(); },
   });
   const mkRoot = (els) => ({ querySelectorAll: () => els });
@@ -769,6 +864,38 @@ console.log('\nlisting.js — text and images come back together, shadow DOM inc
     api.changed({ height: 1, textLen: 1, imgs: 0, leaves: 0 }) === true);
   ok('changed() reports false against a current fingerprint',
     api.changed(api.fingerprint()) === false);
+
+  /* (e) options come from the OPTION SELECTOR, never from reviews
+   * (measured 2026-09-25). The old walk took any class containing "sku": it
+   * missed the image options entirely and returned the variant line of a
+   * review of another seller's item. Class names are the live ones. */
+  const optImg = (alt) => mkEl('IMG', { attrs: { alt }, nw: 60, nh: 60,
+    src: 'https://ae-pic-a1.aliexpress-media.com/kf/S' + alt + '.jpg' });
+  const white = optImg('White');
+  const black = optImg('Black');
+  const optApi = runListing({
+    href: 'https://he.aliexpress.com/item/1005010285456577.html',
+    bodyText: 'One/Nine-key Keychain 4.9 4026 Reviews ౹ 50,000+ sold US $2.14 Reviews (4026) ' +
+      'Reviews | 4.9 952 ratings All from verified purchases All ratings (223) ' +
+      'Color:9 Key no light Ships From:China Mainland ' +
+      'Reviews displayed are from various sellers for similar items on AliExpress. ' + 'x'.repeat(2500),
+    els: [
+      mkEl('DIV', { cls: 'sku-item--title--Z0HLO87', text: 'Color: White' }),
+      mkEl('DIV', { cls: 'sku-item--image--jMUnnGA sku-item--selected--ITGY_EO', children: [white] }), white,
+      mkEl('DIV', { cls: 'sku-item--image--jMUnnGA', children: [black] }), black,
+      mkEl('DIV', { cls: 'sku-item--text--Qa1', text: '3Pcs Random Color' }),
+      // The live leak was this short review line (under the old 40-char cap).
+      mkEl('SPAN', { cls: 'list--itemSku--Zx9', text: 'Color:D Ships From:China Mainland' }),
+    ],
+  });
+  const optRes = optApi.read();
+  eq('options are read from the option selector, in order', optRes.variants, ['White', 'Black', '3Pcs Random Color']);
+  eq('the selected option is named', optRes.selectedVariant, 'White');
+  ok('a review line of another seller\'s item is NOT an option',
+    !optRes.variants.some((v) => /Ships From/.test(v)), JSON.stringify(optRes.variants));
+  ok('the property title is NOT an option', !optRes.variants.includes('Color: White'), JSON.stringify(optRes.variants));
+  eq('read() returns the own review count, not the pooled one',
+    optRes.reviews, { own: 952, ownRating: 4.9, header: 4026, pooledNote: true });
 }
 
 // ------------------------------------------ two browsers, two locales (2026-09-14)
@@ -1038,6 +1165,133 @@ console.log('\nextract.js — English grid, USD prices, path-only URL');
   eq('dom: Hebrew card still parses (sold)', r3.items[0].sold, 2000);
   eq('dom: Hebrew card still parses (price)', r3.items[0].price, 18.3);
   eq('dom: Hebrew card currency', r3.items[0].currency, 'ILS');
+  // "100K+ sold" (measured 2026-09-25) on both extract.js paths
+  const winK = { _dida_config_: { _init_data_: { data: { data: { root: { fields: { mods: { itemList: { content: [
+    { productId: 'k1', title: { displayTitle: 'Glitter Dumpling Squishy' }, prices: { salePrice: { minPrice: 2.48, currencyCode: 'USD' } },
+      evaluation: { starRating: 4.9 }, trade: { tradeDesc: '100K+ sold' } },
+    { productId: 'k2', title: { displayTitle: 'Odd Squishy' }, prices: { salePrice: { minPrice: 1, currencyCode: 'USD' } },
+      evaluation: { starRating: 4.9 }, trade: { tradeDesc: 'lots sold' } },
+  ] } } } } } } } } };
+  const rK = run(winK, domDoc([]), loc);
+  eq('init-data: "100K+ sold" parses', rK.items[0].sold, 100000);
+  eq('init-data: unreadable sold text is kept', rK.items[1].soldText, 'lots sold');
+  const rK2 = run({}, domDoc([card('1005012967864709', 'Glitter Dumpling Squishy with Box 4.9100K+ sold US $2.48 US $4.96 -50%')]), loc);
+  eq('dom: rating split from glued "100K+ sold"', rK2.items[0].rating, 4.9);
+  eq('dom: "100K+" parses', rK2.items[0].sold, 100000);
+}
+
+// ------------------------------------ own review count vs pooled (2026-09-25)
+/* The JSON-LD reviewCount (= header "N Reviews" = "Reviews (N)" tab) is
+ * usually POOLED across other sellers' similar items; the page says so. The
+ * listing's own count is the review block "4.9 1090 ratings". Step 5 used to
+ * rank on the pooled number: header 5,479 vs own 1,090 on one listing. The
+ * texts below are copied from live pages read that day. */
+console.log('\nparseReviewBlock — the header count is pooled; the review block is the listing\'s own');
+const RV = {
+  gyro: 'Metal Gyro 4.9 5479 Reviews ౹ 50,000+ sold US $1.58 50% offUS $3.16 Reviews (5479) Specifications ' +
+        'Description More to love Reviews | 4.9 1090 ratings All from verified purchases All ratings (204) (29) ' +
+        'Reviews displayed are from various sellers for similar items on AliExpress. View more',
+  dumpling: 'Glitter Dumpling 4.9 4779 Reviews ౹ 100K+ sold US $2.48 50% offUS $4.96 Reviews (4779) ' +
+        'Reviews | 4.9 488 ratings All from verified purchases All ratings (79) ' +
+        'Reviews displayed are from various sellers for similar items on AliExpress.',
+  boba: 'Boba Bottle 4.8 37 Reviews ౹ 455 sold US $11.35 Reviews (37) Reviews | 4.8 37 ratings All from verified purchases',
+  comma: 'Reviews (9,460) Reviews | 4.9 1,914 ratings All from verified purchases',
+  cardFirst: 'More to love Cute toy 4.7 12 ratings US $1.00 Reviews (5479) Reviews | 4.9 1090 ratings All from verified purchases',
+  noBlock: '4.9 5479 Reviews ౹ 50,000+ sold',
+  hebrew: '4.9 5479 חוות דעת ౹ 50,000+ נמכרו',
+  empty: '',
+};
+eq('pooled listing: own 1090, header 5479, note seen', parseReviewBlock(RV.gyro), { own: 1090, ownRating: 4.9, header: 5479, pooledNote: true });
+eq('pooled listing, 100K+: own 488', parseReviewBlock(RV.dumpling).own, 488);
+eq('listing without the note: own equals header (37 = 37)', parseReviewBlock(RV.boba), { own: 37, ownRating: 4.8, header: 37, pooledNote: false });
+eq('comma thousands in both numbers', [parseReviewBlock(RV.comma).own, parseReviewBlock(RV.comma).header], [1914, 9460]);
+eq('a product card\'s "12 ratings" earlier on the page does not win', parseReviewBlock(RV.cardFirst).own, 1090);
+eq('no review block: own is null (unknown), never the header', parseReviewBlock(RV.noBlock), { own: null, ownRating: null, header: 5479, pooledNote: false });
+eq('Hebrew wording not observed yet: own is null', parseReviewBlock(RV.hebrew).own, null);
+eq('empty text', parseReviewBlock(RV.empty), { own: null, ownRating: null, header: null, pooledNote: false });
+
+/* The step-5 reader lives in SKILL.md as prose code. It is the code that ran
+ * the pooled number into the ranking, so it is tested like code: pulled out
+ * from between its markers and run against sample pages. */
+const skillSrc = readFileSync(join(HERE, '..', 'SKILL.md'), 'utf8');
+const step5 = (skillSrc.match(/<!-- @snippet:step5:start -->\s*```js\n([\s\S]*?)\n```\s*<!-- @snippet:step5:end -->/) || [])[1];
+ok('SKILL.md carries the step-5 reader between its markers', !!step5);
+
+console.log('\nshared blocks in listing.js and the SKILL.md step-5 reader — assert no copy has drifted');
+for (const [name, src] of [['listing.js', readFileSync(join(HERE, 'listing.js'), 'utf8')], ['SKILL.md step 5', step5 || '']]) {
+  const block = src.match(/\/\* @shared:reviewBlock:start \*\/([\s\S]*?)\/\* @shared:reviewBlock:end \*\//);
+  ok(`${name} exposes the @shared:reviewBlock block`, !!block);
+  if (!block) continue;
+  const inlined = new Function(`${block[1]}; return parseReviewBlock;`)();
+  const drift = Object.keys(RV).filter((k) => JSON.stringify(inlined(RV[k])) !== JSON.stringify(parseReviewBlock(RV[k])));
+  ok(`${name} parseReviewBlock agrees with lib.mjs on every page text`, drift.length === 0, `drifted on ${JSON.stringify(drift)}`);
+}
+{
+  const block = (step5 || '').match(/\/\* @shared:soldRe:start \*\/([\s\S]*?)\/\* @shared:soldRe:end \*\//);
+  ok('SKILL.md step 5 exposes the @shared:soldRe block', !!block);
+  if (block) {
+    const re = new Function(`${block[1]}; return SOLD_RE;`)();
+    eq('SKILL.md step 5 SOLD_RE is the lib.mjs pattern', [re.source, re.flags], [SOLD_RE.source, SOLD_RE.flags]);
+  }
+}
+
+console.log('\nSKILL.md step-5 reader — run against sample detail pages');
+{
+  const opt = (name, { selected = false, image = true, cls = null } = {}) => ({
+    className: cls || ((image ? 'sku-item--image--jMUnnGA' : 'sku-item--text--Qa1') + (selected ? ' sku-item--selected--ITGY_EO' : '')),
+    querySelector: (sel) => (image && sel === 'img' ? { getAttribute: (k) => (k === 'alt' ? name : null) } : null),
+    textContent: image ? '' : name, shadowRoot: null,
+  });
+  const ld = (rating, count, price) => ({ '@type': 'Product',
+    aggregateRating: { ratingValue: String(rating), reviewCount: String(count) },
+    offers: { price: String(price), priceCurrency: 'USD' } });
+  const runStep5 = ({ path = '/item/1005007038434772.html', title = 'Metal Gyro', text, json = null, opts = [] }) => {
+    const scripts = json ? [{ textContent: JSON.stringify(json) }] : [];
+    const doc = { title, body: { innerText: text, textContent: text },
+      querySelector: (sel) => (/ld\+json/.test(sel) ? scripts[0] || null : null),
+      querySelectorAll: (sel) => (/ld\+json/.test(sel) ? scripts : opts) };
+    return new Function('document', 'location', 'return (' + step5 + '\n)')(doc, { pathname: path });
+  };
+  const noise = opt('Color:D Ships From:China Mainland', { image: false, cls: 'list--itemSku--Zx9' });
+  const g = JSON.parse(runStep5({ text: RV.gyro, json: ld(4.9, 5479, 1.58),
+    opts: [opt('Black', { selected: true }), opt('Silver'), noise] }));
+  eq('reviews is the OWN count (the bug: it was the pooled 5479)', g.reviews, 1090);
+  eq('the pooled count is kept, under its own name', g.pooledReviews, 5479);
+  ok('own and pooled differ on a pooled listing', g.reviews !== g.pooledReviews);
+  eq('the "various sellers" note is reported', g.pooledNote, true);
+  eq('sold from the header', g.soldRaw, '50,000+');
+  eq('rating, price, currency and id from JSON-LD and the path', [g.rating, g.price, g.currency, g.id], [4.9, 1.58, 'USD', '1005007038434772']);
+  eq('options from the selector, the selected one starred, no review line', g.options, ['Black*', 'Silver']);
+  ok('the result fits the Chrome connector\'s 1,000-character limit', JSON.stringify(g).length < 1000, String(JSON.stringify(g).length));
+  const d = JSON.parse(runStep5({ path: '/item/1005012967864709.html', text: RV.dumpling, json: ld(4.9, 4779, 2.48),
+    opts: [opt('A', { selected: true }), opt('random 1pc')] }));
+  eq('"100K+ sold" is read from the header', d.soldRaw, '100K+');
+  eq('the 100K+ listing\'s own count', d.reviews, 488);
+  const b = JSON.parse(runStep5({ path: '/item/1005008659361529.html', text: RV.boba, json: ld(4.8, 37, 11.35) }));
+  eq('a listing without the note: own equals pooled', [b.reviews, b.pooledReviews, b.pooledNote], [37, 37, false]);
+  const n = JSON.parse(runStep5({ text: RV.noBlock, json: ld(4.9, 5479, 1.58) }));
+  eq('no review block: reviews is null, NOT the pooled number', n.reviews, null);
+  const c = JSON.parse(runStep5({ text: 'More to love 4.8800+ sold cute toy ' + RV.gyro, json: ld(4.9, 5479, 1.58) }));
+  eq('a product card\'s sold text earlier on the page does not win over the header', c.soldRaw, '50,000+');
+  let threw = '';
+  try { runStep5({ path: '/_____tmd_____/punish', text: 'Please slide to verify', json: null }); } catch (e) { threw = String(e); }
+  ok('a wall throws, so a browser_batch stops right there', /WALL/.test(threw), threw);
+  const e = JSON.parse(runStep5({ text: 'x'.repeat(900), json: null }));
+  ok('no JSON-LD asks for a screenshot instead of a conclusion', /SCREENSHOT/.test(e.error || ''), e.error);
+}
+
+console.log('\nrank — a finalist with only the pooled count is set aside, not ranked on it');
+{
+  const r = rank([
+    { id: 'own', title: 'gyro', rating: 4.9, reviews: 1090, pooledReviews: 5479, sold: 50000 },
+    { id: 'pooledOnly', title: 'keychain', rating: 4.9, reviews: null, pooledReviews: 4026, sold: 50000 },
+  ], ['--mode', 'final']);
+  eq('only the listing with an own count is ranked', r.ranked.map((x) => x.id), ['own']);
+  eq('the other is dropped as own-reviews-unknown, not "evidence<10"', r.droppedReasons['own-reviews-unknown'], 1);
+  ok('and the ranker names it in a warning',
+    r.warnings.some((w) => w.startsWith('own-reviews-unknown') && w.includes('pooledOnly')), JSON.stringify(r.warnings));
+  const s = rank([{ id: 'x', title: 'y', rating: 4.9, sold: 5000 }], ['--mode', 'shortlist']);
+  eq('shortlist mode is untouched by the own-count rule', s.ranked.map((x) => x.id), ['x']);
 }
 
 // -------------------------------------------------------------------------

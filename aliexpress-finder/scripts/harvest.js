@@ -77,6 +77,12 @@
    * A separator is only treated as a thousands mark when exactly 3 digits
    * follow it, so a genuine decimal ("1.5") is left alone rather than
    * misread as 15.
+   *
+   * From 100,000 up the storefront writes a K: "100K+ sold" (measured
+   * 2026-09-25, the two best sellers of a 1,228-item harvest). This used to
+   * return null, and rank.mjs then dropped both best sellers as
+   * "evidence<100" without a word. K and M multiply. Before them, one
+   * separator followed by 1-2 digits is a decimal mark ("1.2K", "1,2K").
    */
   function parseSold(raw) {
     if (raw == null) return null;
@@ -85,19 +91,28 @@
       .replace(/\s+/g, '')
       .replace(/\+/g, '');
     if (!s) return null;
-    const cleaned = s.replace(/[.,](?=\d{3}(?:\D|$))/g, '');
+    const unit = s.slice(-1).toLowerCase();
+    const mult = unit === 'k' ? 1e3 : unit === 'm' ? 1e6 : 1;
+    let body = mult === 1 ? s : s.slice(0, -1);
+    if (mult !== 1) body = body.replace(/[.,](?=\d{1,2}$)/, '.');
+    const cleaned = body.replace(/[.,](?=\d{3}(?:\D|$))/g, '');
     if (!/^\d+(\.\d+)?$/.test(cleaned)) return null;
-    const n = Number(cleaned);
-    return Number.isFinite(n) ? n : null;
+    const n = Number(cleaned) * mult;
+    if (!Number.isFinite(n)) return null;
+    return mult === 1 ? n : Math.round(n);
   }
   /* @shared:parseSold:end */
 
+  /* @shared:soldRe:start */
   /* The sold marker follows the page language: "1,000+ נמכרו" on a Hebrew
    * page, "10,000+ sold" on an English one (measured 2026-09-14, same item,
    * same host, only the locale cookie differed). Accept both — a signed-in
    * browser renders whatever locale the account uses, and that must not be
-   * changed by us (see SKILL.md, Chrome connector rules). */
-  const SOLD_RE = /([\d.,]+\s*\+?)\s*(?:נמכר|sold)/i;
+   * changed by us (see SKILL.md, Chrome connector rules). From 100,000 up
+   * the number carries a K ("100K+ sold", measured 2026-09-25); without
+   * [KkMm] the match failed and the best sellers came back with no sold. */
+  const SOLD_RE = /([\d.,]+\s*[KkMm]?\s*\+?)\s*(?:נמכר|sold)/i;
+  /* @shared:soldRe:end */
 
   /* Same record shape as extract.js, so rank.mjs consumes either. */
   const mk = (o) => ({
@@ -115,6 +130,11 @@
     soldRaw: o.soldRaw || null,
     sold: parseSold(o.soldRaw),
     soldBucketed: o.soldRaw ? /\+/.test(o.soldRaw) : null,
+    /* The grid's sold text, kept ONLY when it did not parse. A format the
+     * parser does not know must reach rank.mjs as visible text, never as a
+     * silent null: "100K+ sold" once turned the two best sellers into
+     * "evidence<100" drops, with nothing to show why. */
+    soldText: o.soldText || null,
     /* The grid thumbnail. Captured because physical attributes (wires,
      * connector type, enclosure) are NEVER in the title — screening these
      * costs nothing against the request budget, since the CDN is a different
@@ -122,7 +142,7 @@
      * a title search was a real defect; this is the cheap way to check. */
     image: o.image || null,
     freeShipping: null,
-    reviews: null, // search page never exposes this; detail page JSON-LD does
+    reviews: null, // search page never exposes this; the detail page's review block does (step 5)
     page: o.page != null ? o.page : null,
   });
 
@@ -454,6 +474,7 @@ function wallVerdict(sig) {
           const orig = prices.originalPrice || {};
           const desc = clean((it.trade && it.trade.tradeDesc) || '');
           const m = desc.match(SOLD_RE);
+          const soldRaw = m ? m[1].replace(/\s/g, '') : null;
           s.items.push(mk({
             id,
             title: clean((it.title && it.title.displayTitle) || ''),
@@ -463,7 +484,8 @@ function wallVerdict(sig) {
             discountPct: typeof sale.discount === 'number' ? sale.discount : null,
             rating: it.evaluation && typeof it.evaluation.starRating === 'number'
               ? it.evaluation.starRating : null,
-            soldRaw: m ? m[1].replace(/\s/g, '') : null,
+            soldRaw,
+            soldText: desc && parseSold(soldRaw) === null ? desc.slice(0, 80) : null,
             image: (() => {
               const im = it.image || {};
               const u = im.imgUrl || im.imgUrlOrigin || '';

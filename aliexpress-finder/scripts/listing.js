@@ -5,6 +5,8 @@
  *
  *   __aeListing.read()            // expand everything, return text + images + specs
  *   __aeListing.read().gallery    // big image URLs, ready for labels.sh
+ *   __aeListing.read().reviews    // { own, ownRating, header, pooledNote }
+ *   __aeListing.read().variants   // the option selector only; selectedVariant too
  *   __aeListing.changed(fp)       // did the page change since fingerprint fp?
  *
  * WHY THIS EXISTS (three measured failures, 2026-08-21, Tapo C222 session)
@@ -137,6 +139,40 @@ function wallVerdict(sig) {
   };
 }
 /* @shared:wallVerdict:end */
+
+  /* @shared:reviewBlock:start */
+  /* Read a detail page's review counts from its rendered text.
+   *
+   * WHY (measured 2026-09-25, 17 listings in two searches): the JSON-LD
+   * reviewCount, the header "N Reviews" and the "Reviews (N)" tab are one and
+   * the same number, and on most listings it is POOLED across similar items
+   * from other sellers. The page says so: "Reviews displayed are from various
+   * sellers for similar items on AliExpress". The review block carries a
+   * second, smaller figure, "4.9 1090 ratings", which is the listing's own
+   * count. Header vs own: 5,479 vs 1,090; 9,460 vs 1,914; 4,779 vs 488. On
+   * the one listing without that note the two were equal (37 vs 37). Ranking
+   * on the header ranked the pool, not the listing. "own" is inferred from the
+   * page; no AliExpress documentation was found.
+   *
+   * own is null when the block is not found (the Hebrew wording has not been
+   * observed). Null means UNKNOWN: never fall back to the pooled number.
+   */
+  function parseReviewBlock(text) {
+    const t = String(text || '').replace(/\s+/g, ' ');
+    const num = (s) => Number(String(s).replace(/[.,](?=\d{3}(?:\D|$))/g, ''));
+    const blk = t.match(/(\d\.\d)\s+(\d[\d,.]*)\s+ratings?\b(?=\s*All from verified)/i) ||
+                t.match(/(\d\.\d)\s+(\d[\d,.]*)\s+ratings?\b/i);
+    const head = t.match(/Reviews\s*\((\d[\d,.]*)\)/i) || t.match(/(\d[\d,.]*)\s+Reviews\b/i);
+    const own = blk ? num(blk[2]) : null;
+    const header = head ? num(head[1]) : null;
+    return {
+      own: Number.isFinite(own) ? own : null,
+      ownRating: blk ? Number(blk[1]) : null,
+      header: Number.isFinite(header) ? header : null,
+      pooledNote: /from various sellers for similar items/i.test(t),
+    };
+  }
+  /* @shared:reviewBlock:end */
 
   /* Recursive walk THROUGH shadow roots. See failure 3 above. */
   function walk(root, fn) {
@@ -295,14 +331,30 @@ function wallVerdict(sig) {
         });
 
       // ---- variant selector --------------------------------------------
+      /* Options come ONLY from the option selector. This used to take any
+       * element whose class mentioned "sku", and on 2026-09-25 that returned
+       * the variant lines of REVIEWS, many of them other sellers' items
+       * ("Color:9 Key no light Ships From: China"), instead of the listing's
+       * own options (White / Black / 1Pcs Random Color / 3Pcs Random Color).
+       * The default option's price is the one JSON-LD reports, so which option
+       * is selected matters: a $2.14 "keychain" was the 1-key one, not the
+       * 9-key pad in the title. Live class names: sku-item--image--<hash>,
+       * sku-item--text--<hash>, sku-item--selected--<hash> on the same node. */
       const variants = [];
+      let selectedVariant = null;
       walk(document, (e) => {
         const cls = (e.className && e.className.toString ? e.className.toString() : '');
-        if (!/sku/i.test(cls)) return;
-        const t = e.getAttribute && (e.getAttribute('title') || e.getAttribute('alt'));
-        const v = clean(t || (e.children.length === 0 ? e.textContent : ''));
-        if (v && v.length <= 40) variants.push(v);
+        if (!/sku-item--(image|text)|sku-property-item/.test(cls)) return;
+        const img = e.querySelector ? e.querySelector('img') : null;
+        const v = clean((img && img.getAttribute && (img.getAttribute('alt') || img.getAttribute('title'))) ||
+                        (e.getAttribute && e.getAttribute('title')) || e.textContent);
+        if (!v || v.length > 60) return;
+        variants.push(v);
+        if (!selectedVariant && /sku-item--selected|\bselected\b|\bactive\b/i.test(cls)) selectedVariant = v;
       });
+
+      // Review counts, read AFTER expanding: the review block renders lazily.
+      const reviews = parseReviewBlock((document.body && document.body.innerText) || '');
 
       return {
         blocked: false,
@@ -312,6 +364,11 @@ function wallVerdict(sig) {
         fingerprint: after,
         pageGrew: after.height !== before.height || after.textLen !== before.textLen,
         variants: [...new Set(variants)].slice(0, 40),
+        selectedVariant,
+        // { own, ownRating, header, pooledNote }. `own` is the listing's own
+        // rating count; `header` equals JSON-LD reviewCount and is usually
+        // pooled across other sellers. Rank on `own`; null means unknown.
+        reviews,
         // Each entry: { text, isPackage, context? }. A `isPackage: true` line is
         // the SHIPPING CARTON, not the product — never report it as the size.
         sizeLines: sizeLines.slice(0, 25),

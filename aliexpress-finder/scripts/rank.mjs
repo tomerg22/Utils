@@ -18,7 +18,9 @@
  *   shortlist - only the search page is loaded. We have rating + sold, never
  *               review count. Evidence = sold, with a large prior (m=300)
  *               because sold is bucketed and coarse.
- *   final     - detail pages fetched, exact reviewCount known from JSON-LD.
+ *   final     - detail pages read. `reviews` is the listing's OWN rating count
+ *               from the step-5 reader (the JSON-LD reviewCount is pooled
+ *               across other sellers; see own-reviews-unknown below).
  *               Evidence = reviews, smaller prior (m=50).
  *
  * Volume is log-scaled because sold saturates at "10,000+" — at the top of a
@@ -34,7 +36,7 @@
  * redistributed instead, so nothing is scored on absent data.
  */
 
-import { median } from './lib.mjs';
+import { median, parseSold } from './lib.mjs';
 
 const argv = process.argv.slice(2);
 const arg = (name, dflt) => {
@@ -150,6 +152,34 @@ for (const it of pool) {
 }
 const all = [...byId.values()];
 
+/* WHY sold-unparsed EXISTS (measured 2026-09-25, the fidget-toys session)
+ *
+ * From 100,000 up the storefront writes "100K+ sold". The parser did not know
+ * the K, so the two best sellers of a 1,228-item harvest came through with
+ * sold = null, and this file dropped them as "evidence<100": a best seller
+ * reported as a no-seller, with no warning. A sold text that does not parse is
+ * a PARSER gap, never a verdict on the item. So it gets its own drop reason
+ * and a loud warning, and the gap gets fixed instead of trusted.
+ *
+ * soldRaw is re-parsed here as well, so a hand-built finalist that carries
+ * only soldRaw ("100K+") is scored on its number instead of being dropped.
+ */
+for (const i of all) {
+  if (i.sold == null && i.soldRaw != null) i.sold = parseSold(i.soldRaw);
+}
+const soldUnparsed = (i) => i.sold == null && !!(i.soldText || i.soldRaw);
+
+/* WHY own-reviews-unknown EXISTS (measured 2026-09-25)
+ *
+ * The JSON-LD reviewCount is usually POOLED across other sellers' similar
+ * items (header 5,479 vs the listing's own 1,090), and it used to be the
+ * `reviews` field of every finalist. The step-5 reader now puts the listing's
+ * own count in `reviews` and the pooled one in `pooledReviews`. A finalist
+ * that has only the pooled number has an UNKNOWN own count: it is set aside
+ * out loud, never ranked on the pooled number and never called thin.
+ */
+const ownReviewsUnknown = (i) => i.reviews == null && i.pooledReviews != null;
+
 const evidenceOf = (i) => (MODE === 'final' ? i.reviews : i.sold);
 const reqRe = REQUIRE ? new RegExp(REQUIRE, 'i') : null;
 
@@ -165,6 +195,8 @@ for (const i of all) {
   else if (violated.length) dropped.push({ ...i, why: `violates:${violated.join('+')}` });
   else if (i.rating == null) dropped.push({ ...i, why: 'no rating' });
   else if (i.rating < MIN_RATING) dropped.push({ ...i, why: `rating<${MIN_RATING}` });
+  else if (MODE !== 'final' && soldUnparsed(i)) dropped.push({ ...i, why: 'sold-unparsed' });
+  else if (MODE === 'final' && ownReviewsUnknown(i)) dropped.push({ ...i, why: 'own-reviews-unknown' });
   else if (!ev || ev < MIN_EVIDENCE) dropped.push({ ...i, why: `evidence<${MIN_EVIDENCE}` });
   // Unverified is held back LAST, so a genuinely bad item is reported as bad
   // rather than as merely unchecked.
@@ -189,6 +221,19 @@ const ABSENCE = 'absence-is-not-evidence: a title regex found nothing. Titles om
   'product does not exist. Verify on the IMAGES and description of >=3 candidates first ' +
   '(listing.js + labels.sh).';
 if (reqRe && all.length >= 10 && requireDropped >= 0.9 * all.length) warnings.push(ABSENCE);
+const unparsed = all.filter(soldUnparsed);
+if (unparsed.length)
+  warnings.push(`sold-unparsed: ${unparsed.length} item(s) carry a sold text the parser could not ` +
+    `read (${unparsed.slice(0, 3).map((i) => JSON.stringify(i.soldText || i.soldRaw)).join(', ')}). ` +
+    (MODE === 'final'
+      ? 'Their sold-based flags were skipped.'
+      : 'They were set aside, NOT judged: they may be the best sellers. Fix parseSold/SOLD_RE ' +
+        'in lib.mjs and every inlined copy, or open their detail pages.'));
+const noOwn = MODE === 'final' ? all.filter(ownReviewsUnknown) : [];
+if (noOwn.length)
+  warnings.push(`own-reviews-unknown: ${noOwn.length} finalist(s) carry only the pooled review ` +
+    `count (${noOwn.slice(0, 3).map((i) => i.id).join(', ')}). They were set aside, NOT ranked: ` +
+    're-read the review block ("N ratings") on their detail pages. Never rank on the pooled number.');
 if (CONSTRAINTS.length && unverified.length)
   warnings.push(`unverified-constraint: ${unverified.length} item(s) were NOT ranked because ` +
     `their status for [${CONSTRAINTS.join(', ')}] is unknown. Check them, do not assume they pass.`);

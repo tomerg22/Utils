@@ -135,6 +135,12 @@ function wallVerdict(sig) {
    * A separator is only treated as a thousands mark when exactly 3 digits
    * follow it, so a genuine decimal ("1.5") is left alone rather than
    * misread as 15.
+   *
+   * From 100,000 up the storefront writes a K: "100K+ sold" (measured
+   * 2026-09-25, the two best sellers of a 1,228-item harvest). This used to
+   * return null, and rank.mjs then dropped both best sellers as
+   * "evidence<100" without a word. K and M multiply. Before them, one
+   * separator followed by 1-2 digits is a decimal mark ("1.2K", "1,2K").
    */
   function parseSold(raw) {
     if (raw == null) return null;
@@ -143,16 +149,25 @@ function wallVerdict(sig) {
       .replace(/\s+/g, '')
       .replace(/\+/g, '');
     if (!s) return null;
-    const cleaned = s.replace(/[.,](?=\d{3}(?:\D|$))/g, '');
+    const unit = s.slice(-1).toLowerCase();
+    const mult = unit === 'k' ? 1e3 : unit === 'm' ? 1e6 : 1;
+    let body = mult === 1 ? s : s.slice(0, -1);
+    if (mult !== 1) body = body.replace(/[.,](?=\d{1,2}$)/, '.');
+    const cleaned = body.replace(/[.,](?=\d{3}(?:\D|$))/g, '');
     if (!/^\d+(\.\d+)?$/.test(cleaned)) return null;
-    const n = Number(cleaned);
-    return Number.isFinite(n) ? n : null;
+    const n = Number(cleaned) * mult;
+    if (!Number.isFinite(n)) return null;
+    return mult === 1 ? n : Math.round(n);
   }
   /* @shared:parseSold:end */
 
+  /* @shared:soldRe:start */
   /* "1,000+ נמכרו" on a Hebrew page, "10,000+ sold" on an English one — the
-   * marker follows the page locale, which a signed-in account controls. */
-  const SOLD_RE = /([\d.,]+\s*\+?)\s*(?:נמכר|sold)/i;
+   * marker follows the page locale, which a signed-in account controls. From
+   * 100,000 up the number carries a K ("100K+ sold", measured 2026-09-25);
+   * without [KkMm] the match failed and the best sellers had no sold. */
+  const SOLD_RE = /([\d.,]+\s*[KkMm]?\s*\+?)\s*(?:נמכר|sold)/i;
+  /* @shared:soldRe:end */
   /* Grid prices: "₪22.30" on the Israeli storefront, "US $4.92" for a USD
    * account, "€3.10" elsewhere. One regex, currency symbol captured. */
   const MONEY_RE = /(₪|US\s?\$|\$|€|£)\s*([\d,]+(?:\.\d+)?)/g;
@@ -169,8 +184,11 @@ function wallVerdict(sig) {
     soldRaw: o.soldRaw || null,
     sold: parseSold(o.soldRaw),
     soldBucketed: o.soldRaw ? /\+/.test(o.soldRaw) : null,
+    // The grid's sold text, kept only when it did not parse, so an unknown
+    // format reaches rank.mjs as visible text instead of a silent null.
+    soldText: o.soldText || null,
     freeShipping: o.freeShipping != null ? o.freeShipping : null,
-    reviews: null, // search page never exposes this; detail page JSON-LD does
+    reviews: null, // search page never exposes this; the detail page's review block does (step 5)
   });
 
   // ---------- source 1: embedded render payload ----------
@@ -218,6 +236,7 @@ function wallVerdict(sig) {
       const orig = prices.originalPrice || {};
       const desc = clean((it.trade && it.trade.tradeDesc) || '');
       const m = desc.match(SOLD_RE);
+      const soldRaw = m ? m[1].replace(/\s/g, '') : null;
       out.push(mk({
         id,
         title: clean((it.title && it.title.displayTitle) || ''),
@@ -227,7 +246,8 @@ function wallVerdict(sig) {
         discountPct: typeof sale.discount === 'number' ? sale.discount : null,
         rating: it.evaluation && typeof it.evaluation.starRating === 'number'
           ? it.evaluation.starRating : null,
-        soldRaw: m ? m[1].replace(/\s/g, '') : null,
+        soldRaw,
+        soldText: desc && parseSold(soldRaw) === null ? desc.slice(0, 80) : null,
       }));
     }
     return out;
@@ -255,7 +275,7 @@ function wallVerdict(sig) {
       seen.add(id);
 
       // Rating and sold are glued together: "<rating><sold> נמכרו" / "... sold"
-      const rs = text.match(/([1-5]\.\d)\s*([\d.,]+\s*\+?)\s*(?:נמכר|sold)/i);
+      const rs = text.match(/([1-5]\.\d)\s*([\d.,]+\s*[KkMm]?\s*\+?)\s*(?:נמכר|sold)/i);
       // Every price, in order: [current, original]; the symbol says the currency
       const moneyM = [...text.matchAll(MONEY_RE)];
       const money = moneyM

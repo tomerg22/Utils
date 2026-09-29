@@ -103,7 +103,8 @@ user's Chrome when it is there. Order:
    request). Read the header from the body text: a signed-in page shows
    `Hi, <name>` and `Account`; a logged-out one shows `Sign in / Register`
    (Hebrew: `התחבר / הרשמה`). Do this with text, not cookies — the connector
-   blocks a result that contains cookie data.
+   blocks a result that contains cookie data. In the same call return
+   `document.visibilityState`: `hidden` changes what works (next section).
 3. **Signed in → use Chrome for the whole run.** Report which account name
    you saw and which locale/currency the header shows (`EN/ USD` etc.).
 4. **Not signed in → stop and ask, as the headline of that turn:** "Chrome is
@@ -125,11 +126,59 @@ this list is so you do not fight the symptoms:
 | Result cut at **1,000 characters** | `…[TRUNCATED]` | Never return `payload()`. Use `__aeHarvest.expose(i)` + `get_page_text` (step 3). |
 | Result with a cookie or a **query string** is replaced | `[BLOCKED: Cookie/query string data]` | Never return `document.cookie`, `location.href` of a search page, or any URL with `?`. `start()`/`status()`/`payload()` are already clean; `debugUrl()` is in-app only. |
 | An async IIFE returns `{}` | `(async () => {...})()` → `{}` | Use a **top-level `await`**: `await __aeHarvest.step(6)`. |
-| Call timeout between 25 s and 45 s | `CDP Runtime.evaluate timed out after 45000ms` | Keep `step(6)`; 25 s passed, 45 s failed. In-app dies at 30 s, so the unit of work is the same. |
+| Call timeout between 25 s and 45 s | `CDP Runtime.evaluate timed out after 45000ms` | Keep `step(6)`; 25 s passed, 45 s failed. In-app died at 30 s (2026-09-14) and at 45 s (2026-09-29), so the unit of work is the same. |
 
 Also: tab ids are **numbers** and must be passed explicitly inside
 `browser_batch`; `get_page_text` returns at most 50,000 characters (the
 `max_chars` argument is ignored there); close the tab you opened when done.
+
+### A hidden tab — measured 2026-09-29
+
+The connector's tab lives in its own Chrome window. When that window is
+minimised or fully covered, Chrome marks the tab `hidden`. On 2026-09-29
+both tabs of the run were hidden, one of them seconds after it was opened.
+In that state:
+
+| Works | Hangs or breaks |
+|---|---|
+| `javascript_tool`, `navigate`, form POSTs | `computer` screenshot and zoom, `get_page_text`: each hung until the 45 s timeout |
+| JSON-LD, the option selector, the review block | page timers: a 100 ms `setTimeout` fired after 958 ms; a 2,500 ms one had not fired 45 s later |
+| `fetch()`: 7 search pages and 3 description fetches went through on 2026-09-29 | `fetch()` on 2026-09-17: after a tab had been hidden for a while, fetch and XHR stayed pending until the 45 s limit |
+| | lazy rendering: the product description was not rendered anywhere (the page had fetched it) |
+
+When `fetch()` hangs (`step()` or `read()` times out with no result), do
+NOT close the tab first: the harvest lives only in that tab's `window`.
+
+1. In the stuck tab, `__aeHarvest.status()` still answers. Export what you
+   have: `await __aeHarvest.send(<port>)` (hidden, it posts the form and
+   needs no fetch), and read the saved path from the receiver's output. For
+   a detail page, `__aeListing.last` holds everything but the description.
+2. Then close the tab and open a fresh one with `tabs_context_mcp`. That
+   recovered the 2026-09-17 run.
+3. The harvest does **not** resume in the new tab: paste `harvest.js`
+   again, and `start()` begins at page 1. Pass `maxRequests` reduced by the
+   requests already spent; they still count toward the wall budget. Merge
+   the two saved payloads (`rank.mjs` accepts an array and dedupes by id).
+
+What to do:
+
+- **Read `visibility` first.** `harvest.js` `status()`, `extract.js` and
+  `listing.js` `read()` all report it. `listing.js` adds a `tab-hidden`
+  warning.
+- **Never wait inside the page.** No `setTimeout`, no `await sleep`, in any
+  snippet you write. To wait, use the tool's own `computer{action:"wait"}`
+  between calls. A page timer can outlive the tool call, and then the result
+  is lost.
+- **A screenshot needs the window in front.** When one is required (a
+  `suspect` wall, step 2), headline it: "The AliExpress tab is hidden: please
+  bring that Chrome window to the front." Until then, report the wall as
+  unresolved. Never report "not blocked".
+- **Exports still work.** `__aeHarvest.send()` sees `hidden` and posts the
+  form without its fetch race (the race needs a timer). Read the saved path
+  from the receiver's own output (the background task), not from the tab.
+  `expose()` + `get_page_text` does NOT work hidden.
+- **The description is fetched, not rendered.** `listing.js` fetches it from
+  the URL the page already requested; `description.source` says `fetched`.
 
 **Never change the account's language or currency in the signed-in browser.**
 No `forceEnglish()` there, no settings clicks. The parsers accept both
@@ -261,7 +310,9 @@ Two hard rules come out of it, both now enforced by `wallVerdict()` in `lib.mjs`
   them. `computer{action:"screenshot"}` ends the ambiguity immediately. This is
   the skill's own *"one channel drew a blank and the blank was treated as a
   finding"* defect (see defect 4 below), finally applied to block detection
-  instead of only to product specs.
+  instead of only to product specs. **In a hidden tab the screenshot hangs**
+  (step 0, "A hidden tab"): ask the user to bring the window to the front,
+  and keep the wall unresolved until you have looked.
 
 **Never write "not blocked", "no data available", or "this product does not
 exist" from the text channel alone.** Look first.
@@ -307,7 +358,26 @@ between 25 s and 45 s in Chrome), which is about 8-12 fetches. Drive it with a
 **top-level `await`** — an async IIFE comes back as `{}` in Chrome. Call it
 repeatedly until `done: true`. It stops on `exhausted`, `page-cap`,
 `request-budget`, `blocked`, `fetch-error` or `parse-error` — and
-**`blocked` means go to step 2 and alert the user.**
+**`blocked` means go to step 2 and alert the user.** `exhausted` carries an
+`endSignal`: `empty-page` (the server served nothing) or `no-new-ids` (every
+id on the page was already seen).
+
+**After a `step()` call times out, its loop is still running** in the page
+(a promise cannot be cancelled). Do not call `step()` again at once: it
+would be refused with `err: 'step() is already running …'`. Wait with
+`computer{action:"wait"}`, poll `status()` until `running: false`, then
+call `step()` again. (Before this guard, an overlapping call fetched the
+same page twice, found no new ids and ended a 600-item run at 240 as
+`exhausted-all-results`; measured by the 2026-09-29 review.)
+
+**`pageInfo.finished` is ignored, on purpose.** Measured 2026-09-29 in
+signed-in Chrome: `cheese grater` reported `finished: true` on pages 1, 2 and
+3 while page 3 still held 60 ids never seen; the stream served 60, 60, 60, 50
+and then an empty page. Trusting the flag stopped the run after page 1 and
+would have reported 60 of 230 items as `exhausted-all-results`. A short page
+is not the end either: `vegetable slicer` served 48 on page 4 and 1 more item
+on page 5. Reading to the empty page costs one request. Each entry in
+`payload().pages` still records the flag, for diagnosis.
 
 Defaults are `maxPages: 20`, `maxRequests: 24`, `fourStar: true`.
 
@@ -319,11 +389,14 @@ fixed depth — it varies enormously by query and is not even stable between run
 | `wire brush set` (4★) | 1,166 unique over 20 pages, still going at the cap |
 | `travel duffel bag` (4★) | 473 over 8 pages, 98% on-category, still going |
 | `balance board roller` (4★) | dry at page 5 — and page 7 an hour earlier |
+| `cheese grater` (4★, signed-in Chrome) | 230 over 4 pages, empty page 5 |
+| `rotary grater` (4★, signed-in Chrome) | 23 on page 1, empty page 2 |
 
 **`pageInfo.totalResults` is not a denominator.** The balance-board query
-claimed **160,188** results and served nothing past page 4. Never report
-coverage as a percentage of it. Report `coverage.verdict`:
-`exhausted-all-results` or `truncated`.
+claimed **160,188** results and served nothing past page 4. In signed-in
+Chrome it did the opposite: it grew with each page read (60, 120, 180), so it
+counted what had been served. Never report coverage as a percentage of it.
+Report `coverage.verdict`: `exhausted-all-results` or `truncated`.
 
 **Paging works — the old warning was wrong.** This file used to claim `&page=2`
 returns recommendations rather than results. Measured: pages 1-12 of `wire brush
@@ -361,18 +434,24 @@ then in the browser:
 ```js
 await __aeHarvest.send(8765)
 // in-app:  "sent 91234 chars; receiver replied 200: saved <path> (…)"
-// Chrome:  "form-posted 91234 chars to http://127.0.0.1:8765/harvest - the tab
-//           now shows the receiver reply: get_page_text, then navigate back"
+// Chrome:  "form-posted 91234 chars to http://127.0.0.1:8765/harvest - the
+//           receiver prints the saved path in its own output: read it there,
+//           or with get_page_text on this tab, then navigate back"
+// hidden:  "form-posted … (tab hidden: fetch skipped) - … (get_page_text hangs
+//           on a hidden tab), then navigate back"
 ```
 
 `send()` tries a `fetch()` POST first and, if Chrome holds it (its
 local-network permission gate held such a request for 45 s without it ever
 reaching the receiver, measured on Chrome 153), submits a top-level
 `text/plain` form to the same URL. A form POST is a navigation, and it
-arrived. The tab then shows `saved <path> (…)`: read it with
-`get_page_text`, and `navigate` back to AliExpress. Window state is gone
-after that navigation — export once, at the end of the harvest. Nothing is
-retyped and nothing is chunked; the saved file is `harvest.json`.
+arrived. In a **hidden** tab it skips the fetch and posts the form at once,
+because the fetch race needs a timer (see "A hidden tab"). The receiver
+prints `saved <path>` in its own output: read it from the background task,
+which works whether or not the tab is visible. Then `navigate` back to
+AliExpress. Window state is gone after that navigation — export once, at the
+end of the harvest. Nothing is retyped and nothing is chunked; the saved file
+is `harvest.json`.
 
 **Fallbacks**, decoded by the one decoder:
 
@@ -385,7 +464,8 @@ node ~/.claude/skills/aliexpress-finder/scripts/decode.mjs --check <file...>   #
   tool-result limit, the harness saves it to a file and prints the path —
   that file is the input to `decode.mjs` (double-encoded: a JSON array whose
   `text` field holds a JSON string; the decoder knows).
-- *Chrome connector:* `payload()` would come back as 1,000 characters plus
+- *Chrome connector, visible tab only* (`get_page_text` hangs on a hidden
+  one): `payload()` would come back as 1,000 characters plus
   `[TRUNCATED]`. Export through the page: `__aeHarvest.chunks()` reports
   `{ total, chunkSize: 40000, count }`; `__aeHarvest.expose(0)` writes chunk
   0 into a `<pre>` placed FIRST in `<body>`; `get_page_text` reads it (its
@@ -480,7 +560,8 @@ step-5 fetches, not a cleverer sort. Say so rather than implying the tool found
 the best item when it sampled a tier.
 
 For each selected item, navigate to its URL, scroll to the middle of the page,
-wait 2-3 s (the review block renders late), and run the reader below. Its
+wait 2-3 s with `computer{action:"wait"}` (the review block renders late;
+never wait with a timer inside the page), and run the reader below. Its
 output stays under the Chrome connector's 1,000-character limit. `test.mjs`
 pulls this code out of this file and runs it against sample pages, so edit it
 here, between the markers, and run the tests after any change.
@@ -568,15 +649,41 @@ The step-5 reader gives review counts, price, sold and options only. For anythin
 dimensions, what is on the output — install `scripts/listing.js` and run:
 
 ```js
-__aeListing.read()
+window.__r = await __aeListing.read()   // async since 2026-09-29: top-level await
+__r.warnings                              // read first; then return fields in pieces
 ```
 
 It expands every "show more" first, then returns **text and images together**:
 `sizeLines`, `ratingLines`, `variants`, `selectedVariant`, `reviews`,
-`gallery`, `text`, plus a `fingerprint`. One call, both channels, deliberately —
-see the defect below.
+`gallery`, `descriptionImages`, `description`, `text`, `visibility`,
+`warnings`, plus a `fingerprint`. One call, both channels, deliberately —
+see the defect below. In Chrome the whole result is far over 1,000
+characters: keep it on `window` and return the fields you need in pieces.
 
-Four things it encodes that cost real time to discover:
+- **`gallery` is the product's own photos only**, full size, in slider order.
+  Other products on the page (related items, the footer licence badge, menu
+  icons) are counted in `excludedImages` and never returned as the product.
+  `galleryScope: 'unscoped'` means the product container was not found and
+  the old "every big image" list came back instead, with a warning: then
+  check every image before trusting it.
+- **The description is read** (`description.source`): `rendered` from its
+  shadow tree under `#nav-description`, or `fetched` from the URL the page
+  already requested when nothing is rendered (a hidden tab never renders
+  it). Its text is appended to
+  `text` after `[DESCRIPTION]` and feeds `sizeLines`; its images are
+  `descriptionImages`, where dimension drawings usually are. `missing`,
+  `fetch-failed`, `skipped` or `pending` means **unknown**: never write "the
+  listing does not state the size" from that. `blocked` or `suspect-wall`
+  means a **wall answered the description fetch**: the top-level `blocked` /
+  `suspectedWall` is set, and it is the same STOP as step 2.
+- **A stalled description fetch does not lose the read.** `read()` stores a
+  complete result without the description in `__aeListing.last`
+  (`description.source: 'pending'`) before it fetches. If `read()` times out,
+  return fields from `__aeListing.last` in the next call; it is replaced when
+  the fetch settles. `await __aeListing.read({ description: false })` never
+  fetches.
+
+Five things it encodes that cost real time to discover:
 
 - **Options come only from the option selector** (`sku-item--image`,
   `sku-item--text`; the selected one also carries `sku-item--selected`). It
@@ -592,10 +699,17 @@ Four things it encodes that cost real time to discover:
 - **Any mutation invalidates your previous read.** Expanding a description or
   selecting a variant changes the DOM. `changed(fp)` tells you whether a
   re-read is owed. If you clicked anything, you owe one.
-- **A "size" line may be the shipping box.** `sizeLinesArePackage` separates
-  them. `12 x 7 x 4 cm / 59 g` was the carton; the product was `8 x 3.7 x 2 cm`.
+- **A "size" line may be the shipping box.** `isPackage: true` marks it, and
+  `productSizeLines` / `packageSizeLines` keep them apart. `12 x 7 x 4 cm /
+  59 g` was the carton; the product was `8 x 3.7 x 2 cm`.
+- **The description lives in a shadow root, and `innerText` never sees
+  shadow content.** `text` used to be `body.innerText`, so "Weight: about
+  750 g" was on screen and absent from `text` (2026-09-29). The description
+  is now read from its shadow tree, `<style>` skipped. The iframe under
+  `#nav-description` is empty in both tab states: it is not the description.
 
-Then read the labels — this is not optional for hardware:
+Then read the labels — this is not optional for hardware. Pass `gallery`
+AND `descriptionImages`:
 
 ```bash
 scripts/labels.sh fetch /tmp/labels <url1> <url2> ...
@@ -721,11 +835,11 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 
 | File | Role |
 |------|------|
-| `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until dry, reports `coverage.verdict`. Runs unchanged in both browsers; `forceEnglish()` (in-app only), `expose()`/`chunks()` (Chrome export), `debugUrl()` (in-app only). |
+| `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until an empty page or a page with no new ids (never on `finished`), reports `coverage.verdict` and `endSignal`, and `visibility` in `status()`. Runs unchanged in both browsers; `forceEnglish()` (in-app only), `send()` (skips its fetch race in a hidden tab), one `step()` loop at a time (`running` in `status()`), `expose()`/`chunks()` (Chrome export, visible tab only), `debugUrl()` (in-app only). |
 | `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; `__aeHarvest.send(port)` POSTs the payload to it and it writes `harvest-<query>-<stamp>.json`, replying with the path. Exits after one payload or 15 idle minutes. |
 | `scripts/decode.mjs` | **Fallback decoder.** Reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps (any order, refuses a partial set), or from a plain payload JSON. |
-| `scripts/extract.js` | Single-page extractor for the currently loaded page. `_init_data_` first, DOM fallback, reports `source` and `blocked`. |
-| `scripts/listing.js` | **Detail-page reader.** Expands, then returns text AND images in one call. Shadow-DOM aware, block-aware, separates product size from carton size, reads options only from the option selector (`selectedVariant` too), returns the own vs pooled review counts, `changed()` proves a re-read is owed. |
+| `scripts/extract.js` | Single-page extractor for the currently loaded page. `_init_data_` first, DOM fallback, reports `source`, `blocked` and `visibility`. |
+| `scripts/listing.js` | **Detail-page reader.** `await read()`: expands, then returns text AND images in one call. Shadow-DOM aware, block-aware; `gallery` is the product's own photos only (other products counted in `excludedImages`); reads the description (from its shadow tree, or fetched when a hidden tab left it unrendered) into `text`, `sizeLines` and `descriptionImages`; separates product size from carton size, reads options only from the option selector (`selectedVariant` too), returns the own vs pooled review counts, reports `visibility` and `warnings`, keeps the result in `last` before the description fetch, `changed()` proves a re-read is owed. |
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). The label on the case is the spec sheet. |
 | `scripts/rank.mjs` | Ranker. Bayesian shrinkage, log volume, neutral brand default, `--require` filter, `--spread` tier stratification, `--constraint` hard filters, absence warning, `sold-unparsed` and `own-reviews-unknown` set-asides with warnings. |
 | `scripts/lib.mjs` | Pure helpers (`parseSold`, `SOLD_RE`, `parseReviewBlock`, `median`, `clean`, **`wallVerdict`**) shared by ranker, browser files, the step-5 reader and tests. |
@@ -739,6 +853,67 @@ matches `lib.mjs` on every fixture — keep them in sync, the test will catch yo
 if you don't. A drifted `wallVerdict` means one entry point silently stops
 detecting walls; a drifted `SOLD_RE` means best sellers silently lose their
 sold count.
+
+### Defects fixed 2026-09-29 (the rotary-grater session)
+
+Found during a live run in signed-in Chrome, then checked on two detail
+pages. Each has a guard in code, and its tests fail on the old code.
+
+1. **The harvest stopped at page 1 and called it exhausted.** `harvest.js`
+   ended the run on `pageInfo.finished: true`. That flag was true on every
+   page served: `cheese grater` pages 1-3 each carried it, and page 3 still
+   held 60 new ids. The stream really ended with an empty page 5, at 230
+   items. The run was saved only because the operator noticed that
+   "cheese grater" could not have just 60 results. Guard: the run ends only on
+   an empty page (`endSignal: 'empty-page'`) or a page with no new ids
+   (`no-new-ids`); the flag is recorded per page and never trusted. A short
+   page is not an end (`vegetable slicer`: 48, then 1 more, then empty).
+2. **The gallery was other products.** `listing.js` returned every image of
+   400 px or more. On one listing 8 of 15 were not the product: related
+   items, the footer licence badge, category menu icons. On another it kept
+   1 of 9 product photos, because the slider serves them at 220 px. The
+   description text never reached `text`: it renders in a shadow root, and
+   `text` was `body.innerText`, which excludes shadow content ("Weight:
+   about 750 g" on screen, absent from `text`). Guard: images are sorted by
+   page zone (`main-image--wrap` is the product), restored to full size,
+   and other products are counted in `excludedImages`; the description is
+   read from its shadow tree into `text`, and its images come back as
+   `descriptionImages`.
+3. **A hidden tab broke timers, screenshots and page text, silently.** The
+   connector's window was hidden. A 2,500 ms timer inside a read never fired
+   and the 45 s tool call timed out with no result; a screenshot, a zoom and
+   `get_page_text` each hung the same way; the description was not rendered
+   anywhere on the page. Guard: every browser script reports `visibility`;
+   `listing.js` warns and
+   fetches the description itself from the URL the page already requested;
+   `send()` skips its timer-based fetch race when hidden; this file forbids
+   page timers and names what needs the window in front.
+
+Common cause: a signal was trusted without checking what it measured (a
+flag, an image size, a DOM walk that looked complete).
+
+An independent review of these fixes (13 findings, 8 confirmed by a second
+agent, several live) found more, all fixed with tests that fail on the
+reviewed code:
+
+- **Text out of order.** Reading each element's own text in
+  `querySelectorAll` order turned `<li><b>Weight:</b> about 680 g</li>` into
+  "about 680 g Weight:". `textOf()` now follows tree order.
+- **Seller copy read as a wall.** A description saying "please slide the
+  drum in" was thrown away as `blocked`. Wall phrases in the TEXT now count
+  only when the fetch returned nothing usable; the URL and the captcha HTML
+  are always checked.
+- **A real wall on the description fetch passed as "unknown".** It now sets
+  the top-level `blocked` / `suspectedWall`, the same STOP as a page wall.
+- **A stalled description fetch lost the whole read.** `read()` stores the
+  rest in `__aeListing.last` first; `read({ description: false })` skips
+  the fetch.
+- **Overlapping `step()` calls ended a harvest early.** After a tool timeout
+  the page loop runs on; a second call fetched the same page, found no new
+  ids and stopped a 600-item run at 240. `step()` now refuses while
+  `running`.
+- **The stuck-tab advice threw the harvest away.** Export first, then open a
+  fresh tab (step 0, "A hidden tab").
 
 ### Defects fixed 2026-09-25 (the fidget-toys and stress-ball sessions)
 

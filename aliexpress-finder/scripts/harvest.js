@@ -265,6 +265,19 @@ function wallVerdict(sig) {
     catch (e) { return { err: 'json:' + String(e).slice(0, 80) }; }
   }
 
+  /* 'visible', 'hidden' or 'unknown'. Reported by status() because a hidden
+   * tab changes what works (measured 2026-09-29, Chrome connector): a
+   * 100 ms setTimeout fired after 958 ms, a 2,500 ms one had not fired 45 s
+   * later, and screenshots, zoom and get_page_text each hung until the 45 s
+   * tool timeout. javascript_tool and fetch() kept working. Chrome marks a
+   * tab hidden when its window is minimised or fully covered. */
+  function visibility() {
+    try {
+      const d = window.document;
+      return d && typeof d.visibilityState === 'string' ? d.visibilityState : 'unknown';
+    } catch (e) { return 'unknown'; }
+  }
+
   function slugify(q) {
     return String(q || '').trim().toLowerCase()
       .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
@@ -303,7 +316,8 @@ function wallVerdict(sig) {
         maxRequests: opts.maxRequests || 24,
         page: 0, requests: 0,
         seen: new Set(), items: [], pages: [],
-        claimedTotal: null, stop: null, lastErr: null, wall: null,
+        claimedTotal: null, stop: null, endSignal: null, lastErr: null, wall: null,
+        running: false,
       };
       /* No query string in anything returned to the operator. The Chrome
        * connector replaces a whole result with "[BLOCKED: Cookie/query string
@@ -361,14 +375,23 @@ function wallVerdict(sig) {
      *              get_page_text, then navigate back. Window state is gone
      *              after that, which is fine — the payload is on disk.
      * The return value is short and has no query string, so the Chrome
-     * connector shows it in full. */
+     * connector shows it in full.
+     *
+     * A HIDDEN tab skips the fetch race in 'auto' mode and posts the form
+     * straight away. The race needs a timer, and a hidden tab delays timers
+     * past the 45 s tool limit (see visibility()), so the call would time out
+     * with nothing reported. A form POST is a navigation and needs no timer.
+     * The tab's reply page cannot be read there either (get_page_text hangs
+     * on a hidden tab), so read the saved path from the receiver's own
+     * output instead. */
     async send(port, opts) {
       opts = opts || {};
       const host = opts.host || '127.0.0.1';
       const url = 'http://' + host + ':' + (port || 8765) + '/harvest';
       const p = this.payload();
       const via = opts.via || 'auto';
-      if (via !== 'form') {
+      const hidden = visibility() === 'hidden';
+      if (via === 'fetch' || (via === 'auto' && !hidden)) {
         const timeoutMs = opts.timeoutMs || 3000;
         const attempt = fetch(url, { method: 'POST', mode: 'cors', headers: { 'Content-Type': 'text/plain' }, body: p })
           .then(async (r) => 'sent ' + p.length + ' chars; receiver replied ' + r.status + ': ' + (await r.text()).slice(0, 220))
@@ -386,7 +409,10 @@ function wallVerdict(sig) {
       doc.body.appendChild(f);
       f.submit();
       return 'form-posted ' + p.length + ' chars to ' + url +
-             ' - the tab now shows the receiver reply: get_page_text, then navigate back';
+             (hidden ? ' (tab hidden: fetch skipped)' : '') +
+             ' - the receiver prints the saved path in its own output: read it there' +
+             (hidden ? ' (get_page_text hangs on a hidden tab)' : ', or with get_page_text on this tab') +
+             ', then navigate back';
     },
 
     /* FALLBACK export for the Chrome connector when loopback is unreachable.
@@ -423,82 +449,119 @@ function wallVerdict(sig) {
 
     /* Fetch up to n more pages. Safe to call repeatedly; returns progress.
      * Stops early on: exhausted stream, page cap, request budget, or a BLOCK.
+     *
+     * ONE LOOP AT A TIME. When the tool call times out, the page loop keeps
+     * running (a promise cannot be cancelled; measured 2026-09-29 in the
+     * in-app browser against a slow local server: after the 45 s timeout the
+     * loop finished page 3 and went on to page 4). A
+     * second step() started then would fetch the same page again, find no
+     * new ids on it, and end the run as 'exhausted' with most pages unread.
+     * So a second call returns at once with an error; poll status() until
+     * `running` is false, then call step() again.
      */
     async step(n) {
       const s = this.st;
       if (!s) return { err: 'call start() first' };
-      for (let k = 0; k < (n || 1) && !s.stop; k++) {
-        if (s.page >= s.maxPages) { s.stop = 'page-cap'; break; }
-        if (s.requests >= s.maxRequests) { s.stop = 'request-budget'; break; }
-        const p = s.page + 1;
-        let html = '', finalUrl = '';
-        s.requests++;
-        try {
-          const r = await fetch(s.base + '&page=' + p, { credentials: 'include' });
-          finalUrl = r.url;
-          html = await r.text();
-        } catch (e) {
-          s.lastErr = 'fetch:' + String(e).slice(0, 100);
-          s.stop = 'fetch-error';
-          break;
-        }
-        // Checked BEFORE the parse is trusted. A LOUD wall must never be
-        // reported as a parse bug, and a QUIET one must never be reported as
-        // "the page had no data" — see wallVerdict above.
-        const c = carve(html);
-        const verdict = wallVerdict({
-          url: finalUrl, text: html, html: html, dataNodes: c.err ? 0 : 1,
+      if (s.running) {
+        return Object.assign(this.status(), {
+          err: 'step() is already running (an earlier call timed out but its loop goes on). ' +
+               'Wait with computer{action:"wait"}, poll status() until running is false, then call step() again.',
         });
-        if (verdict.state !== 'clear') {
-          s.stop = verdict.state === 'blocked' ? 'blocked' : 'suspect-wall';
-          s.wall = verdict;
-          break;
+      }
+      s.running = true;
+      try {
+        for (let k = 0; k < (n || 1) && !s.stop; k++) {
+          if (s.page >= s.maxPages) { s.stop = 'page-cap'; break; }
+          if (s.requests >= s.maxRequests) { s.stop = 'request-budget'; break; }
+          const p = s.page + 1;
+          let html = '', finalUrl = '';
+          s.requests++;
+          try {
+            const r = await fetch(s.base + '&page=' + p, { credentials: 'include' });
+            finalUrl = r.url;
+            html = await r.text();
+          } catch (e) {
+            s.lastErr = 'fetch:' + String(e).slice(0, 100);
+            s.stop = 'fetch-error';
+            break;
+          }
+          // Checked BEFORE the parse is trusted. A LOUD wall must never be
+          // reported as a parse bug, and a QUIET one must never be reported as
+          // "the page had no data" — see wallVerdict above.
+          const c = carve(html);
+          const verdict = wallVerdict({
+            url: finalUrl, text: html, html: html, dataNodes: c.err ? 0 : 1,
+          });
+          if (verdict.state !== 'clear') {
+            s.stop = verdict.state === 'blocked' ? 'blocked' : 'suspect-wall';
+            s.wall = verdict;
+            break;
+          }
+          if (c.err) { s.lastErr = c.err; s.stop = 'parse-error'; break; }
+          s.page = p;
+          const f = c.obj.data.root.fields;
+          const info = f.pageInfo || {};
+          if (s.claimedTotal === null && info.totalResults != null) {
+            s.claimedTotal = info.totalResults;
+          }
+          const arr = (f.mods && f.mods.itemList && f.mods.itemList.content) || [];
+          // `finished` is recorded for diagnosis only. It is NOT a stop signal:
+          // see the stop rules below the item loop.
+          const fin = info.finished === true;
+          if (!arr.length) {
+            s.pages.push({ page: p, n: 0, fresh: 0, finished: fin });
+            s.stop = 'exhausted'; s.endSignal = 'empty-page'; break;
+          }
+          let fresh = 0;
+          for (const it of arr) {
+            const id = String((it && it.productId) || '');
+            if (!id || s.seen.has(id)) continue;
+            s.seen.add(id);
+            fresh++;
+            const prices = it.prices || {};
+            const sale = prices.salePrice || {};
+            const orig = prices.originalPrice || {};
+            const desc = clean((it.trade && it.trade.tradeDesc) || '');
+            const m = desc.match(SOLD_RE);
+            const soldRaw = m ? m[1].replace(/\s/g, '') : null;
+            s.items.push(mk({
+              id,
+              title: clean((it.title && it.title.displayTitle) || ''),
+              price: typeof sale.minPrice === 'number' ? sale.minPrice : null,
+              currency: typeof sale.currencyCode === 'string' ? sale.currencyCode : null,
+              wasPrice: typeof orig.minPrice === 'number' ? orig.minPrice : null,
+              discountPct: typeof sale.discount === 'number' ? sale.discount : null,
+              rating: it.evaluation && typeof it.evaluation.starRating === 'number'
+                ? it.evaluation.starRating : null,
+              soldRaw,
+              soldText: desc && parseSold(soldRaw) === null ? desc.slice(0, 80) : null,
+              image: (() => {
+                const im = it.image || {};
+                const u = im.imgUrl || im.imgUrlOrigin || '';
+                return u ? (u.startsWith('//') ? 'https:' + u : u) : null;
+              })(),
+              page: p,
+            }));
+          }
+          s.pages.push({ page: p, n: arr.length, fresh, finished: fin });
+          /* STOP RULES (measured 2026-09-29, signed-in Chrome, USD account).
+           * The stream is dry only when a page comes back EMPTY, or when every
+           * id on it was already seen (the server is repeating itself).
+           *
+           * `pageInfo.finished` used to end the run. It is not trustworthy:
+           * "cheese grater" reported finished:true on pages 1, 2 AND 3, and page
+           * 3 still held 60 ids never seen before; the stream really ended at
+           * page 5 (60, 60, 60, 50, then 0). The harvester stopped after page 1
+           * and would have called 60 of 230 items "exhausted-all-results".
+           * A short page is not an end either: "vegetable slicer" served 48 on
+           * page 4 and then 1 more item on page 5, before an empty page 6.
+           * Reading to the empty page costs one extra request per harvest.
+           * totalResults was no better: it grew with each page read (60, 120,
+           * 180), so it counts what was served, not what exists. */
+          if (fresh === 0) { s.stop = 'exhausted'; s.endSignal = 'no-new-ids'; break; }
         }
-        if (c.err) { s.lastErr = c.err; s.stop = 'parse-error'; break; }
-        s.page = p;
-        const f = c.obj.data.root.fields;
-        const info = f.pageInfo || {};
-        if (s.claimedTotal === null && info.totalResults != null) {
-          s.claimedTotal = info.totalResults;
-        }
-        const arr = (f.mods && f.mods.itemList && f.mods.itemList.content) || [];
-        if (!arr.length) { s.pages.push({ page: p, n: 0, fresh: 0 }); s.stop = 'exhausted'; break; }
-        let fresh = 0;
-        for (const it of arr) {
-          const id = String((it && it.productId) || '');
-          if (!id || s.seen.has(id)) continue;
-          s.seen.add(id);
-          fresh++;
-          const prices = it.prices || {};
-          const sale = prices.salePrice || {};
-          const orig = prices.originalPrice || {};
-          const desc = clean((it.trade && it.trade.tradeDesc) || '');
-          const m = desc.match(SOLD_RE);
-          const soldRaw = m ? m[1].replace(/\s/g, '') : null;
-          s.items.push(mk({
-            id,
-            title: clean((it.title && it.title.displayTitle) || ''),
-            price: typeof sale.minPrice === 'number' ? sale.minPrice : null,
-            currency: typeof sale.currencyCode === 'string' ? sale.currencyCode : null,
-            wasPrice: typeof orig.minPrice === 'number' ? orig.minPrice : null,
-            discountPct: typeof sale.discount === 'number' ? sale.discount : null,
-            rating: it.evaluation && typeof it.evaluation.starRating === 'number'
-              ? it.evaluation.starRating : null,
-            soldRaw,
-            soldText: desc && parseSold(soldRaw) === null ? desc.slice(0, 80) : null,
-            image: (() => {
-              const im = it.image || {};
-              const u = im.imgUrl || im.imgUrlOrigin || '';
-              return u ? (u.startsWith('//') ? 'https:' + u : u) : null;
-            })(),
-            page: p,
-          }));
-        }
-        s.pages.push({ page: p, n: arr.length, fresh });
-        // `finished` is the server saying the stream is dry. Trust it over
-        // claimedTotal, which is an estimate and routinely fiction: a balance
-        // board query claimed 160,188 results and served nothing past page 4.
-        if (info.finished === true) { s.stop = 'exhausted'; break; }
+      } finally {
+        s.running = false;
       }
       return this.status();
     },
@@ -508,12 +571,14 @@ function wallVerdict(sig) {
       if (!s) return { err: 'not started' };
       return {
         query: s.query, pagesRead: s.page, requests: s.requests,
-        unique: s.seen.size, stop: s.stop, lastErr: s.lastErr,
+        unique: s.seen.size, stop: s.stop, endSignal: s.endSignal, lastErr: s.lastErr,
         blocked: s.stop === 'blocked',
         suspectedWall: s.stop === 'suspect-wall',
         wall: s.wall || null,
         claimedTotal: s.claimedTotal,
         done: s.stop !== null,
+        running: !!s.running,
+        visibility: visibility(),
       };
     },
 
@@ -539,6 +604,7 @@ function wallVerdict(sig) {
         coverage: {
           verdict: s.stop === 'exhausted' ? 'exhausted-all-results' : 'truncated',
           stop: s.stop,
+          endSignal: s.endSignal,
           pagesRead: s.page,
           requests: s.requests,
           claimedTotal: s.claimedTotal,

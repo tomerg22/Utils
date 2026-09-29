@@ -332,6 +332,9 @@ function wallVerdict(sig) {
     blocked,
     suspectedWall: verdict.state === 'suspect',
     wall: verdict,
+    // 'hidden' explains a thin DOM fallback (the grid lazy-loads only while
+    // visible) and warns that screenshots and get_page_text will hang.
+    visibility: (() => { try { return typeof document.visibilityState === 'string' ? document.visibilityState : 'unknown'; } catch (e) { return 'unknown'; } })(),
     cardCount: items.length,
     withRating: items.filter((i) => i.rating !== null).length,
     items,

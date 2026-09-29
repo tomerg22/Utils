@@ -441,17 +441,115 @@ console.log('\nharvest.js — paging, dedupe and stop reasons');
   ok('claimedTotal is carried but marked unreliable',
     pl.coverage.claimedTotalIsUnreliable === true && pl.coverage.claimedTotal === 1234);
   ok('served one request per page plus the empty one', served === 4, `served=${served}`);
+  eq('the end is named: an empty page', st.endSignal, 'empty-page');
+}
+
+/* WHY (measured 2026-09-29, signed-in Chrome, USD account). The harvester
+ * used to stop on pageInfo.finished. "cheese grater" reported finished:true
+ * on pages 1, 2 AND 3 while page 3 still held 60 ids never seen; the stream
+ * served 60, 60, 60, 50 and then an empty page 5. The run stopped after
+ * page 1 and would have called 60 of 230 items "exhausted-all-results".
+ * These are the measured shapes, scaled down. */
+console.log('\nharvest.js — finished:true is NOT a stop signal (the 2026-09-29 defect)');
+{
+  const sizes = [6, 6, 6, 5, 0]; // cheese grater: 60, 60, 60, 50, 0
+  let served = 0;
+  const H = loadHarvest(async (url) => {
+    served++;
+    const p = Number(new URL(url).searchParams.get('page'));
+    const n = sizes[p - 1] ?? 0;
+    return reply(makePage({ items: Array.from({ length: n }, (_, i) => makeItem(`cg${p}-${i}`)),
+      finished: true, total: 60 * p, page: p }));
+  });
+  H.start({ query: 'cheese grater' });
+  const st = await H.step(10);
+  eq('reads past finished:true to the empty page', st.pagesRead, 5);
+  eq('keeps every item the stream served (the bug kept only page 1)', st.unique, 23);
+  eq('stop is exhausted', st.stop, 'exhausted');
+  eq('the end signal is the empty page, not the flag', st.endSignal, 'empty-page');
+  eq('one request per page, the empty one included', served, 5);
+  const pl = JSON.parse(H.payload());
+  ok('each page records its finished flag for diagnosis',
+    pl.pages.every((pg) => pg.finished === true), JSON.stringify(pl.pages));
+  eq('payload coverage names the end signal', pl.coverage.endSignal, 'empty-page');
 }
 {
-  // `finished: true` on a page that still HAS items must still stop.
+  // vegetable slicer: 60, 59, 59, 48, 1, 0. A SHORT page is not the end.
+  const sizes = [6, 6, 6, 4, 1, 0];
   const H = loadHarvest(async (url) => {
     const p = Number(new URL(url).searchParams.get('page'));
-    return reply(makePage({ items: [makeItem('x' + p)], finished: p >= 2, page: p }));
+    const n = sizes[p - 1] ?? 0;
+    return reply(makePage({ items: Array.from({ length: n }, (_, i) => makeItem(`vs${p}-${i}`)),
+      finished: true, page: p }));
+  });
+  H.start({ query: 'vegetable slicer' });
+  const st = await H.step(10);
+  eq('a short page does not end the run: the item after it is kept', st.unique, 23);
+  eq('pages read up to and including the empty one', st.pagesRead, 6);
+}
+{
+  // A server that repeats itself: page 3 serves only ids already seen.
+  const H = loadHarvest(async (url) => {
+    const p = Number(new URL(url).searchParams.get('page'));
+    const ids = p <= 2 ? [`d${p}-a`, `d${p}-b`] : ['d2-a', 'd2-b'];
+    return reply(makePage({ items: ids.map((i) => makeItem(i)), page: p }));
   });
   H.start({ query: 'wire brush set' });
-  const st = await H.step(9);
-  eq('honours finished:true even with items present', st.stop, 'exhausted');
-  eq('kept both pages of items', st.unique, 2);
+  const st = await H.step(10);
+  eq('a page with no new ids ends the run', st.stop, 'exhausted');
+  eq('that end is named', st.endSignal, 'no-new-ids');
+  eq('it stops on that page, not later', st.pagesRead, 3);
+  eq('the repeated ids are counted once', st.unique, 4);
+}
+
+/* Review finding F5 (confirmed live in the in-app browser): when a step()
+ * tool call times out, its page loop keeps running. A second step() started
+ * then fetched the same page again, found no new ids on it, and ended the
+ * run as 'exhausted' with most pages unread (240 of 600 labelled as all
+ * results). A second call must refuse while the first loop runs. */
+console.log('\nharvest.js — a second step() while the first still runs is refused');
+{
+  const fetched = [];
+  const H = loadHarvest((url) => new Promise((resolve) => {
+    const p = Number(new URL(url).searchParams.get('page'));
+    fetched.push(p);
+    const items = p <= 6 ? [makeItem(`ov${p}-a`), makeItem(`ov${p}-b`)] : [];
+    setTimeout(() => resolve(reply(makePage({ items, finished: true, page: p }))), 5);
+  }));
+  H.start({ query: 'wire brush set' });
+  const first = H.step(10);            // the call whose tool timed out
+  await new Promise((r) => setTimeout(r, 12));
+  const mid = H.status();
+  ok('status() shows the loop is running', mid.running === true, JSON.stringify(mid));
+  const second = await H.step(10);     // the operator's retry
+  ok('the second call is refused with an error', /already running/.test(second.err || ''), JSON.stringify(second));
+  ok('and does not end the run', second.done === false, JSON.stringify(second));
+  const st = await first;
+  eq('the first loop reads to the empty page', st.endSignal, 'empty-page');
+  eq('every item is kept', st.unique, 12);
+  eq('no page was fetched twice', fetched, [1, 2, 3, 4, 5, 6, 7]);
+  eq('running is cleared at the end', H.status().running, false);
+}
+{
+  // The guard is released even when the loop stops on an error.
+  const H = loadHarvest(async () => { throw new Error('network down'); });
+  H.start({ query: 'wire brush set' });
+  await H.step(2);
+  eq('running is cleared after a fetch-error', H.status().running, false);
+}
+
+/* A hidden tab changes what works (measured 2026-09-29): a 100 ms timer fired
+ * after 958 ms, a 2,500 ms one had not fired 45 s later, and screenshots,
+ * zoom and get_page_text hung. status() must say so, so the operator knows. */
+console.log('\nharvest.js — status() reports the tab visibility');
+{
+  const H = loadHarvest(async () => reply(makePage({ items: [makeItem('v1')] })));
+  H.start({ query: 'wire brush set' });
+  eq('no document at all is "unknown", not a guess', H.status().visibility, 'unknown');
+  const winH = { document: { visibilityState: 'hidden' } };
+  new Function('window', 'fetch', harvestSrc)(winH, async () => reply(makePage({ items: [makeItem('v2')] })));
+  winH.__aeHarvest.start({ query: 'wire brush set' });
+  eq('a hidden tab is reported as hidden', winH.__aeHarvest.status().visibility, 'hidden');
 }
 {
   const H = loadHarvest(async (url) => {
@@ -782,23 +880,35 @@ console.log('\nlisting.js — text and images come back together, shadow DOM inc
     // Option tiles hold their name in a child <img alt>; model that lookup.
     querySelector: (sel) => (sel === 'img'
       ? (props.children || []).find((c) => c.tagName === 'IMG') || null : null),
+    // A container's own descendants, for walks that start below `document`.
+    querySelectorAll: () => props.qsa || [],
     closest: () => null, click() { (props.onClick || (() => {}))(); },
+    id: props.id || '',
+    // The ancestor link the zone walk climbs from a shadow root to its host.
+    getRootNode: props.rootHost ? () => ({ host: props.rootHost }) : undefined,
+    // Child nodes in tree order, which textOf() recurses through (innerText
+    // misses shadow content). `nodes` sets them exactly; otherwise the own
+    // text comes first, then `kids`.
+    nodeType: 1,
+    childNodes: props.nodes || [...(props.text ? [{ nodeType: 3, nodeValue: props.text }] : []), ...(props.kids || [])],
   });
-  const mkRoot = (els) => ({ querySelectorAll: () => els });
+  const mkRoot = (els) => ({ querySelectorAll: () => els, childNodes: els });
+  const txt = (s) => ({ nodeType: 3, nodeValue: s });
 
-  const runListing = ({ href, bodyText, els, shadowEls = [], html = '', ldCount = null }) => {
+  const runListing = ({ href, bodyText, els, shadowEls = [], html = '', ldCount = null, win = {}, visibilityState }) => {
     const host = mkEl('DIV', { shadow: mkRoot(shadowEls) });
     const all = [...els, host];
     const document = {
       body: { scrollHeight: 5000, innerText: bodyText },
       documentElement: { outerHTML: html },
+      visibilityState,
       // ldCount lets a test express "big page, zero JSON-LD" — the shape of
       // the quiet wall that walked through the old boolean check.
       querySelectorAll: (sel) =>
         (ldCount !== null && /ld\+json/.test(sel || '')) ? new Array(ldCount) : all,
     };
     const sandbox = {
-      window: { scrollTo() {} }, document, location: { href },
+      window: { scrollTo() {}, ...win }, document, location: { href },
       console,
     };
     sandbox.window.document = document;
@@ -812,14 +922,16 @@ console.log('\nlisting.js — text and images come back together, shadow DOM inc
     href: 'https://he.aliexpress.com/_____tmd_____/punish?x5secdata=abc',
     bodyText: 'Sorry, we have detected unusual traffic', els: [],
   });
-  const blockedRes = blockedApi.read();
+  const blockedRes = await blockedApi.read();
   ok('listing.js reports a wall as blocked, not as empty data', blockedRes.blocked === true);
   ok('blocked result tells the operator to stop this turn',
     /STOP and tell the user/.test(blockedRes.note || ''), blockedRes.note);
 
   // (b)+(c) text and images in one call, image hidden behind a shadow root
+  // The gallery lives in a shadow root under the main-image container.
+  const mainWrap = mkEl('DIV', { cls: 'main-image--wrap--AbC12x' });
   const shadowImg = mkEl('IMG', {
-    src: 'https://ae-pic-a1.aliexpress-media.com/kf/Sbig.jpg', nw: 800, nh: 800,
+    src: 'https://ae-pic-a1.aliexpress-media.com/kf/Sbig.jpg', nw: 800, nh: 800, rootHost: mainWrap,
   });
   const api = runListing({
     href: 'https://he.aliexpress.com/item/123.html',
@@ -837,9 +949,10 @@ console.log('\nlisting.js — text and images come back together, shadow DOM inc
     ],
     shadowEls: [shadowImg],
   });
-  const res = api.read();
+  const res = await api.read();
   ok('image behind a shadow root IS found (bare querySelectorAll returns 1)',
     res.gallery.some((u) => /Sbig\.jpg/.test(u)), JSON.stringify(res.gallery));
+  eq('the zone walk crosses the shadow root to the product container', res.galleryScope, 'product');
   ok('27x27 icons are not mistaken for product images',
     !res.gallery.some((u) => /Sicon/.test(u)), JSON.stringify(res.gallery));
   ok('the SAME call also returns the size line', res.sizeLines.length > 0,
@@ -888,7 +1001,7 @@ console.log('\nlisting.js — text and images come back together, shadow DOM inc
       mkEl('SPAN', { cls: 'list--itemSku--Zx9', text: 'Color:D Ships From:China Mainland' }),
     ],
   });
-  const optRes = optApi.read();
+  const optRes = await optApi.read();
   eq('options are read from the option selector, in order', optRes.variants, ['White', 'Black', '3Pcs Random Color']);
   eq('the selected option is named', optRes.selectedVariant, 'White');
   ok('a review line of another seller\'s item is NOT an option',
@@ -896,6 +1009,197 @@ console.log('\nlisting.js — text and images come back together, shadow DOM inc
   ok('the property title is NOT an option', !optRes.variants.includes('Color: White'), JSON.stringify(optRes.variants));
   eq('read() returns the own review count, not the pooled one',
     optRes.reviews, { own: 952, ownRating: 4.9, header: 4026, pooledNote: true });
+
+  /* (f) THE GALLERY WAS OTHER PRODUCTS (measured 2026-09-29). Every image of
+   * 400 px or more used to be "the gallery": for one listing 8 of 15 were
+   * related items (slick-slide carousel), the footer licence badge, and
+   * category menu icons. For another it kept 1 of 9 product photos and dropped 8,
+   * because the slider serves them at 220 px. Class names are the live ones. */
+  const CDN = 'https://ae-pic-a1.aliexpress-media.com/kf/';
+  // chain(outermost, ..., innermost): returns the innermost, linked upward.
+  const chain = (...classes) => classes.reduce((parent, cls) => mkEl('DIV', { cls, parent }), null);
+  const pdp = chain('pdp-info-left--x', 'main-image--wrap--f1', 'image-view-v2--wrap--q', 'slider--wrap--z', 'slider--item--k');
+  const slick = chain('_9HTSH', 'slick-track', 'slick-slide');
+  const footer = chain('footer-copywrite', 'container');
+  const menu = chain('Categoey--categoryContainer--a', 'Categoey--lv1Item--b');
+  const zoneEls = [
+    mkEl('IMG', { src: CDN + 'Sown1aaa.jpg_220x220q75.jpg_.avif', nw: 220, nh: 220, parent: pdp }),
+    mkEl('IMG', { src: CDN + 'Sown2bbb.jpg_220x220q75.jpg_.avif', nw: 220, nh: 220, parent: pdp }),
+    mkEl('IMG', { src: CDN + 'Sown1aaa.jpg_960x960q75.jpg_.avif', nw: 915, nh: 915, parent: pdp }),
+    mkEl('IMG', { src: CDN + 'Sown3ccc.jpg_220x220q75.jpg_.avif?v=1', nw: 0, nh: 0, parent: pdp }),
+    mkEl('IMG', { src: CDN + 'Splayicon.png_.avif', nw: 48, nh: 48, parent: pdp }),
+    mkEl('IMG', { src: CDN + 'Srelated1.jpg', nw: 800, nh: 800, parent: slick }),
+    mkEl('IMG', { src: CDN + 'Srelated2.jpg', nw: 800, nh: 800, parent: slick }),
+    mkEl('IMG', { src: CDN + 'Slicence.png', nw: 1228, nh: 1228, parent: footer }),
+    mkEl('IMG', { src: CDN + 'Smenuicon.png', nw: 1024, nh: 1024, parent: menu }),
+  ];
+  const zRes = await runListing({ href: 'https://he.aliexpress.com/item/1005007252144239.html',
+    bodyText: 'x'.repeat(2500), els: zoneEls }).read();
+  eq('the gallery is the product zone only, full size, slider order, deduped',
+    zRes.gallery, [CDN + 'Sown1aaa.jpg', CDN + 'Sown2bbb.jpg', CDN + 'Sown3ccc.jpg']);
+  eq('galleryScope says the product container was found', zRes.galleryScope, 'product');
+  eq('other products are counted by zone, never returned as the product',
+    zRes.excludedImages, { carousel: 2, footer: 1, menu: 1 });
+  ok('a 48 px play icon in the product zone is not a product photo',
+    !zRes.gallery.some((u) => /Splayicon/.test(u)), JSON.stringify(zRes.gallery));
+  ok('an image not loaded yet (0 px) in the product zone is kept',
+    zRes.gallery.includes(CDN + 'Sown3ccc.jpg'), JSON.stringify(zRes.gallery));
+  ok('no gallery URL carries a query string (the Chrome connector blocks it)',
+    !zRes.gallery.some((u) => u.includes('?')), JSON.stringify(zRes.gallery));
+  ok('no unscoped warning when the container was found',
+    !zRes.warnings.some((w) => /gallery-unscoped/.test(w)), JSON.stringify(zRes.warnings));
+
+  // No product container at all: fall back to every big image, LOUDLY.
+  const fbRes = await runListing({ href: 'https://he.aliexpress.com/item/1.html', bodyText: 'x'.repeat(2500),
+    els: [mkEl('IMG', { src: CDN + 'Sloose.jpg', nw: 800, nh: 800 })] }).read();
+  eq('without the container the gallery is unscoped', fbRes.galleryScope, 'unscoped');
+  eq('the fallback still returns the big images', fbRes.gallery, [CDN + 'Sloose.jpg']);
+  ok('and it says so in warnings', fbRes.warnings.some((w) => /gallery-unscoped/.test(w)), JSON.stringify(fbRes.warnings));
+
+  /* (g) THE DESCRIPTION NEVER REACHED `text` (measured 2026-09-29). It
+   * renders in a SHADOW ROOT under #nav-description, and `text` came from
+   * body.innerText, which never includes shadow content: "Weight: about
+   * 750 g" was on screen and absent from `text`. In a hidden tab the shadow
+   * content is not rendered at all, although the page requested the
+   * description document; fetching that URL returned 200 with the text and
+   * 17 images. */
+  const DESC_URL = 'https://pdp.aliexpress-media.com/product/description/pc/v2/en_US/desc.htm?productId=1&key=k&token=t';
+  const descBody = 'Item type: 3 in 1 Rotary Cheese Grater Weight: about 680 g Package includes: 1 x grater';
+
+  // (g1) rendered: the shadow tree under #nav-description holds it.
+  const descBox = mkEl('DIV', { id: 'nav-description', cls: 'description--wrap--LscZ0He' });
+  const shLeaf1 = mkEl('LI', { text: descBody });
+  const shLeaf2 = mkEl('LI', { text: 'Size: 22 x 12 x 28 cm' });
+  const shStyle = mkEl('STYLE', { text: '.product-description{width:960px;margin:0 auto}' });
+  const shHost = mkEl('DIV', { id: 'product-description', parent: descBox,
+    shadow: mkRoot([shStyle, shLeaf1, shLeaf2]) });
+  const shImg = mkEl('IMG', { src: CDN + 'Sdrawing1.jpg_960x960.jpg', nw: 750, nh: 1200, rootHost: shHost });
+  shHost.shadowRoot = mkRoot([shStyle, shLeaf1, shLeaf2, shImg]);
+  descBox.querySelectorAll = () => [shHost];
+  descBox.childNodes = [shHost];
+  let fetches = 0;
+  const rRes = await runListing({ href: 'https://he.aliexpress.com/item/1.html', bodyText: 'x'.repeat(2500),
+    els: [descBox, shHost], win: { fetch: async () => { fetches++; return {}; } } }).read();
+  eq('a rendered description is read from its shadow tree', rRes.description.source, 'rendered');
+  ok('its text reaches `text` (body.innerText never had it)', /\[DESCRIPTION\].*Weight: about 680 g/.test(rRes.text),
+    rRes.text.slice(-160));
+  ok('the shadow root\'s CSS is not product text', !/margin:0 auto/.test(rRes.text), rRes.text.slice(-160));
+  ok('its size line reaches sizeLines', rRes.productSizeLines.some((t) => /22 x 12 x 28 cm/.test(t)),
+    JSON.stringify(rRes.productSizeLines));
+  eq('its images are the descriptionImages, at full size', rRes.descriptionImages, [CDN + 'Sdrawing1.jpg']);
+  eq('a rendered description counts its images (review finding F11)', rRes.description.imageCount, 1);
+  eq('a rendered description costs no request', fetches, 0);
+
+  /* (g1b) TEXT ORDER (review finding F7, confirmed in real Chromium). Taking
+   * each element's own text nodes in querySelectorAll order read
+   * "<li><b>Weight:</b> about 680 g</li>" as "about 680 g Weight:", because
+   * the <li> is listed before the <b>. The walk must follow tree order. */
+  const ordBold = mkEl('B', { text: 'Weight:' });
+  const ordLi = mkEl('LI', { nodes: [ordBold, txt(' about 680 g')] });
+  const ordLi2 = mkEl('LI', { nodes: [mkEl('B', { text: 'Material:' }), txt(' Stainless Steel & PP, easy to clean and safe')] });
+  const ordBox = mkEl('DIV', { id: 'nav-description' });
+  const ordHost = mkEl('DIV', { parent: ordBox, shadow: mkRoot([ordLi, ordLi2]) });
+  ordBox.childNodes = [ordHost];
+  ordBox.querySelectorAll = () => [ordHost, ordBold];
+  const oRes = await runListing({ href: 'https://he.aliexpress.com/item/1.html', bodyText: 'x'.repeat(2500),
+    els: [ordBox, ordHost] }).read();
+  ok('a bold label stays before its value', /Weight: about 680 g/.test(oRes.text), oRes.text.slice(-120));
+  ok('two list items do not run together', /680 g Material:/.test(oRes.text), oRes.text.slice(-120));
+
+  // (g2) hidden tab: nothing rendered under #nav-description (only the empty
+  // iframe the page keeps there), so the description is fetched from the URL
+  // the page already requested.
+  const emptyBox = mkEl('DIV', { id: 'nav-description', qsa: [mkEl('IFRAME', {})] });
+  const parsedLeaf = mkEl('LI', { text: 'Size: 30 x 15 x 25 cm' });
+  const parsedText = mkEl('P', { text: descBody });
+  const parsedCss = mkEl('STYLE', { text: 'body{font-size:14px}' });
+  const parsedImg = mkEl('IMG', { attrs: { src: '//ae-pic-a1.aliexpress-media.com/kf/Sspec2.jpg_640x640.jpg' } });
+  const fetchedUrls = [];
+  const win = {
+    performance: { getEntriesByType: () => [{ name: 'https://x.alicdn.com/other.js' }, { name: DESC_URL }] },
+    fetch: async (u) => { fetchedUrls.push(u); return { url: u, text: async () => '<html>' + descBody + '</html>' }; },
+    DOMParser: class { parseFromString() { return {
+      body: mkEl('BODY', { qsa: [parsedCss, parsedText, parsedLeaf, parsedImg], kids: [parsedCss, parsedText, parsedLeaf, parsedImg] }),
+      querySelectorAll: () => [parsedCss, parsedText, parsedLeaf, parsedImg] }; } },
+  };
+  const hRes = await runListing({ href: 'https://he.aliexpress.com/item/1.html', bodyText: 'x'.repeat(2500),
+    els: [emptyBox], win, visibilityState: 'hidden' }).read();
+  eq('an unrendered description makes read() fetch it', hRes.description.source, 'fetched');
+  ok('the fetched document\'s CSS is not product text', !/font-size/.test(hRes.text), hRes.text.slice(-160));
+  eq('from the URL the page itself requested', fetchedUrls, [DESC_URL]);
+  ok('the fetched text reaches `text`', /\[DESCRIPTION\].*Weight: about 680 g/.test(hRes.text), hRes.text.slice(-160));
+  ok('the fetched size line reaches sizeLines', hRes.productSizeLines.some((t) => /30 x 15 x 25 cm/.test(t)),
+    JSON.stringify(hRes.productSizeLines));
+  eq('fetched description images come back full size', hRes.descriptionImages, [CDN + 'Sspec2.jpg']);
+  ok('nothing in the result carries the description query string',
+    !JSON.stringify(hRes).includes('token='), 'query string leaked');
+  eq('the tab is reported hidden', hRes.visibility, 'hidden');
+  ok('and read() warns what that breaks', hRes.warnings.some((w) => /tab-hidden/.test(w)), JSON.stringify(hRes.warnings));
+
+  // (g3) nothing to read: unknown, never "the listing states nothing".
+  const mRes = await runListing({ href: 'https://he.aliexpress.com/item/1.html', bodyText: 'x'.repeat(2500),
+    els: [] }).read();
+  eq('no rendered text and no request: source is missing', mRes.description.source, 'missing');
+  ok('missing is a warning, not silence', mRes.warnings.some((w) => /description-missing.*Do NOT report/.test(w)),
+    JSON.stringify(mRes.warnings));
+  const fRes = await runListing({ href: 'https://he.aliexpress.com/item/1.html', bodyText: 'x'.repeat(2500), els: [],
+    win: { performance: { getEntriesByType: () => [{ name: DESC_URL }] }, fetch: async () => { throw new Error('net'); } } }).read();
+  eq('a failed fetch is named', fRes.description.source, 'fetch-failed');
+  ok('and warned about', fRes.warnings.some((w) => /description-fetch-failed/.test(w)), JSON.stringify(fRes.warnings));
+  eq('a visible-state-less stub reports unknown, not visible', fRes.visibility, 'unknown');
+
+  const fetchedWin = (body, url, extra = {}) => ({
+    performance: { getEntriesByType: () => [{ name: DESC_URL }] },
+    fetch: async () => ({ url: url || DESC_URL, text: async () => '<html>' + body + '</html>' }),
+    DOMParser: class { parseFromString() { const p = mkEl('P', { text: body });
+      return { body: mkEl('BODY', { qsa: [p], kids: [p] }), querySelectorAll: () => [p] }; } },
+    ...extra,
+  });
+
+  /* (g4) review finding F0: seller copy that happens to contain a wall
+   * phrase is the description, not a wall. */
+  const slideBody = 'Please slide the drum into the holder until it clicks. Weight: about 680 g. Package includes 3 drums.';
+  const sRes = await runListing({ href: 'https://he.aliexpress.com/item/1.html', bodyText: 'x'.repeat(2500), els: [],
+    win: fetchedWin(slideBody) }).read();
+  eq('a description saying "please slide" is still fetched', sRes.description.source, 'fetched');
+  ok('and its text is kept', /Please slide the drum/.test(sRes.text), sRes.text.slice(-140));
+  eq('and it raises no wall', sRes.blocked, false);
+
+  /* (g5) review finding F1: a REAL wall on the description fetch must stop
+   * the run like a page wall, not pass as "description unknown". */
+  const wRes = await runListing({ href: 'https://he.aliexpress.com/item/1.html', bodyText: 'x'.repeat(2500), els: [],
+    win: fetchedWin('Sorry, we have detected unusual traffic. Please slide to verify',
+      'https://he.aliexpress.com/_____tmd_____/punish') }).read();
+  eq('a wall on the description fetch is named', wRes.description.source, 'blocked');
+  eq('and raised to the top-level blocked flag', wRes.blocked, true);
+  ok('with the STOP instruction', wRes.warnings.some((w) => /STOP and tell the user/.test(w)), JSON.stringify(wRes.warnings));
+  ok('while the rest of the read is still returned', wRes.gallery !== undefined && wRes.reviews !== undefined);
+  const qRes = await runListing({ href: 'https://he.aliexpress.com/item/1.html', bodyText: 'x'.repeat(2500), els: [],
+    win: fetchedWin('', DESC_URL, { fetch: async () => ({ url: DESC_URL, text: async () => '<html><!-- punish ' + 'y'.repeat(60000) + ' --></html>' }) }) }).read();
+  eq('a quiet wall on the description fetch is a suspect-wall', qRes.description.source, 'suspect-wall');
+  eq('raised as suspectedWall, not blocked', [qRes.blocked, qRes.suspectedWall], [false, true]);
+
+  /* (g6) review findings F2/F8: a description fetch that never settles used
+   * to lose the whole read. The complete result without the description is
+   * stored in `last` BEFORE the fetch; read({ description: false }) skips it. */
+  const hangApi = runListing({ href: 'https://he.aliexpress.com/item/1.html', bodyText: 'x'.repeat(2500), els: zoneEls,
+    win: { performance: { getEntriesByType: () => [{ name: DESC_URL }] }, fetch: () => new Promise(() => {}) } });
+  const hanging = hangApi.read();
+  await new Promise((r) => setImmediate(r));
+  ok('read() is still waiting on the fetch', hangApi.last !== null);
+  eq('`last` already holds the result, marked pending', hangApi.last.description.source, 'pending');
+  eq('with the gallery already in it', hangApi.last.galleryCount, 3);
+  ok('and a warning naming `last`', hangApi.last.warnings.some((w) => /description-pending.*__aeListing\.last/.test(w)),
+    JSON.stringify(hangApi.last.warnings));
+  void hanging;
+  let skipFetches = 0;
+  const kRes = await runListing({ href: 'https://he.aliexpress.com/item/1.html', bodyText: 'x'.repeat(2500), els: [],
+    win: { performance: { getEntriesByType: () => [{ name: DESC_URL }] }, fetch: async () => { skipFetches++; return {}; } } })
+    .read({ description: false });
+  eq('description:false never fetches', skipFetches, 0);
+  eq('and names the description skipped', kRes.description.source, 'skipped');
+  ok('which is a warning, not silence', kRes.warnings.some((w) => /description-skipped.*Do NOT report/.test(w)),
+    JSON.stringify(kRes.warnings));
 }
 
 // ------------------------------------------ two browsers, two locales (2026-09-14)
@@ -1066,6 +1370,29 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
     await winOk.__aeHarvest.step(1);
     const msg3 = await winOk.__aeHarvest.send(9999, { timeoutMs: 50 });
     ok('a working fetch returns the reply and posts no form', /receiver replied 200: saved/.test(msg3) && forms.length === 1, msg3);
+
+    /* A HIDDEN tab must not start the fetch race: the race needs a timer,
+     * and a hidden tab delayed a 2,500 ms timer past the 45 s tool limit
+     * (measured 2026-09-29). The form POST needs no timer. The loopback
+     * fetch here would succeed, so if send() raced at all, it would return
+     * the fetch reply and post no form: both halves are asserted. */
+    const hiddenDoc = { ...doc, visibilityState: 'hidden' };
+    const winHidden = { document: hiddenDoc };
+    let loopbackCalls = 0;
+    new Function('window', 'fetch', src)(winHidden, (url) => {
+      if (url.startsWith('http://127.0.0.1:')) { loopbackCalls++; return Promise.resolve({ status: 200, text: async () => 'saved /tmp/y.json' }); }
+      return Promise.resolve(reply(makePage({ items: [makeItem('h3')] })));
+    });
+    winHidden.__aeHarvest.start({ query: 'wire brush set' });
+    await winHidden.__aeHarvest.step(1);
+    const msg4 = await winHidden.__aeHarvest.send(9999);
+    eq('a hidden tab never calls the loopback fetch', loopbackCalls, 0);
+    ok('a hidden tab posts the form straight away', /^form-posted /.test(msg4) && forms.length === 2, msg4);
+    ok('the reply says why the fetch was skipped', /tab hidden: fetch skipped/.test(msg4), msg4);
+    ok('the reply points at the receiver output, not get_page_text',
+      /receiver prints the saved path in its own output/.test(msg4) && /get_page_text hangs/.test(msg4), msg4);
+    const msg5 = await winHidden.__aeHarvest.send(9999, { via: 'fetch' });
+    ok('an explicit via:"fetch" is still honoured in a hidden tab', /receiver replied 200/.test(msg5) && loopbackCalls === 1, msg5);
   }
   const recv2 = await startReceiver({ dir, port: 0, count: 1, idle: 30 });
   const bad = await fetch('http://127.0.0.1:' + recv2.port + '/harvest', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{"a":1}' });

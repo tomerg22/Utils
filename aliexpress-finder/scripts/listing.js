@@ -1,13 +1,24 @@
 /* AliExpress DETAIL-PAGE reader — expands, then returns text AND images together.
  *
  * Pass the WHOLE contents of this file as the `text` argument of
- * mcp__Claude_Browser__javascript_tool. It installs `window.__aeListing`.
+ * javascript_tool (in-app browser or Chrome connector). It installs
+ * `window.__aeListing`. read() is ASYNC: drive it with a top-level await.
  *
- *   __aeListing.read()            // expand everything, return text + images + specs
- *   __aeListing.read().gallery    // big image URLs, ready for labels.sh
- *   __aeListing.read().reviews    // { own, ownRating, header, pooledNote }
- *   __aeListing.read().variants   // the option selector only; selectedVariant too
- *   __aeListing.changed(fp)       // did the page change since fingerprint fp?
+ *   const r = await __aeListing.read()  // expand, read text + images + specs
+ *   r.gallery                 // the product's OWN photos, full size, slider order
+ *   r.descriptionImages       // images inside the description (drawings, spec tables)
+ *   r.description.source      // 'rendered' | 'fetched' | 'missing' | 'fetch-failed' | 'blocked'
+ *   r.reviews                 // { own, ownRating, header, pooledNote }
+ *   r.variants                // the option selector only; selectedVariant too
+ *   r.warnings, r.visibility  // read these first
+ *   __aeListing.last          // the latest result, stored BEFORE the description
+ *                             // fetch: if read() timed out, read this next call
+ *   await __aeListing.read({ description: false })  // never fetch
+ *   __aeListing.changed(fp)   // did the page change since fingerprint fp?
+ *
+ * The Chrome connector cuts a result at 1,000 characters, so there keep the
+ * result on window (`window.__r = await __aeListing.read()`) and return the
+ * fields you need in small pieces.
  *
  * WHY THIS EXISTS (three measured failures, 2026-08-21, Tapo C222 session)
  *
@@ -43,9 +54,38 @@
  *    => every collector here walks shadowRoot recursively. Never use a bare
  *       document.querySelectorAll for images on a detail page.
  *
- * NO setTimeout / NO async pacing. A hidden Browser pane throttles timers; a
- * waiting loop here times out the whole 30s tool call. Everything is
- * synchronous. Scroll nudges are fire-and-forget.
+ * 4. THE GALLERY WAS OTHER PRODUCTS (measured 2026-09-29).
+ *    "Every image of 400 px or more" returned 15 images for one listing and 8
+ *    of them were not the product: related items (slick-slide carousel), the
+ *    footer business-licence badge, and category menu icons. On a second
+ *    listing it kept 1 of 9 product photos and dropped the other 8, because the
+ *    slider serves them at 220 px. The product's photos all sit under the
+ *    main-image--wrap container.
+ *    => images are sorted by the page zone they sit in; `gallery` is the
+ *       product zone only, restored to full size. Other products are counted
+ *       in `excludedImages`, never returned as the product.
+ *
+ * 5. THE DESCRIPTION NEVER REACHED `text` (measured 2026-09-29).
+ *    The description renders inside a SHADOW ROOT under #nav-description.
+ *    `text` came from document.body.innerText, which never includes shadow
+ *    content: "Weight: about 750 g" was on screen and absent from `text`.
+ *    (The iframe under #nav-description held 3 empty elements whether the tab
+ *    was visible or hidden; it is not the description.) In a HIDDEN tab the
+ *    shadow content is not rendered at all, although the page did request
+ *    the description document; fetching that same URL returned 200 with the
+ *    text and 17 images.
+ *    => the rendered description is read from its shadow tree (textOf), and
+ *       read() fetches the document when the page has not rendered it. It is
+ *       appended to `text` after [DESCRIPTION]. `description.source` says
+ *       which happened; 'missing' means unknown, never "not stated".
+ *
+ * NO setTimeout / NO async pacing. A hidden tab delays timers (measured: a
+ * 100 ms timer fired after 958 ms, a 2,500 ms one had not fired after 45 s),
+ * so any wait inside the page can outlive the tool call. The only await is
+ * the description fetch, which is a network call, not a timer. Scroll
+ * nudges are fire-and-forget. In a hidden tab screenshots, zoom and
+ * get_page_text also hang until the tool times out; read() reports
+ * `visibility` and warns.
  */
 (() => {
   const BIDI_RE = new RegExp('[\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]', 'g');
@@ -184,6 +224,112 @@ function wallVerdict(sig) {
     }
   }
 
+  /* The next node up, crossing a shadow root to its host, so an image inside
+   * the description's shadow tree still finds #nav-description above it. */
+  function up(n) {
+    if (n.parentElement) return n.parentElement;
+    try {
+      const r = n.getRootNode && n.getRootNode();
+      if (r && r.host) return r.host;
+    } catch (e) {}
+    return null;
+  }
+
+  /* Visible text under a root, shadow trees included, IN TREE ORDER.
+   * innerText cannot do this job: it never includes shadow content
+   * (failure 5). A walk that takes each element's own text nodes in
+   * querySelectorAll order is not enough either: for
+   * "<li><b>Weight:</b> about 680 g</li>" it yields "about 680 g Weight:",
+   * because the <li> comes before the <b>. So this recurses through
+   * childNodes. A host's shadow tree is read first, since that is what
+   * renders. <style> and <script> are skipped: the description's shadow
+   * root carries a <style>, and CSS is not product text. Block elements
+   * add a space so "<li>A</li><li>B</li>" does not read "AB". */
+  const SKIP_TEXT = /^(STYLE|SCRIPT|NOSCRIPT|TEMPLATE)$/;
+  const BLOCK = /^(P|DIV|LI|UL|OL|BR|TR|TD|TH|TABLE|H[1-6]|SECTION|ARTICLE|DL|DT|DD)$/;
+  function textOf(root) {
+    const parts = [];
+    const visit = (node, depth) => {
+      if (!node || depth > 200) return;
+      if (node.shadowRoot) visit(node.shadowRoot, depth + 1);
+      for (const c of (node.childNodes || [])) {
+        if (c.nodeType === 3) { parts.push(c.nodeValue); continue; }
+        if (c.nodeType !== 1 || SKIP_TEXT.test(c.tagName || '')) continue;
+        const block = BLOCK.test(c.tagName || '');
+        if (block) parts.push(' ');
+        visit(c, depth + 1);
+        if (block) parts.push(' ');
+      }
+    };
+    visit(root, 0);
+    return clean(parts.join(''));
+  }
+
+  /* Which part of the page an image sits in. Class names are the live ones
+   * (measured 2026-09-29 on two listings); the hash suffix after "--" varies,
+   * so only the stem is matched. The NEAREST matching ancestor wins.
+   *   product      main-image--wrap: the slider and the magnifier
+   *   description  #nav-description / description--wrap (and its shadow tree)
+   *   carousel     slick-slide/-track/-list, "recommend": other products
+   *   footer       footer-copywrite: the business-licence badge
+   *   menu         Categoey--: the category menu icons */
+  function zone(e) {
+    let n = e, d = 0;
+    while (n && d < 60) {
+      const c = typeof n.className === 'string' ? n.className : '';
+      const id = typeof n.id === 'string' ? n.id : '';
+      if (/(^|\s)main-image--/.test(c)) return 'product';
+      if (id === 'nav-description' || /(^|\s)description--wrap/.test(c)) return 'description';
+      if (/(^|\s)slick-(slide|track|list)\b|recommend/i.test(c)) return 'carousel';
+      if (/(^|\s)footer/i.test(c)) return 'footer';
+      if (/(^|\s)Categoey--|(^|\s)category/i.test(c)) return 'menu';
+      n = up(n); d++;
+    }
+    return 'other';
+  }
+
+  /* The full-size asset behind a displayed image. The slider shows
+   * "S…jpg_220x220q75.jpg_.avif"; the original is "S…jpg". The query string
+   * is dropped too, because the Chrome connector blocks any result that
+   * carries one. */
+  function fullSize(u) {
+    let s = String(u || '').split('?')[0];
+    if (s.startsWith('//')) s = 'https:' + s;
+    return s.replace(/(\.(?:jpe?g|png|webp|gif))_[^/]*$/i, '$1');
+  }
+  const stem = (u) => (String(u).split('/').pop() || '').slice(0, 24);
+  const uniqByStem = (list) => {
+    const seen = new Set();
+    return list.filter((u) => { const k = stem(u); if (seen.has(k)) return false; seen.add(k); return true; });
+  };
+
+  /* 'visible', 'hidden' or 'unknown'. See the hidden-tab note in the header. */
+  function visibility() {
+    try {
+      return typeof document.visibilityState === 'string' ? document.visibilityState : 'unknown';
+    } catch (e) { return 'unknown'; }
+  }
+
+  /* Leaves of a DOM tree with their parent's text as context. Measured: the
+   * carton size renders as a bare leaf "12x7x4 סמ" while the qualifier
+   * "גודל החבילה" ("package size") sits in a SIBLING node. Testing the leaf
+   * alone marks the shipping box as if it were the product. */
+  function leavesOf(root, seenLeaf, out) {
+    walk(root, (e) => {
+      if (e.children.length !== 0) return;
+      const t = clean(e.textContent);
+      if (!t || t.length > 300 || seenLeaf.has(t)) return;
+      seenLeaf.add(t);
+      let ctx = '';
+      try {
+        const p = e.parentElement || (e.parentNode && e.parentNode.nodeType === 1 ? e.parentNode : null);
+        ctx = p ? clean(p.textContent).slice(0, 240) : '';
+      } catch (err) { ctx = ''; }
+      out.push({ text: t, context: ctx });
+    });
+    return out;
+  }
+
   const SHOW_MORE = /^(להציג יותר|הצג עוד|show more|see more|view more|לפרטים נוספים)$/i;
 
   /* Size lines. The Hebrew storefront writes ס"מ / סמ / מ"מ; sellers also use
@@ -201,6 +347,18 @@ function wallVerdict(sig) {
   /* A "package" size is the shipping box, not the product. Callers must not
    * confuse the two — this cost a wrong report once already. */
   const PACKAGE_RE = /(חבילה|אריזה|package|packing|shipping)/i;
+
+  /* The description's own URL, from the requests the page already made.
+   * Measured 2026-09-29: pdp.aliexpress-media.com/product/description/pc/v2/
+   * <locale>/desc.htm, with productId/key/token/sellerId/v in the query. The
+   * page requested it even in a hidden tab, but never rendered it there. */
+  function descriptionUrl() {
+    try {
+      const perf = window.performance;
+      const names = perf && perf.getEntriesByType ? perf.getEntriesByType('resource').map((x) => x.name) : [];
+      return names.find((n) => /\/product\/description\/pc\//.test(n)) || null;
+    } catch (e) { return null; }
+  }
 
   const L = {
     /* Click every "show more" so collapsed description text is in the DOM.
@@ -241,13 +399,77 @@ function wallVerdict(sig) {
              now.imgs !== fp.imgs || now.leaves !== fp.leaves;
     },
 
-    /* opts:
-     *   expand      default true  — click "show more" before reading
-     *   minNatural  default 400   — smallest naturalWidth counted as a real
-     *                               product image (icons are 27x27 / 30x30)
-     *   maxText     default 20000
+    /* The product description: rendered text if the page drew it, otherwise
+     * the same document fetched from the URL the page already requested.
+     *   source  'rendered' | 'fetched' | 'missing' | 'fetch-failed'
+     *           | 'blocked' | 'suspect-wall'
+     *           (read() adds 'pending' before the fetch settles and
+     *           'skipped' for read({ description: false }))
+     * Everything except 'rendered' and 'fetched' means UNKNOWN, never "the
+     * listing states nothing": the text may hold the size, weight and
+     * package contents. */
+    async description() {
+      let box = null;
+      walk(document, (e) => {
+        if (box) return;
+        const c = typeof e.className === 'string' ? e.className : '';
+        if (e.id === 'nav-description' || /(^|\s)description--wrap/.test(c)) box = e;
+      });
+      if (box) {
+        // Rendered: its leaves and images are already in the page walk.
+        const text = textOf(box);
+        if (text.length >= 50) return { source: 'rendered', text, leaves: [], images: [] };
+      }
+      const u = descriptionUrl();
+      if (!u) return { source: 'missing', text: '', leaves: [], images: [] };
+      try {
+        const res = await window.fetch(u);
+        const html = await res.text();
+        const Parser = window.DOMParser;
+        const doc = new Parser().parseFromString(html, 'text/html');
+        const text = textOf(doc.body || doc);
+        const images = [];
+        walk(doc, (e) => {
+          if (e.tagName !== 'IMG') return;
+          const s = (e.getAttribute && (e.getAttribute('src') || e.getAttribute('data-src'))) || '';
+          if (/aliexpress-media|alicdn/.test(s)) images.push(fullSize(s));
+        });
+        /* Seller copy can contain a wall phrase ("please slide the drum
+         * in"), so the TEXT markers count only when the fetch returned
+         * nothing usable. The URL (a redirect to the punish page) and the
+         * HTML (the captcha widget) are always checked. A wall here is a
+         * real wall: read() raises it to its own top-level `blocked`. */
+        const usable = text.length >= 50 || images.length > 0;
+        const v = wallVerdict({ url: res.url || '', text: usable ? '' : text, html, dataNodes: usable ? 1 : 0 });
+        if (v.state !== 'clear') {
+          return { source: v.state === 'blocked' ? 'blocked' : 'suspect-wall',
+                   text: '', leaves: [], images: [], wall: v };
+        }
+        const leaves = leavesOf(doc, new Set(), []);
+        return { source: 'fetched', text, leaves, images };
+      } catch (e) {
+        return { source: 'fetch-failed', text: '', leaves: [], images: [], error: String(e).slice(0, 120) };
+      }
+    },
+
+    /* The latest read() result. read() stores a complete result here BEFORE
+     * it awaits the description fetch (description.source 'pending'), and
+     * replaces it when the fetch settles. If read() times out (a stalled
+     * fetch in a hidden tab), return fields from `__aeListing.last` in the
+     * next call instead of losing the whole read. */
+    last: null,
+
+    /* async: `await __aeListing.read()`. It fetches the description when the
+     * page has not rendered it (a hidden tab never does).
+     * opts:
+     *   expand       default true  — click "show more" before reading
+     *   description  default true  — false skips the fetch (source 'skipped')
+     *   minNatural   default 400   — smallest naturalWidth counted when the
+     *                                product-image container is NOT found and
+     *                                the gallery falls back to every big image
+     *   maxText      default 20000
      */
-    read(opts) {
+    async read(opts) {
       opts = opts || {};
       const url = location.href;
       const bodyText = (document.body && document.body.innerText) || '';
@@ -262,10 +484,12 @@ function wallVerdict(sig) {
       // Chrome connector blocks any result holding a query string. The path
       // (/_____tmd_____/punish) still names the wall.
       const pageUrl = (location.origin || '') + (location.pathname || '');
+      const vis = visibility();
       if (verdict.state !== 'clear') {
-        return { blocked: verdict.state === 'blocked',
-                 suspectedWall: verdict.state === 'suspect',
-                 wall: verdict, url: pageUrl.slice(0, 120), note: verdict.note };
+        this.last = { blocked: verdict.state === 'blocked',
+                      suspectedWall: verdict.state === 'suspect',
+                      wall: verdict, url: pageUrl.slice(0, 120), note: verdict.note, visibility: vis };
+        return this.last;
       }
 
       const before = this.fingerprint();
@@ -276,59 +500,41 @@ function wallVerdict(sig) {
       window.scrollTo(0, 0);
       const after = this.fingerprint();
 
-      // ---- text channel -----------------------------------------------
-      /* Leaf text is captured WITH its parent's text as context. Measured: the
-       * carton size renders as a bare leaf "12x7x4 סמ" while the qualifier
-       * "גודל החבילה" ("package size") sits in a SIBLING node. Testing the leaf
-       * alone marks the shipping box as if it were the product. */
-      const leaves = [];
-      const seenLeaf = new Set();
-      walk(document, (e) => {
-        if (e.children.length !== 0) return;
-        const t = clean(e.textContent);
-        if (!t || t.length > 300 || seenLeaf.has(t)) return;
-        seenLeaf.add(t);
-        let ctx = '';
-        try {
-          const p = e.parentElement || (e.parentNode && e.parentNode.nodeType === 1 ? e.parentNode : null);
-          ctx = p ? clean(p.textContent).slice(0, 240) : '';
-        } catch (err) { ctx = ''; }
-        leaves.push({ text: t, context: ctx });
-      });
-
-      const sizeLines = leaves
-        .filter((l) => SIZE_RE.test(l.text) || TRIPLE_RE.test(l.text))
-        .map((l) => ({
-          text: l.text,
-          // The qualifier may live in the leaf OR in its parent — check both.
-          isPackage: PACKAGE_RE.test(l.text) || PACKAGE_RE.test(l.context),
-          context: l.context && l.context !== l.text ? l.context.slice(0, 120) : undefined,
-        }));
-      const ratingLines = leaves
-        .filter((l) => RATING_RE.test(l.text) || WATT_RE.test(l.text))
-        .map((l) => l.text);
+      // ---- text channel (page part) ------------------------------------
+      const pageLeaves = leavesOf(document, new Set(), []);
 
       // ---- image channel ----------------------------------------------
+      /* Images are sorted by WHERE they sit (failure 4). Measured 2026-09-29:
+       * the old "every image of 400 px or more" returned 15 images for one
+       * listing, and 8 were not the product (related items, the footer
+       * licence badge, category menu icons); on another listing it kept one
+       * product photo and dropped the other 8, because the slider serves
+       * them at 220 px. Product photos now come from their container at any
+       * size and are returned at full size, in slider order. */
       const minNat = opts.minNatural == null ? 400 : opts.minNatural;
-      const imgs = [];
+      const own = [], descImgs = [], big = [];
+      const excluded = {};
       walk(document, (e) => {
         if (e.tagName !== 'IMG') return;
-        const u = e.currentSrc || e.src;
-        if (!u || !/aliexpress-media|alicdn/.test(u)) return;
-        imgs.push({ u, nw: e.naturalWidth || 0, nh: e.naturalHeight || 0 });
+        const raw = e.currentSrc || e.src || (e.getAttribute && e.getAttribute('data-src')) || '';
+        if (!raw || !/aliexpress-media|alicdn/.test(raw)) return;
+        const nw = e.naturalWidth || 0, nh = e.naturalHeight || 0;
+        const z = zone(e);
+        if (nw >= minNat) big.push({ u: fullSize(raw), area: nw * nh });
+        // A loaded image under 100 px is a play button or an icon; 0 means
+        // not loaded yet, which lazy slider images often are — keep those.
+        if (nw > 0 && nw < 100) return;
+        if (z === 'product') own.push(fullSize(raw));
+        else if (z === 'description') descImgs.push(fullSize(raw));
+        else if (nw >= minNat) excluded[z] = (excluded[z] || 0) + 1;
       });
-      const seen = new Set();
-      const gallery = imgs
-        .filter((i) => i.nw >= minNat)
-        .sort((a, b) => b.nw * b.nh - a.nw * a.nh)
-        .filter((i) => {
-          // Dedupe by the CDN filename stem — the same asset appears at many
-          // sizes (`....jpg`, `..._960x960.png_.avif`) and must count once.
-          const k = (i.u.split('/').pop() || '').slice(0, 24);
-          if (seen.has(k)) return false;
-          seen.add(k);
-          return true;
-        });
+      let gallery = uniqByStem(own);
+      let galleryScope = 'product';
+      if (!gallery.length) {
+        // Layout changed or the slider did not mount: fall back LOUDLY.
+        galleryScope = 'unscoped';
+        gallery = uniqByStem(big.sort((a, b) => b.area - a.area).map((i) => i.u));
+      }
 
       // ---- variant selector --------------------------------------------
       /* Options come ONLY from the option selector. This used to take any
@@ -355,37 +561,108 @@ function wallVerdict(sig) {
 
       // Review counts, read AFTER expanding: the review block renders lazily.
       const reviews = parseReviewBlock((document.body && document.body.innerText) || '');
+      const pageText = (document.body.innerText || '').replace(/\s+/g, ' ');
 
-      return {
-        blocked: false,
-        url: pageUrl.slice(0, 140),
-        expandedClicks: expanded,
-        fingerprintBefore: before,
-        fingerprint: after,
-        pageGrew: after.height !== before.height || after.textLen !== before.textLen,
-        variants: [...new Set(variants)].slice(0, 40),
-        selectedVariant,
-        // { own, ownRating, header, pooledNote }. `own` is the listing's own
-        // rating count; `header` equals JSON-LD reviewCount and is usually
-        // pooled across other sellers. Rank on `own`; null means unknown.
-        reviews,
-        // Each entry: { text, isPackage, context? }. A `isPackage: true` line is
-        // the SHIPPING CARTON, not the product — never report it as the size.
-        sizeLines: sizeLines.slice(0, 25),
-        productSizeLines: sizeLines.filter((s) => !s.isPackage).map((s) => s.text).slice(0, 10),
-        packageSizeLines: sizeLines.filter((s) => s.isPackage).map((s) => s.text).slice(0, 10),
-        ratingLines: ratingLines.slice(0, 40),
-        galleryCount: gallery.length,
-        gallery: gallery.slice(0, 20).map((i) => i.u),
-        text: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, opts.maxText || 20000),
-        // Loud, because both halves were skipped in the failure this file exists for.
-        reminder: 'Specs printed on the product PHOTO outrank every text field. ' +
-                  'Download `gallery` with labels.sh and READ the label before quoting any rating. ' +
-                  'A size line matching sizeLinesArePackage is the SHIPPING BOX, not the product.',
+      // Everything that depends on the description, built twice: once with
+      // a 'pending' description (stored in `last` before the fetch), once
+      // with the real one.
+      const build = (desc) => {
+        const seen = new Set(pageLeaves.map((l) => l.text));
+        const leaves = pageLeaves.slice();
+        for (const l of desc.leaves) {
+          if (!seen.has(l.text)) { seen.add(l.text); leaves.push(l); }
+        }
+        const sizeLines = leaves
+          .filter((l) => SIZE_RE.test(l.text) || TRIPLE_RE.test(l.text))
+          .map((l) => ({
+            text: l.text,
+            // The qualifier may live in the leaf OR in its parent — check both.
+            isPackage: PACKAGE_RE.test(l.text) || PACKAGE_RE.test(l.context),
+            context: l.context && l.context !== l.text ? l.context.slice(0, 120) : undefined,
+          }));
+        const ratingLines = leaves
+          .filter((l) => RATING_RE.test(l.text) || WATT_RE.test(l.text))
+          .map((l) => l.text);
+        const descriptionImages = uniqByStem([...descImgs, ...desc.images]);
+
+        const warnings = [];
+        let top = { blocked: false };
+        if (galleryScope === 'unscoped') {
+          warnings.push('gallery-unscoped: no product-image container was found, so `gallery` holds ' +
+                        'every big image on the page, including other products. Check each one.');
+        }
+        if (desc.wall) {
+          // A wall answered the description fetch: the same STOP as a page wall.
+          top = { blocked: desc.wall.state === 'blocked', suspectedWall: desc.wall.state === 'suspect',
+                  wall: desc.wall, note: 'description fetch: ' + desc.wall.note };
+          warnings.push('description-' + desc.source + ': a wall answered the description fetch. ' +
+                        (desc.wall.state === 'blocked' ? 'STOP and tell the user this turn (SKILL.md step 2).'
+                                                       : 'Take a screenshot before concluding anything.'));
+        } else if (desc.source === 'pending') {
+          warnings.push('description-pending: the description fetch has not finished. If read() timed out, ' +
+                        'return fields from __aeListing.last in the next call; its description.source ' +
+                        'changes when the fetch settles.');
+        } else if (desc.source !== 'rendered' && desc.source !== 'fetched') {
+          warnings.push('description-' + desc.source + ': the description was not read. Its text often ' +
+                        'holds the size, weight and package contents. Do NOT report those as absent.');
+        }
+        if (vis === 'hidden') {
+          warnings.push('tab-hidden: screenshots, zoom and get_page_text hang until the tool times out, ' +
+                        'and page timers are delayed. Ask the user to bring the browser window to the ' +
+                        'front before any screenshot. javascript_tool keeps working.');
+        }
+
+        return Object.assign(top, {
+          url: pageUrl.slice(0, 140),
+          visibility: vis,
+          warnings,
+          expandedClicks: expanded,
+          fingerprintBefore: before,
+          fingerprint: after,
+          pageGrew: after.height !== before.height || after.textLen !== before.textLen,
+          variants: [...new Set(variants)].slice(0, 40),
+          selectedVariant,
+          // { own, ownRating, header, pooledNote }. `own` is the listing's own
+          // rating count; `header` equals JSON-LD reviewCount and is usually
+          // pooled across other sellers. Rank on `own`; null means unknown.
+          reviews,
+          // Each entry: { text, isPackage, context? }. A `isPackage: true` line is
+          // the SHIPPING CARTON, not the product — never report it as the size.
+          sizeLines: sizeLines.slice(0, 25),
+          productSizeLines: sizeLines.filter((s) => !s.isPackage).map((s) => s.text).slice(0, 10),
+          packageSizeLines: sizeLines.filter((s) => s.isPackage).map((s) => s.text).slice(0, 10),
+          ratingLines: ratingLines.slice(0, 40),
+          // The product's own photos, full size, slider order. `galleryScope`
+          // 'unscoped' means the fallback ran: see `warnings`.
+          galleryScope,
+          galleryCount: gallery.length,
+          gallery: gallery.slice(0, 20),
+          // Images inside the description: dimension drawings and spec tables
+          // usually live here, not in the gallery.
+          descriptionImages: descriptionImages.slice(0, 30),
+          // Big images that are NOT this product, counted by where they sat.
+          excludedImages: excluded,
+          description: { source: desc.source, textLen: desc.text.length, imageCount: descriptionImages.length },
+          text: (pageText + (desc.text ? ' [DESCRIPTION] ' + desc.text : '')).slice(0, opts.maxText || 20000),
+          // Loud, because both halves were skipped in the failure this file exists for.
+          reminder: 'Specs printed on the product PHOTO outrank every text field. ' +
+                    'Download `gallery` AND `descriptionImages` with labels.sh and READ the label before quoting any rating. ' +
+                    'A size line with isPackage: true is the SHIPPING BOX, not the product.',
+        });
       };
+
+      const none = (source) => ({ source, text: '', leaves: [], images: [] });
+      if (opts.description === false) {
+        this.last = build(none('skipped'));
+        return this.last;
+      }
+      this.last = build(none('pending'));
+      const desc = await this.description();
+      this.last = build(desc);
+      return this.last;
     },
   };
 
   window.__aeListing = L;
-  return 'aeListing ready — __aeListing.read() returns text AND images together';
+  return 'aeListing ready — await __aeListing.read() returns text AND images together';
 })()

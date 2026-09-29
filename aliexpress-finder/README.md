@@ -63,15 +63,15 @@ read as they are, never changed.
 | File | Role |
 |------|------|
 | `SKILL.md` | The skill: 8-step workflow plus gotchas verified against the live site |
-| `scripts/harvest.js` | Browser-side paged harvester. Resumable, reads until the result stream is dry, detects the anti-bot wall *before* parsing so a block can never be mistaken for a parse error. Runs unchanged in both browsers: `forceEnglish()` for the logged-out in-app browser, `expose()`/`chunks()` to export through the Chrome connector, both `sold` and `נמכר` parsed, currency per item |
+| `scripts/harvest.js` | Browser-side paged harvester. Resumable, reads until an empty page or a page with no new ids (the server's `finished` flag is not trusted: it was true on every page of a 230-item stream), detects the anti-bot wall *before* parsing so a block can never be mistaken for a parse error. Runs unchanged in both browsers: `forceEnglish()` for the logged-out in-app browser, `expose()`/`chunks()` to export through the Chrome connector, both `sold` and `נמכר` parsed, currency per item, tab `visibility` reported |
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. Reads the embedded `_dida_config_._init_data_` payload (~60 records), falls back to DOM scraping (`₪`, `US $`, `€`, `£`), and flags captcha interstitials |
 | `scripts/receiver.mjs` | Loopback HTTP receiver: `__aeHarvest.send(port)` POSTs the harvest payload to it from either browser and it writes `harvest-<query>-<stamp>.json`, replying with the path. No retyping, no chunking. Exits after one payload or 15 idle minutes |
 | `scripts/decode.mjs` | Fallback decoder: reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps in any order (refuses a partial set), or from a plain payload JSON |
-| `scripts/listing.js` | Detail-page reader. Expands the page, then returns text **and** images in one call; walks the shadow DOM (a bare `querySelectorAll('img')` sees 1 image of dozens), separates product size from carton size, reads options only from the option selector, returns own vs pooled review counts |
+| `scripts/listing.js` | Detail-page reader (`await read()`). Expands the page, then returns text **and** images in one call; walks the shadow DOM (a bare `querySelectorAll('img')` sees 1 image of dozens); `gallery` is the product's own photos only, full size, with other products counted apart; reads the description from its shadow root, or fetches it when a hidden tab left it unrendered; separates product size from carton size, reads options only from the option selector, returns own vs pooled review counts, reports tab `visibility` and warnings |
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). For hardware the label on the case is the spec sheet |
 | `scripts/rank.mjs` | Scoring: shrunk quality + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification, `--constraint` hard requirement filters, absence-is-not-evidence warning, `sold-unparsed` and `own-reviews-unknown` set-asides |
 | `scripts/lib.mjs` | Pure helpers shared by the ranker, the browser files, the step-5 reader and the tests |
-| `scripts/test.mjs` | Test suite — 333 assertions, including the step-5 reader pulled out of `SKILL.md` |
+| `scripts/test.mjs` | Test suite — 410 assertions, including the step-5 reader pulled out of `SKILL.md` |
 
 ## Tests
 

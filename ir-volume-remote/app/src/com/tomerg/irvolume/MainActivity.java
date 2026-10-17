@@ -163,6 +163,9 @@ public class MainActivity extends Activity {
         b.setOnTouchListener((v, ev) -> {
             switch (ev.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
+                    // Without this the ScrollView takes over a finger that drifts while
+                    // holding, cancels the touch, and sending stops mid-press.
+                    v.getParent().requestDisallowInterceptTouchEvent(true);
                     v.setPressed(true);
                     startSending(src.get());
                     return true;

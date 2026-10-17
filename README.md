@@ -146,3 +146,14 @@ See `tv-control/README.md` for pairing, configuration, and the Windows timing
 constraints that shape the design — the suspend window is only a few hundred
 milliseconds wide, which is why a connection is held open and rotated rather
 than opened on demand.
+## ir-volume-remote
+
+Android app that turns a phone's IR blaster into a volume remote for a DIY
+motorized-potentiometer volume kit: hold-to-send VOL+ / VOL-, a 10 s MUTE, and
+a brand test that sends Pioneer, Sony, Onkyo, Yamaha, Denon and other receiver
+codes. Plain Java, built with `build.sh` (no Gradle). Also holds `irsweep.py`,
+the adb tool that swept NEC / RC5 / SIRC codes from the phone to find the kit's
+codes (NEC address 0x00, VOL+ 0x05, VOL- 0x04).
+
+See `ir-volume-remote/README.md` for build, install (including HyperOS without
+a Mi account), tests and the sweep tool.

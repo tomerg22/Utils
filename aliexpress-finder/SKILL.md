@@ -125,7 +125,7 @@ this list is so you do not fight the symptoms:
 
 | Limit | Symptom | What to do |
 |---|---|---|
-| Result cut at **1,000 characters** | `…[TRUNCATED]` | Never return `payload()`. Export with `await __aeHarvest.send(<port>)` to `receiver.mjs` (step 3). `expose(i)` + `get_page_text` is the fallback, visible tab only. |
+| Result cut at **1,000 characters** | `…[TRUNCATED]` | Never return `payload()`. Export with `await __aeHarvest.send(<port>, {via: 'form'})` to `receiver.mjs` (step 3). `expose(i)` + `get_page_text` is the fallback, visible tab only. |
 | Result with a cookie or a **query string** is replaced | `[BLOCKED: Cookie/query string data]` | Never return `document.cookie`, `location.href` of a search page, or any URL with `?`. `start()`/`status()`/`payload()` are already clean; `debugUrl()` is in-app only. |
 | An async IIFE returns `{}` | `(async () => {...})()` → `{}` | Use a **top-level `await`**: `await __aeHarvest.step(6)`. |
 | Call timeout between 25 s and 45 s | `CDP Runtime.evaluate timed out after 45000ms` | Keep `step(6)`; 25 s passed, 45 s failed. In-app died at 30 s (2026-09-14) and at 45 s (2026-09-29), so the unit of work is the same. |
@@ -165,7 +165,7 @@ NOT close the tab first: the harvest lives in that tab's `window`. Since
    receiver gone the tab navigates to an error page. Only the
    `localStorage` backup (and `restore()`) is left then.
 2. In the stuck tab, `__aeHarvest.status()` still answers. Export what you
-   have: `await __aeHarvest.send(<port>)` (hidden, it posts the form and
+   have: `await __aeHarvest.send(<port>, {via: 'form'})` (hidden, it posts the form and
    needs no fetch). The reply starts with `UNCONFIRMED`: the receiver's own
    output must print `saved <path>`. For a detail page, `__aeListing.last`
    holds everything but the description.
@@ -392,7 +392,7 @@ current harvest.
 __aeHarvest.forceEnglish()                      // in-app browser ONLY, once
 __aeHarvest.start({ query: 'wire brush set' })  // returns the plan (path, flags — no URL)
 await __aeHarvest.step(6)                       // repeat until .done (top-level await)
-await __aeHarvest.send(8765)                    // export to receiver.mjs (below)
+await __aeHarvest.send(8765, {via: 'form'})     // export to receiver.mjs (below; curl it first)
 __aeHarvest.restore()                           // a fresh tab: reload the saved harvest
 __aeHarvest.payload()                           // in-app browser: JSON string for decode.mjs
 ```
@@ -528,15 +528,25 @@ met a closed port.)
 
 then in the browser:
 
-**In the in-app browser use `send(8765, {via: 'form'})`, after the curl
-check.** Measured 2026-10-18 (Chromium 152 in the app): every `fetch()` from
-an https page to loopback is refused by the browser itself
-(`net::ERR_BLOCKED_BY_CLIENT`), so a plain `send(8765)` always answers
-`NOT DELIVERED: FETCH-ERROR` there, receiver up or not. In Chrome, plain
-`send(8765)` is right.
+**In both browsers use `send(8765, {via: 'form'})`, after the curl
+check.** Measured 2026-10-18 in both:
+
+- In-app browser (Chromium 152): every `fetch()` from an https page to
+  loopback is refused by the browser itself (`net::ERR_BLOCKED_BY_CLIENT`).
+- Signed-in Chrome (connector): a plain `send(8766)` answered `NOT
+  DELIVERED: FETCH-ERROR TypeError: Failed to fetch` twice, while `curl`
+  showed the receiver up and the receiver logged nothing. No CSP violation
+  fired. `send(8766, {via: 'form'})` then arrived (`saved <path>`, 92
+  items). Chrome 153 used to HOLD such a fetch instead (2026-09-14), so
+  either can happen.
+
+So a plain `send(8765)` normally answers `NOT DELIVERED: FETCH-ERROR` in
+both browsers, receiver up or not. It is safe (the page does not
+navigate), but it never delivers there. The form path keeps a
+`localStorage` backup before it navigates.
 
 ```js
-await __aeHarvest.send(8765)
+await __aeHarvest.send(8765, {via: 'form'})   // both browsers, after: curl -s http://127.0.0.1:8765/
 // fetch reached it: "DELIVERED: sent 91234 chars; receiver replied 200: saved <path> (…)"
 // no receiver:      "NOT DELIVERED: FETCH-ERROR … The page did NOT navigate: the harvest is still here. …"
 // Chrome held it:   "UNCONFIRMED: form-posted 91234 chars to http://127.0.0.1:8765/harvest (fetch held 3000 ms);
@@ -741,7 +751,7 @@ here, between the markers, and run the tests after any change.
   const o = p.offers || {}, ar = p.aggregateRating || {}, rv = parseReviewBlock(tx);
   const sold = tx.match(new RegExp('Reviews\\s*\\S?\\s*' + SOLD_RE.source, 'i')) || tx.match(SOLD_RE);
   // Spec rows a hard requirement is decided on. Edit WANT per requirement.
-  const WANT = ['Type', 'Interface Type', 'Power Type', 'Battery Included'];
+  const WANT = ['Type', 'Interface Type', 'Power Type', 'Power Source', 'Battery Included'];
   const want = (k) => WANT.find((w) => w.toLowerCase() === String(k || '').trim().toLowerCase());
   const spec = {}, opts = [];
   const walk = (r) => { for (const e of r.querySelectorAll('*')) {
@@ -826,7 +836,7 @@ What comes back, and why each field is there (all measured 2026-09-25):
   they are. A "$2.14 keychain" was the 1-key option, not the 9-key pad in its
   title.
 - **`spec`** holds the Specifications rows named in `WANT` (default `Type`,
-  `Interface Type`, `Power Type`, `Battery Included`; edit `WANT` to match
+  `Interface Type`, `Power Type`, `Power Source`, `Battery Included`; edit `WANT` to match
   the user's hard requirements), and `specFrom` says where they came from:
   `dom` (the `specification--prop` rows), `text` (the lines after a
   "Specifications" heading) or `none`. **The class names and the line layout
@@ -994,8 +1004,8 @@ that differs from its own is flagged `rating-may-be-pooled`.
 
 1. `pass` needs a positive statement in a spec row (step-5 `spec`, or
    `listing.js` `specs`), the description, or the product photo. A title
-   "Wired" with a spec row `Type: 2.4Ghz Wireless` or `Power Type:
-   Rechargeable` is a `fail`: say the two disagree.
+   "Wired" with a spec row `Type: 2.4Ghz Wireless`, `Power Type:
+   Rechargeable` or `Power Source: Rechargeable` is a `fail`: say the two disagree.
 2. `fail` needs a statement that contradicts the requirement.
 3. Anything else is `unknown`, including `specFrom: 'none'` and a
    description that was not read. `unknown` is held out of `ranked`.
@@ -1159,8 +1169,8 @@ splits a size line; the nearest label decides carton vs product;
 
 A third review, at higher effort (six reviewers, the listing cases run in real
 Chromium), confirmed about 50 more, all fixed with tests that fail on the
-reviewed code. What changes how to work: **in the in-app browser export with
-`send(8765, {via: 'form'})`** (it blocks every loopback fetch); a bare size
+reviewed code. What changes how to work: **export with
+`send(8765, {via: 'form'})`** (the in-app browser blocks every loopback fetch, and the live check the same day found signed-in Chrome refusing it too); a bare size
 takes its label from the element before it (a table cell, a `<dt>`, a span);
 "Packaging", "Box" and "Carton" sizes are cartons; carousel titles are never
 this product's sizes; relevance matches whole words and their inflections

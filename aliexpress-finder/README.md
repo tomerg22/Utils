@@ -73,7 +73,7 @@ read as they are, never changed.
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). For hardware the label on the case is the spec sheet |
 | `scripts/rank.mjs` | Scoring: shrunk quality (the listing's own rating in final mode) + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification, `--constraint` hard requirement filters, absence-is-not-evidence, off-query and tie-at-cutoff warnings, `sold-unparsed` and `own-reviews-unknown` set-asides, strict flag values |
 | `scripts/lib.mjs` | Pure helpers shared by the ranker, the browser files, the step-5 reader and the tests |
-| `scripts/test.mjs` | Test suite — 755 assertions, including the step-5 reader pulled out of `SKILL.md` and the harvest scenarios run on the `dist` copy |
+| `scripts/test.mjs` | Test suite — 761 assertions, including the step-5 reader pulled out of `SKILL.md` and the harvest scenarios run on the `dist` copy |
 
 ## Tests
 

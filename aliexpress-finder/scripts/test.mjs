@@ -2130,6 +2130,20 @@ await block('step5 spec', async () => {
   eq('the text fallback reads the rows after "Specifications"', [g2.spec, g2.specFrom], [{ Type: '2.4Ghz Wireless', 'Power Type': 'Rechargeable' }, 'text']);
   const g3 = JSON.parse(new Function('document', 'location', 'return (' + step5 + '\n)')({ ...doc2, body: { innerText: RV.gyro } }, { pathname: '/item/1.html' }));
   eq('no rows: specFrom none, spec empty', [g3.spec, g3.specFrom], [{}, 'none']);
+  // Live 2026-10-18: a vertical mouse titled "Wired" had spec rows "Type: 2.4Ghz Wireless",
+  // "Battery Included: Yes" and "Power Source: Rechargeable". WANT had no "Power Source",
+  // so that row never came back.
+  const els4 = [specEl('Type', '2.4Ghz Wireless'), specEl('Battery Included', 'Yes'), specEl('Power Source', 'Rechargeable')];
+  const g4 = JSON.parse(new Function('document', 'location', 'return (' + step5 + '\n)')(
+    { title: 'Mouse', body: { innerText: RV.gyro }, querySelectorAll: (sel) => (/ld\+json/.test(sel) ? ldj : els4) }, { pathname: '/item/1005006743691875.html' }));
+  eq('step 5 returns the "Power Source" row from the DOM', g4.spec, { Type: '2.4Ghz Wireless', 'Battery Included': 'Yes', 'Power Source': 'Rechargeable' });
+  const g5 = JSON.parse(new Function('document', 'location', 'return (' + step5 + '\n)')(
+    { ...doc2, body: { innerText: 'x\nSpecifications\nPower Source\nRechargeable\nType\nWired\nDescription\n' + RV.gyro } }, { pathname: '/item/1.html' }));
+  eq('step 5 returns the "Power Source" row from the text fallback', [g5.spec, g5.specFrom], [{ 'Power Source': 'Rechargeable', Type: 'Wired' }, 'text']);
+  const all5 = [...els, specEl('Power Source', 'Rechargeable via USB-C cable')];
+  const out5 = new Function('document', 'location', 'return (' + step5 + '\n)')(
+    { title: 'Mouse', body: { innerText: RV.gyro }, querySelectorAll: (sel) => (/ld\+json/.test(sel) ? ldj : all5) }, { pathname: '/item/1005007038434772.html' });
+  ok('five spec rows plus 13 options still fit the 1,000-character cap', out5.length < 1000 && JSON.parse(out5).spec['Power Source'] != null, String(out5.length));
 });
 
 console.log('\nextract.js — a version number in the title is not the rating (finding 7)');
@@ -2698,7 +2712,13 @@ await block('W3', async () => {
     ? Promise.resolve({ status: 200, text: async () => longPath }) : Promise.resolve(reply(makePage({ items: [makeItem('s3')], finished: true }))));
   const m3 = await H3.send(9999);
   ok('a long saved path comes back whole', m3.includes('(1234 chars, 3 items)'), m3);
-  ok('SKILL.md tells the in-app operator to use {via: \'form\'}', /In the in-app browser use `send\(8765, \{via: 'form'\}\)`/.test(skillSrc));
+  ok('SKILL.md tells the operator to use {via: \'form\'} in both browsers', /In both browsers use `send\(8765, \{via: 'form'\}\)`/.test(skillSrc));
+  // Live 2026-10-18: signed-in Chrome refused the loopback fetch (FETCH-ERROR) with the
+  // receiver up, so "In Chrome, plain send(8765) is right" sent the operator the wrong way.
+  ok('SKILL.md no longer says plain send(8765) is right in Chrome', !/In Chrome, plain\s+`send\(8765\)` is right/.test(skillSrc));
+  ok('no SKILL.md example calls a bare send(8765) or send(<port>)', !/__aeHarvest\.send\((8765|<port>)\)/.test(skillSrc),
+    (skillSrc.match(/__aeHarvest\.send\((8765|<port>)\)[^\n]*/g) || []).join(' | '));
+  ok('a refused fetch names signed-in Chrome too', /signed-in Chrome/.test(m), m);
 });
 
 console.log('\nW4 — receiver.mjs: write errors, same-millisecond names, flag forms');

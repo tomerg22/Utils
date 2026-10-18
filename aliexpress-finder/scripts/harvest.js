@@ -736,7 +736,7 @@ function queryRelevance(query, titles) {
           return 'NOT DELIVERED: FETCH-ERROR ' + res.error + ' - nothing is listening on port ' + (port || 8765) +
                  ', or the browser refused the request. The page did NOT navigate: the harvest is still here. ' +
                  'Check the receiver: curl -s http://127.0.0.1:' + (port || 8765) + '/ must answer "ok". If it does, ' +
-                 'the browser blocks loopback fetches (the in-app browser always does): send(' + (port || 8765) +
+                 'the browser blocks loopback fetches (the in-app browser always does, and signed-in Chrome did on 2026-10-18): send(' + (port || 8765) +
                  ', {via:"form"}) posts the form instead.';
         }
         // Still in flight: it may land later, so this is not "not delivered".

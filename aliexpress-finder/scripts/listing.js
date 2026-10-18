@@ -900,7 +900,7 @@ function wallVerdict(sig) {
         if (specs.source === 'none' || specs.source === 'text-raw') {
           warnings.push('specs-not-found: no Specifications rows were read' +
                         (specs.source === 'text-raw' ? ' by name; the raw lines are in `specsText`' : '') +
-                        '. A hard requirement (Type, Power Type, Interface Type, Battery Included) is UNKNOWN until ' +
+                        '. A hard requirement (Type, Power Type, Power Source, Interface Type, Battery Included) is UNKNOWN until ' +
                         'you read it from `specsText`, `text` or a screenshot.');
         } else if (specs.source === 'text') {
           warnings.push('specs-from-text: the rows were matched by NAME from the page text, not read from the spec ' +

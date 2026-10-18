@@ -1,12 +1,14 @@
 /* AliExpress PAGED search harvester — resumable, block-aware.
  *
- * Pass the WHOLE contents of this file as the `text` argument of
- * mcp__Claude_Browser__javascript_tool. It installs `window.__aeHarvest`
- * and returns a short status string. Then drive it:
+ * Pass the WHOLE contents of this file (or of dist/harvest.min.js, the same
+ * code without comments, built by scripts/build.mjs) as the `text` argument
+ * of javascript_tool. It installs `window.__aeHarvest` and returns a short
+ * status string. Then drive it:
  *
  *   __aeHarvest.start({ query: 'wire brush set' })   // returns the plan
- *   __aeHarvest.step(8)                              // repeat until done
- *   __aeHarvest.payload()                            // JSON for rank.mjs
+ *   await __aeHarvest.step(6)                        // repeat until done
+ *   await __aeHarvest.send(8765)                     // payload -> receiver.mjs
+ *   __aeHarvest.restore()                            // reload a saved harvest
  *
  * WHY THIS EXISTS (measured 2026-08-21)
  * extract.js reads ONE page of ~60 records. That made recall a function of
@@ -29,8 +31,9 @@
  *    The anti-bot page (/_____tmd_____/punish, rotating x5secdata, a
  *    `nc_1_nocaptcha` slider) has no payload, so a naive parser just returns
  *    null and the caller logs "parse failed" and moves on. That happened.
- *    blockedBy() is checked BEFORE parsing and sets stop='blocked', which the
- *    caller MUST surface to the user immediately — see SKILL.md step 2.
+ *    wallVerdict() is checked BEFORE parsing and sets stop='blocked' (or
+ *    'suspect-wall' for a quiet one), which the caller MUST surface to the
+ *    user immediately — see SKILL.md step 2.
  *
  * 2. RESUMABILITY. javascript_tool dies at 30s, which is ~8-12 fetches. State
  *    lives on window so step() can be called repeatedly across tool calls.
@@ -87,7 +90,7 @@
   function parseSold(raw) {
     if (raw == null) return null;
     const s = String(raw)
-      .replace(/[‎‏‪-‮⁦-⁩]/g, '')
+      .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '')
       .replace(/\s+/g, '')
       .replace(/\+/g, '');
     if (!s) return null;
@@ -235,6 +238,219 @@ function wallVerdict(sig) {
 }
 /* @shared:wallVerdict:end */
 
+/* @shared:queryRelevance:start */
+/* Do the result titles belong to the query at all?
+ *
+ * WHY (measured 2026-10-17, the wired-USB-mouse session): the slug
+ * `wholesale-wired-usb-mouse` was served as craft wire. 281 of 282 items
+ * were copper or aluminium wire, the stream ran dry, and the harvest said
+ * `exhausted-all-results` with no warning. rank.mjs then ranked
+ * "Aluminum Craft Wire 20 Gauge" first. Nothing compared a title with the
+ * query, so a whole off-category stream looked like a complete harvest.
+ *
+ * THE RULE: a title is on-query when it holds AT LEAST ONE query keyword as
+ * a whole word or a simple inflection of it (see `stemWord`: plurals,
+ * -er/-ing/-ed, mice/mouse; "wire" is not "wired"). The craft wire holds
+ * none of "wired", "usb", "mouse", so the live case is caught.
+ *
+ * WHY SO LOOSE (review of the fix, 2026-10-18): a stricter "head word"
+ * rule needs to know which keyword is the noun. Taking the last word failed
+ * on "mouse wired" and "mouse for computer"; a list of qualifier words
+ * failed on "rc car", "coil spring" and "faux leather", whose last word is
+ * the noun but was on the list. A false alarm makes the operator throw a
+ * good harvest away, so the check must never fire on a correct stream. The
+ * cost: an off stream that shares one keyword passes (craft wire for
+ * "wire brush set"). `keywordShare` gives the share per keyword, so a low
+ * share on the noun can still be seen by eye.
+ *
+ * A title holding a Hebrew, Arabic or Cyrillic word cannot be compared with
+ * English keywords: on the Hebrew storefront "כבל USB Type C Samsung" is a
+ * cable whose noun is Hebrew. Such titles are not counted; when they are
+ * half or more, the stream is unmeasured, never off-query.
+ */
+function queryRelevance(query, titles) {
+  var STOP = /^(and|for|the|with|set|sets|pcs|pc|new|of|in|on|to|a|an|kit|lot)$/;
+  var words = function (s) { return String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean); };
+  // Each keyword once: "usb c to usb c cable" counted usb twice.
+  var toks = words(query).filter(function (t, i, a) { return t.length >= 2 && !STOP.test(t) && a.indexOf(t) === i; });
+  var list = (titles || []).map(function (t) { return String(t || ''); }).filter(Boolean);
+  if (!toks.length) return { measured: false, reason: 'no-query-keywords', checked: 0 };
+  var latin = list.filter(function (t) {
+    return (t.match(/[a-z]/gi) || []).length >= 3 && !/[\u0590-\u05ff\u0600-\u06ff\u0400-\u04ff]{2}/.test(t);
+  });
+  if (!list.length || latin.length * 2 < list.length) {
+    return { measured: false, reason: list.length ? 'titles-not-latin' : 'no-titles', checked: 0, keywords: toks };
+  }
+  /* Latin script is not English: a Spanish or German account's titles
+   * ("Ratón inalámbrico para PC", "Kabellose Maus mit USB") cannot match
+   * English keywords either. Their function words give them away. */
+  var FOREIGN = /(^|[^a-z])(para|con|und|mit|für|pour|avec|sans|sin|por|les|des|une|della|voor|och)([^a-z]|$)/i;
+  var foreign = latin.filter(function (t) { return FOREIGN.test(t); }).length;
+  if (foreign * 10 >= latin.length * 3) {
+    return { measured: false, reason: 'titles-not-english', checked: 0, keywords: toks };
+  }
+  /* One word for its simple forms: plurals (boxes, cables, knives, mice),
+   * -er/-ing/-ed (charger, charging), -ier/-ying (magnifier, magnifying).
+   * A base must keep 4+ letters, so "wired" stays "wired", never "wire".
+   * A shared PREFIX is not a shared word: "water" and "waterproof",
+   * "table" and "tablet" used to match (review, 2026-10-18). */
+  var IRREGULAR = { mice: 'mouse', men: 'man', women: 'woman', feet: 'foot', teeth: 'tooth', children: 'child', geese: 'goose' };
+  var stemWord = function (w) {
+    if (IRREGULAR[w]) return IRREGULAR[w];
+    if (w.length > 5 && /ives$/.test(w)) return w.slice(0, -4) + 'ife';
+    if (w.length > 5 && /ves$/.test(w)) return w.slice(0, -3) + 'f';
+    if (w.length > 4 && /ies$/.test(w)) return w.slice(0, -3) + 'y';
+    if (w.length > 5 && /ying$/.test(w)) return w.slice(0, -4) + 'y';
+    if (/(s|x|z|ch|sh)es$/.test(w) && w.length > 5) return w.slice(0, -2);
+    var m = w.match(/^(.{4,}?)(ings|ing|ers|er|ed|s)$/);
+    var b = m ? m[1] : w;
+    return b.replace(/i$/, 'y');
+  };
+  var has = function (ws, t) {
+    var st = stemWord(t);
+    return ws.some(function (w) { return w === t || stemWord(w) === st; });
+  };
+  var per = {};
+  toks.forEach(function (k) { per[k] = 0; });
+  var on = 0;
+  var off = [];
+  latin.forEach(function (t) {
+    var ws = words(t);
+    var hit = false;
+    toks.forEach(function (k) { if (has(ws, k)) { per[k]++; hit = true; } });
+    if (hit) on++;
+    else if (off.length < 3) off.push(t.slice(0, 60));
+  });
+  var r3 = function (x) { return Math.round(x * 1000) / 1000; };
+  var keywordShare = {};
+  toks.forEach(function (k) { keywordShare[k] = r3(per[k] / latin.length); });
+  var share = on / latin.length;
+  var warn = latin.length >= 5 && share < 0.5;
+  return {
+    measured: true, keywords: toks, keywordShare: keywordShare,
+    checked: latin.length, onQuery: on, share: r3(share),
+    offSample: off,
+    warning: warn
+      ? 'off-query-results: only ' + on + ' of ' + latin.length + ' titles hold any of the keywords [' +
+        toks.join(', ') + ']. The site served another category (e.g. ' + JSON.stringify(off[0] || '') +
+        '). This is NOT a complete harvest of the product: do not report it as exhausted-all-results. ' +
+        'Re-word the query and say so to the user.'
+      : null,
+  };
+}
+/* @shared:queryRelevance:end */
+
+  /* Visible-ish text of a fetched page: the HTML without scripts, styles and
+   * tags. wallVerdict's "big HTML, no content" rule compares HTML size with
+   * TEXT size. Passing the HTML as the text (as this file used to) made the
+   * two equal, so a large quiet interstitial with no "punish" string could
+   * never be called a suspected wall and was reported as a parse-error. */
+  function pageText(html) {
+    return String(html || '')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ').trim();
+  }
+
+  /* BACKUP. A harvest lives only in this tab's `window`. send() falls back to
+   * a form POST, which is a navigation, and a hung fetch can force the tab
+   * closed: either way the harvest was gone (measured 2026-10-17, lost
+   * twice: the receiver had exited, send() posted the form to the dead port,
+   * and the tab went to chrome-error://). So the state is written to
+   * localStorage after every page and before any form POST. localStorage
+   * belongs to the origin, not the tab: a fresh tab on he.aliexpress.com can
+   * call restore() and carry on from the next unread page. */
+  const BACKUP_PREFIX = '__aeHarvest:';
+  /* One key per RUN: prefix + slug + ':' + start time. A key per query let
+   * restore() hand back an older run of the same query (other filters,
+   * already exhausted) when the current run had not saved yet, and a key
+   * nobody deleted stayed forever. Only the newest MAX_BACKUPS runs are kept,
+   * and when the store is full the older runs are dropped and the save is
+   * tried once more (review of the fix, 2026-10-18). */
+  const MAX_BACKUPS = 3;
+  function storage() {
+    try { return window.localStorage || null; } catch (e) { return null; }
+  }
+  const FIELDS = ['query', 'slug', 'base', 'fourStar', 'extra', 'startPage', 'maxPages', 'maxRequests',
+    'page', 'requests', 'items', 'pages', 'claimedTotal', 'stop', 'endSignal', 'lastErr', 'wall', 'startedAt'];
+  const keyOf = (st) => BACKUP_PREFIX + st.slug + ':' + Number(st.startedAt || 0).toString(36);
+  const parseKey = (k) => {
+    const rest = k.slice(BACKUP_PREFIX.length);
+    const at = rest.lastIndexOf(':');
+    return at < 0 ? { slug: rest, stamp: 0 } : { slug: rest.slice(0, at), stamp: parseInt(rest.slice(at + 1), 36) || 0 };
+  };
+  function backupKeys() {
+    const ls = storage();
+    const out = [];
+    if (!ls) return out;
+    try {
+      for (let i = 0; i < ls.length; i++) {
+        const k = ls.key(i);
+        if (k && k.indexOf(BACKUP_PREFIX) === 0) out.push(k);
+      }
+    } catch (e) { /* storage blocked */ }
+    return out.sort((x, y) => parseKey(y).stamp - parseKey(x).stamp); // newest first
+  }
+  function prune(ls, keepKey, max) {
+    let kept = 0;
+    for (const k of backupKeys()) {
+      if (k === keepKey) continue;
+      if (kept < max - 1) { kept++; continue; }
+      try { ls.removeItem(k); } catch (e) { /* ignore */ }
+    }
+  }
+  function persist(st) {
+    const ls = storage();
+    if (!ls) return { ok: false, err: 'localStorage unavailable' };
+    const o = { v: 2, savedAt: Date.now() };
+    FIELDS.forEach((k) => { o[k] = st[k]; });
+    const text = JSON.stringify(o);
+    const key = keyOf(st);
+    /* When the store is FULL, older runs are dropped one at a time, oldest
+     * first, until this one fits. Any other error drops nothing (it used to
+     * delete every other backup first). If this run still cannot be saved,
+     * its OWN older save is removed too: restored, it would hold fewer pages
+     * and fewer requests than were spent, and say restored:true (review,
+     * 2026-10-18). status().backup then says saved:false: send() at once. */
+    const quota = (e) => /quota/i.test(String(e && e.name) + ' ' + String(e && e.message));
+    let saved = false, lastErr = null;
+    for (let tries = 0; tries < 12 && !saved; tries++) {
+      try { ls.setItem(key, text); saved = true; } catch (e) {
+        lastErr = e;
+        if (!quota(e)) break;
+        const older = backupKeys().filter((k) => k !== key);
+        if (!older.length) break;
+        try { ls.removeItem(older[older.length - 1]); } catch (e2) { break; }
+      }
+    }
+    if (!saved) {
+      try { ls.removeItem(key); } catch (e) { /* ignore */ }
+      return { ok: false, err: noQ(String(lastErr)).slice(0, 100) };
+    }
+    prune(ls, key, MAX_BACKUPS);
+    return { ok: true, key, chars: text.length, items: st.items.length };
+  }
+  /* A number, or a string of digits. '', ' ', false and [] are refused:
+   * Number() turns each of them into 0, a silent zero budget. */
+  /* No "?" in anything returned: the Chrome connector blocks a result that
+   * looks like it holds a query string, and a JSON error message can quote
+   * one ("...?x=1"...). */
+  const noQ = (x) => String(x == null ? '' : x).split('?').join('%3F');
+  const filterKey = (st) => {
+    let h = 5381;
+    const t = (st.fourStar === false ? '0' : '4') + '|' + (st.extra || '');
+    for (let k = 0; k < t.length; k++) h = ((h * 33) ^ t.charCodeAt(k)) >>> 0;
+    return h.toString(36);
+  };
+  const num = (v, dflt, name) => {
+    if (v == null) return dflt;
+    const ok = (typeof v === 'number' && Number.isInteger(v) && v >= 0) ||
+               (typeof v === 'string' && /^\s*\d+\s*$/.test(v));
+    if (!ok) throw new Error('harvest: ' + name + ' must be a whole number >= 0, got ' + JSON.stringify(v));
+    return Number(v);
+  };
+
   /* The SSR payload sits behind an `init-data-start` comment marker and is a
    * JS object literal whose TOP-LEVEL key is unquoted (`= { data: {...} }`),
    * so JSON.parse on the outer object fails. The object after `data:` IS
@@ -294,16 +510,31 @@ function wallVerdict(sig) {
      *               unrated and <4.0 items, so this removes nothing it would
      *               have kept — it just stops wasting requests on rows that
      *               get dropped anyway.
-     *   maxPages    default 20   (AliExpress hard ceiling is page 60)
-     *   maxRequests default 24   (the wall tripped near 50-60 in a session)
+     *   maxPages    default 20   the LAST page number read (AliExpress hard
+     *               ceiling is page 60)
+     *   maxRequests default 24   (the wall tripped near 50-60 in a session).
+     *               0 means "no request left": it is NOT replaced by the
+     *               default (it used to be, so a fully spent budget became 24)
+     *   startPage   default 1    first page to fetch. A recovery harvest that
+     *               cannot restore() starts after the pages already saved,
+     *               instead of spending its budget on them again
      *   extra       raw extra query string, e.g. '&shpf_co=CN' or
      *               '&attr=11795-4362329' (attribute ids come from the
      *               searchRefineFilters module — see SKILL.md step 1)
+     *
+     * Refused while a step() loop runs: a second state would start a second
+     * loop beside the first, both fetching, and only one counted.
      */
     start(opts) {
       opts = opts || {};
+      if (this.st && this.st.running) {
+        throw new Error('harvest: a step() loop is still running. Poll status() until running is false, then start().');
+      }
       const slug = slugify(opts.query);
       if (!slug) throw new Error('harvest: opts.query is required (English keywords)');
+      const maxPages = num(opts.maxPages, 20, 'maxPages');
+      const maxRequests = num(opts.maxRequests, 24, 'maxRequests');
+      const startPage = Math.max(1, num(opts.startPage, 1, 'startPage'));
       let base = 'https://he.aliexpress.com/w/wholesale-' + slug +
                  '.html?SortType=total_tranpro_desc';
       if (opts.fourStar !== false) base += '&selectedSwitches=filterCode%3A4StarRating';
@@ -312,13 +543,15 @@ function wallVerdict(sig) {
         query: opts.query, slug, base,
         fourStar: opts.fourStar !== false,
         extra: opts.extra || null,
-        maxPages: opts.maxPages || 20,
-        maxRequests: opts.maxRequests || 24,
-        page: 0, requests: 0,
+        startPage, maxPages, maxRequests,
+        page: startPage - 1, requests: 0,
         seen: new Set(), items: [], pages: [],
         claimedTotal: null, stop: null, endSignal: null, lastErr: null, wall: null,
-        running: false,
+        running: false, backup: null, startedAt: Date.now(),
       };
+      // Saved at once, so a hang on page 1 can never leave an older run of
+      // this query as the newest backup.
+      this.st.backup = persist(this.st);
       /* No query string in anything returned to the operator. The Chrome
        * connector replaces a whole result with "[BLOCKED: Cookie/query string
        * data]" when it contains one (measured 2026-09-14); the in-app browser
@@ -327,7 +560,86 @@ function wallVerdict(sig) {
                searchPath: '/w/wholesale-' + slug + '.html',
                sort: 'total_tranpro_desc', fourStar: this.st.fourStar,
                extraApplied: !!this.st.extra,
-               maxPages: this.st.maxPages, maxRequests: this.st.maxRequests };
+               startPage, maxPages, maxRequests };
+    },
+
+    /* Reload a harvest saved in localStorage (see BACKUP above), in this tab
+     * or a fresh one on the same origin. With no query, the newest backup is
+     * taken. The state comes back as it was saved: items, pages read,
+     * requests spent and the stop reason, so step() carries on from the next
+     * unread page and the request budget keeps counting. */
+    restore(query) {
+      if (this.st && this.st.running) return { err: 'a step() loop is running; wait until status().running is false' };
+      const ls = storage();
+      if (!ls) return { err: 'localStorage unavailable: no backup can exist in this page' };
+      let best = null;
+      for (const k of backupKeys()) { // newest first
+        if (query && parseKey(k).slug !== slugify(query)) continue;
+        let o = null;
+        try { o = JSON.parse(ls.getItem(k)); } catch (e) { continue; }
+        if (o && Array.isArray(o.items)) { best = o; break; }
+      }
+      if (!best) return { err: 'no harvest backup' + (query ? ' for "' + query + '"' : ''), backups: this.backups() };
+      const st = { running: false, backup: null, seen: new Set() };
+      FIELDS.forEach((k) => { st[k] = best[k]; });
+      st.startPage = st.startPage || 1;
+      st.startedAt = st.startedAt || best.savedAt || 0;
+      st.pages = st.pages || [];
+      st.items.forEach((i) => st.seen.add(String(i.id)));
+      this.st = st;
+      return Object.assign(this.status(), {
+        restored: true, savedAt: new Date(best.savedAt || 0).toISOString(),
+      });
+    },
+
+    /* Saved harvests in localStorage, newest first. No URL, no query string. */
+    backups() {
+      const ls = storage();
+      if (!ls) return [];
+      const out = [];
+      for (const k of backupKeys()) {
+        try {
+          const o = JSON.parse(ls.getItem(k));
+          out.push({ query: o.query, items: (o.items || []).length, pagesRead: o.page, requests: o.requests,
+                     stop: o.stop, fourStar: o.fourStar, extraApplied: !!o.extra,
+                     savedAt: new Date(o.savedAt || 0).toISOString() });
+        } catch (e) { out.push({ query: parseKey(k).slug, err: 'unreadable' }); }
+      }
+      return out; // newest first, at most MAX_BACKUPS
+    },
+
+    /* Delete a backup once its payload is safely on disk. */
+    dropBackup(query) {
+      const ls = storage();
+      if (!ls || !query) return 'nothing dropped';
+      let n = 0;
+      for (const k of backupKeys()) {
+        if (parseKey(k).slug !== slugify(query)) continue;
+        try { ls.removeItem(k); n++; } catch (e) { return 'drop failed: ' + String(e).slice(0, 80); }
+      }
+      return n ? 'dropped ' + n + ' backup(s) for "' + query + '"' : 'no backup for "' + query + '"';
+    },
+
+    /* Clear a stop so step() can go on with the items kept. Before this a
+     * stop was final, so after a cleared wall or one transient fetch error the
+     * only way on was start(), which threw the harvest away and spent requests
+     * re-reading it. 'exhausted' is a real end and is not cleared. A raised
+     * maxRequests / maxPages is taken here, so a 'request-budget' or
+     * 'page-cap' stop can be lifted on purpose. The page that hit the wall
+     * was not counted, so it is fetched again. */
+    resume(opts) {
+      const s = this.st;
+      if (!s) return { err: 'call start() or restore() first' };
+      if (s.running) return Object.assign(this.status(), { err: 'step() is already running' });
+      opts = opts || {};
+      s.maxRequests = num(opts.maxRequests, s.maxRequests, 'maxRequests');
+      s.maxPages = num(opts.maxPages, s.maxPages, 'maxPages');
+      if (s.stop === 'exhausted') {
+        return Object.assign(this.status(), { err: 'the stream already ran dry (exhausted): nothing to resume' });
+      }
+      const was = s.stop;
+      s.stop = null; s.wall = null; s.lastErr = null;
+      return Object.assign(this.status(), { resumed: was, nextPage: s.page + 1 });
     },
 
     /* The full first-page URL. In-app browser only: the Chrome connector
@@ -363,27 +675,42 @@ function wallVerdict(sig) {
      * the receiver first:
      *   node scripts/receiver.mjs --dir <outdir> --port 8765
      *
-     * Two transports, tried in order (measured 2026-09-14, Chrome 153):
+     * Two transports (measured 2026-09-14, Chrome 153):
      *   fetch()  — held indefinitely by Chrome's local-network permission
      *              gate when the page is a public https site: the request
-     *              never reached the receiver in 45 s. Kept because other
-     *              browsers may allow it; raced against a short timeout.
+     *              never reached the receiver in 45 s. Raced against a short
+     *              timeout.
      *   form     — a top-level <form method=POST enctype=text/plain> to the
      *              same URL is a navigation, not a subresource request, and
-     *              it DID reach the receiver. The tab then shows the
-     *              receiver's reply ("saved <path> …"): read it with
-     *              get_page_text, then navigate back. Window state is gone
-     *              after that, which is fine — the payload is on disk.
-     * The return value is short and has no query string, so the Chrome
-     * connector shows it in full.
+     *              it DID reach the receiver. Window state is gone after the
+     *              navigation.
      *
-     * A HIDDEN tab skips the fetch race in 'auto' mode and posts the form
-     * straight away. The race needs a timer, and a hidden tab delays timers
-     * past the 45 s tool limit (see visibility()), so the call would time out
-     * with nothing reported. A form POST is a navigation and needs no timer.
-     * The tab's reply page cannot be read there either (get_page_text hangs
-     * on a hidden tab), so read the saved path from the receiver's own
-     * output instead. */
+     * The return value starts with the outcome, so it cannot be misread:
+     *   DELIVERED      the receiver answered "saved <path>" to the fetch.
+     *   NOT DELIVERED  nothing left the page, and it did NOT navigate: the
+     *                  fetch was refused (no receiver on the port) or the
+     *                  receiver rejected the body. The harvest is still here.
+     *   UNCONFIRMED    the form was posted (fetch held, tab hidden, or
+     *                  via:'form'). Only the receiver's own output can say
+     *                  "saved". The state was written to localStorage first,
+     *                  so if nothing was saved, restore() brings it back.
+     *
+     * WHY (measured 2026-10-17): a refused fetch used to fall through to the
+     * form, exactly like a held one. With the receiver gone (it had exited
+     * after its one payload), the form navigated to a dead port, the tab went
+     * to chrome-error:// and the harvest was lost, twice, while the return
+     * said "form-posted …" as if all was well. A refused connection needs no
+     * navigation to prove: the fetch already answered.
+     *
+     * A HIDDEN tab skips the fetch race in 'auto' mode: the race needs a
+     * timer, and a hidden tab delays timers past the 45 s tool limit (see
+     * visibility()). The form needs no timer. Its reply page cannot be read
+     * there (get_page_text hangs on a hidden tab), so read the saved path
+     * from the receiver's own output.
+     *
+     * No form is posted when the backup could not be written, unless
+     * opts.force is true: the navigation would be the only copy's end.
+     * The return value has no query string, so the Chrome connector shows it. */
     async send(port, opts) {
       opts = opts || {};
       const host = opts.host || '127.0.0.1';
@@ -391,14 +718,42 @@ function wallVerdict(sig) {
       const p = this.payload();
       const via = opts.via || 'auto';
       const hidden = visibility() === 'hidden';
+      let fetchNote = '';
       if (via === 'fetch' || (via === 'auto' && !hidden)) {
         const timeoutMs = opts.timeoutMs || 3000;
         const attempt = fetch(url, { method: 'POST', mode: 'cors', headers: { 'Content-Type': 'text/plain' }, body: p })
-          .then(async (r) => 'sent ' + p.length + ' chars; receiver replied ' + r.status + ': ' + (await r.text()).slice(0, 220))
-          .catch((e) => 'FETCH-ERROR ' + String(e).slice(0, 120));
-        const held = new Promise((resolve) => setTimeout(() => resolve('FETCH-HELD'), timeoutMs));
+          .then(async (r) => ({ status: r.status, text: String(await r.text()).slice(0, 400) }))
+          .catch((e) => ({ error: String(e).slice(0, 120) }));
+        const held = new Promise((resolve) => setTimeout(() => resolve({ held: true }), timeoutMs));
         const res = await Promise.race([attempt, held]);
-        if (via === 'fetch' || !/^FETCH-(HELD|ERROR)/.test(res)) return res;
+        if (res.status != null) {
+          const saved = res.status === 200 && /^saved /.test(res.text);
+          return (saved ? 'DELIVERED: ' : 'NOT DELIVERED: ') + 'sent ' + p.length + ' chars; receiver replied ' +
+                 res.status + ': ' + res.text + (saved ? '' : ' - the harvest is still in this tab; fix the cause and send() again');
+        }
+        if (res.error) {
+          if (via === 'fetch') return 'NOT DELIVERED: FETCH-ERROR ' + res.error;
+          return 'NOT DELIVERED: FETCH-ERROR ' + res.error + ' - nothing is listening on port ' + (port || 8765) +
+                 ', or the browser refused the request. The page did NOT navigate: the harvest is still here. ' +
+                 'Check the receiver: curl -s http://127.0.0.1:' + (port || 8765) + '/ must answer "ok". If it does, ' +
+                 'the browser blocks loopback fetches (the in-app browser always does): send(' + (port || 8765) +
+                 ', {via:"form"}) posts the form instead.';
+        }
+        // Still in flight: it may land later, so this is not "not delivered".
+        if (via === 'fetch') {
+          return 'UNCONFIRMED: FETCH-HELD after ' + timeoutMs + ' ms - the request is still pending and may still ' +
+                 'arrive: check the receiver output for "saved <path>" before sending again';
+        }
+        fetchNote = ' (fetch held ' + timeoutMs + ' ms)';
+      }
+      const bk = this.st ? persist(this.st) : { ok: false, err: 'not started' };
+      if (this.st) this.st.backup = bk;
+      if (!bk.ok && !opts.force) {
+        // A held fetch is still in flight and may yet land: not "not delivered".
+        return (fetchNote ? 'UNCONFIRMED: the fetch is held and may still arrive - check the receiver output for ' +
+                            '"saved <path>" first; ' : 'NOT DELIVERED: ') +
+               'no form posted, because the localStorage backup failed (' + bk.err + ') and the ' +
+               'navigation would lose the only copy. Export with expose() (visible tab), or pass {force:true}.';
       }
       const doc = window.document;
       const f = doc.createElement('form');
@@ -408,11 +763,12 @@ function wallVerdict(sig) {
       f.appendChild(ta);
       doc.body.appendChild(f);
       f.submit();
-      return 'form-posted ' + p.length + ' chars to ' + url +
+      return 'UNCONFIRMED: form-posted ' + p.length + ' chars to ' + url + fetchNote +
              (hidden ? ' (tab hidden: fetch skipped)' : '') +
-             ' - the receiver prints the saved path in its own output: read it there' +
+             (bk.ok ? '; backup saved (' + bk.items + ' items)' : '; NO backup (' + bk.err + ')') +
+             ' - delivered only if the receiver prints "saved <path>" in its own output: read it there' +
              (hidden ? ' (get_page_text hangs on a hidden tab)' : ', or with get_page_text on this tab') +
-             ', then navigate back';
+             '. If it printed nothing, navigate back to AliExpress, install harvest.js and call __aeHarvest.restore()';
     },
 
     /* FALLBACK export for the Chrome connector when loopback is unreachable.
@@ -436,14 +792,22 @@ function wallVerdict(sig) {
       const p = this.payload();
       const count = Math.ceil(p.length / n);
       const idx = i || 0;
+      /* The marker names the payload by a hash of its text. Two exports
+       * (the stuck tab's and the recovery tab's) used to share markers
+       * "AEPAYLOAD 0/2", and decode.mjs let one overwrite the other with
+       * exit 0. A payload that changed between two chunks gets another id,
+       * so its chunks can never be stitched together either. */
+      let h = 5381;
+      for (let k = 0; k < p.length; k++) h = ((h * 33) ^ p.charCodeAt(k)) >>> 0;
+      const id = h.toString(36);
       let el = doc.getElementById('__aePayload');
       if (!el) { el = doc.createElement('pre'); el.id = '__aePayload'; }
-      el.textContent = 'AEPAYLOAD ' + idx + '/' + count + ' START\n' +
+      el.textContent = 'AEPAYLOAD ' + idx + '/' + count + ' ' + id + ' START\n' +
                        p.slice(idx * n, (idx + 1) * n) + '\nAEPAYLOAD END';
       el.setAttribute('style',
         'position:absolute;left:0;top:0;font-size:1px;white-space:pre-wrap;word-break:break-all;');
       if (doc.body.firstChild !== el) doc.body.insertBefore(el, doc.body.firstChild);
-      return 'exposed chunk ' + idx + '/' + count + ' (' +
+      return 'exposed chunk ' + idx + '/' + count + ' of payload ' + id + ' (' +
              Math.max(0, Math.min(n, p.length - idx * n)) + ' chars) - read it with get_page_text';
     },
 
@@ -474,59 +838,96 @@ function wallVerdict(sig) {
           if (s.page >= s.maxPages) { s.stop = 'page-cap'; break; }
           if (s.requests >= s.maxRequests) { s.stop = 'request-budget'; break; }
           const p = s.page + 1;
-          let html = '', finalUrl = '';
+          let html = '', finalUrl = '', status = null;
           s.requests++;
           try {
             const r = await fetch(s.base + '&page=' + p, { credentials: 'include' });
             finalUrl = r.url;
+            status = typeof r.status === 'number' ? r.status : null;
             html = await r.text();
           } catch (e) {
-            s.lastErr = 'fetch:' + String(e).slice(0, 100);
+            s.lastErr = noQ('fetch:' + String(e).slice(0, 100));
             s.stop = 'fetch-error';
             break;
           }
           // Checked BEFORE the parse is trusted. A LOUD wall must never be
           // reported as a parse bug, and a QUIET one must never be reported as
-          // "the page had no data" — see wallVerdict above.
+          // "the page had no data" — see wallVerdict above. The second check
+          // runs only when nothing parsed, on the page's visible text, so the
+          // big-HTML-no-content rule can fire at all (see pageText()).
           const c = carve(html);
-          const verdict = wallVerdict({
+          let verdict = wallVerdict({
             url: finalUrl, text: html, html: html, dataNodes: c.err ? 0 : 1,
           });
+          // Only when the anchor itself is missing. A json or unbalanced error
+          // means the payload DID come back (rule 1), so it stays a
+          // parse-error with its cause in lastErr.
+          if (verdict.state === 'clear' && c.err === 'no-anchor') {
+            const quiet = wallVerdict({ url: finalUrl, text: pageText(html), html: html, dataNodes: 0 });
+            if (quiet.state !== 'clear') verdict = quiet;
+          }
           if (verdict.state !== 'clear') {
             s.stop = verdict.state === 'blocked' ? 'blocked' : 'suspect-wall';
             s.wall = verdict;
             break;
           }
-          if (c.err) { s.lastErr = c.err; s.stop = 'parse-error'; break; }
-          s.page = p;
-          const f = c.obj.data.root.fields;
-          const info = f.pageInfo || {};
-          if (s.claimedTotal === null && info.totalResults != null) {
-            s.claimedTotal = info.totalResults;
+          /* A 429, 503 or 404, or a redirect off the storefront (a login
+           * page), is not a parse bug: it used to read "parse-error /
+           * no-anchor" with the status lost (review, 2026-10-18). It is a
+           * fetch-error naming the status; resume() retries the page. */
+          if (status != null && (status < 200 || status >= 300)) {
+            s.lastErr = 'http ' + status + ' on page ' + p; s.stop = 'fetch-error'; break;
           }
-          const arr = (f.mods && f.mods.itemList && f.mods.itemList.content) || [];
+          // A page that did not parse and came from ANOTHER host (a sign-in
+          // page, say) is named by where it went, path only.
+          if (c.err) {
+            let host = '', want = '', path = '';
+            try { const u = new URL(finalUrl); host = u.host; path = u.pathname; } catch (e) { host = ''; }
+            try { want = new URL(s.base).host; } catch (e) { want = ''; }
+            if (host && want && host !== want) {
+              s.lastErr = 'redirected to ' + host + path; s.stop = 'fetch-error'; break;
+            }
+          }
+          if (c.err) { s.lastErr = noQ(c.err); s.stop = 'parse-error'; break; }
+          /* A page with the anchor but another shape used to throw a
+           * TypeError here, out of step(), with no stop and no pages[]
+           * entry; the next step() went on to page p+1 and page p was lost
+           * without a word. The page is counted only once it has parsed. */
+          const f = c.obj && c.obj.data && c.obj.data.root && c.obj.data.root.fields;
+          if (!f || typeof f !== 'object') {
+            s.lastErr = 'shape:no data.root.fields on page ' + p;
+            s.stop = 'parse-error';
+            break;
+          }
+          const info = f.pageInfo || {};
+          const arr = Array.isArray(f.mods && f.mods.itemList && f.mods.itemList.content)
+            ? f.mods.itemList.content : [];
           // `finished` is recorded for diagnosis only. It is NOT a stop signal:
           // see the stop rules below the item loop.
           const fin = info.finished === true;
-          if (!arr.length) {
-            s.pages.push({ page: p, n: 0, fresh: 0, finished: fin });
-            s.stop = 'exhausted'; s.endSignal = 'empty-page'; break;
-          }
-          let fresh = 0;
+          /* The page is built first and committed only once all of it has
+           * been read. A throw half way (an item field of an unexpected
+           * type) used to leave page p counted as read with part of its
+           * items, so resume() went on to p+1 and the rest of p was lost
+           * (review of the fix, 2026-10-18). Field reads are type-safe too. */
+          const str = (v) => (v == null ? '' : String(v));
+          const batch = [];
+          const batchIds = new Set();
+          let noId = 0;
           for (const it of arr) {
-            const id = String((it && it.productId) || '');
-            if (!id || s.seen.has(id)) continue;
-            s.seen.add(id);
-            fresh++;
+            const id = str(it && it.productId);
+            if (!id) { noId++; continue; }
+            if (s.seen.has(id) || batchIds.has(id)) continue;
+            batchIds.add(id);
             const prices = it.prices || {};
             const sale = prices.salePrice || {};
             const orig = prices.originalPrice || {};
-            const desc = clean((it.trade && it.trade.tradeDesc) || '');
+            const desc = clean(str(it.trade && it.trade.tradeDesc));
             const m = desc.match(SOLD_RE);
             const soldRaw = m ? m[1].replace(/\s/g, '') : null;
-            s.items.push(mk({
+            batch.push(mk({
               id,
-              title: clean((it.title && it.title.displayTitle) || ''),
+              title: clean(str(it.title && it.title.displayTitle)),
               price: typeof sale.minPrice === 'number' ? sale.minPrice : null,
               currency: typeof sale.currencyCode === 'string' ? sale.currencyCode : null,
               wasPrice: typeof orig.minPrice === 'number' ? orig.minPrice : null,
@@ -537,13 +938,41 @@ function wallVerdict(sig) {
               soldText: desc && parseSold(soldRaw) === null ? desc.slice(0, 80) : null,
               image: (() => {
                 const im = it.image || {};
-                const u = im.imgUrl || im.imgUrlOrigin || '';
+                const u = str(im.imgUrl || im.imgUrlOrigin);
                 return u ? (u.startsWith('//') ? 'https:' + u : u) : null;
               })(),
               page: p,
             }));
           }
-          s.pages.push({ page: p, n: arr.length, fresh, finished: fin });
+          const rel = arr.length
+            ? queryRelevance(s.query, arr.map((it) => clean(str(it && it.title && it.title.displayTitle))))
+            : { measured: false };
+          // ---- commit page p ----
+          s.page = p;
+          if (s.claimedTotal === null && info.totalResults != null) {
+            s.claimedTotal = info.totalResults;
+          }
+          if (!arr.length) {
+            s.pages.push({ page: p, n: 0, fresh: 0, finished: fin });
+            s.stop = 'exhausted'; s.endSignal = 'empty-page'; break;
+          }
+          /* Rows with no readable id are not "already seen". A page whose
+           * rows mostly lack productId (the site renamed the field) used to
+           * end the run as exhausted / no-new-ids, 0 items, "all results"
+           * (review, 2026-10-18). It is a parse-error, and the page is not
+           * counted. */
+          if (noId * 2 >= arr.length) {
+            s.page = p - 1;
+            s.lastErr = 'shape:' + noId + ' of ' + arr.length + ' rows on page ' + p + ' have no productId';
+            s.stop = 'parse-error';
+            break;
+          }
+          const fresh = batch.length;
+          batch.forEach((i) => { s.seen.add(i.id); s.items.push(i); });
+          s.pages.push(Object.assign({ page: p, n: arr.length, fresh, finished: fin,
+                         onQuery: rel.measured ? rel.share : null }, noId ? { noId } : {}));
+          // Saved per page: a later page may hang the tab for good.
+          s.backup = persist(s);
           /* STOP RULES (measured 2026-09-29, signed-in Chrome, USD account).
            * The stream is dry only when a page comes back EMPTY, or when every
            * id on it was already seen (the server is repeating itself).
@@ -560,8 +989,13 @@ function wallVerdict(sig) {
            * 180), so it counts what was served, not what exists. */
           if (fresh === 0) { s.stop = 'exhausted'; s.endSignal = 'no-new-ids'; break; }
         }
+      } catch (e) {
+        // Never a silent skip: an unexpected shape stops the run, named.
+        s.lastErr = noQ('step:' + String(e).slice(0, 100));
+        s.stop = s.stop || 'parse-error';
       } finally {
         s.running = false;
+        s.backup = persist(s);
       }
       return this.status();
     },
@@ -569,13 +1003,20 @@ function wallVerdict(sig) {
     status() {
       const s = this.st;
       if (!s) return { err: 'not started' };
+      const rel = queryRelevance(s.query, s.items.map((i) => i.title));
       return {
-        query: s.query, pagesRead: s.page, requests: s.requests,
-        unique: s.seen.size, stop: s.stop, endSignal: s.endSignal, lastErr: s.lastErr,
+        query: s.query, startPage: s.startPage || 1, pagesRead: s.page, requests: s.requests,
+        maxRequests: s.maxRequests,
+        unique: s.seen.size, stop: s.stop, endSignal: s.endSignal, lastErr: s.lastErr == null ? null : noQ(s.lastErr),
         blocked: s.stop === 'blocked',
         suspectedWall: s.stop === 'suspect-wall',
         wall: s.wall || null,
         claimedTotal: s.claimedTotal,
+        // Short on purpose: the Chrome connector cuts a result at 1,000
+        // characters. payload().relevance has the sample titles.
+        relevance: rel.measured ? { share: rel.share, checked: rel.checked, offQuery: !!rel.warning }
+                                : { measured: false, reason: rel.reason },
+        backup: s.backup ? (s.backup.ok ? { saved: true, items: s.backup.items } : { saved: false, err: s.backup.err }) : null,
         done: s.stop !== null,
         running: !!s.running,
         visibility: visibility(),
@@ -584,11 +1025,17 @@ function wallVerdict(sig) {
 
     /* JSON string ready to pipe into rank.mjs. `coverage` is deliberately
      * NOT a percentage of claimedTotal — that number is unreliable. What is
-     * true and useful is whether the stream was exhausted or cut short.
-     */
+     * true and useful is whether the stream was exhausted or cut short, and
+     * whether it was the product at all (`relevance`): an off-query stream
+     * gets verdict 'off-query' however dry it ran (see queryRelevance). */
     payload() {
       const s = this.st;
       if (!s) return JSON.stringify({ err: 'not started' });
+      const rel = queryRelevance(s.query, s.items.map((i) => i.title));
+      const startPage = s.startPage || 1;
+      const stream = s.stop === 'exhausted'
+        ? (startPage === 1 ? 'exhausted-all-results' : 'exhausted-from-start-page')
+        : 'truncated';
       return JSON.stringify({
         query: s.query,
         // Path only. The full URL carries a query string, which makes the
@@ -601,15 +1048,24 @@ function wallVerdict(sig) {
         suspectedWall: s.stop === 'suspect-wall',
         wall: s.wall || null,
         fourStar: s.fourStar,
+        // Names the extra filters without echoing them (the Chrome
+        // connector blocks a result holding a query string). Two runs are
+        // the same search stream only when query, fourStar and filterKey
+        // match; decode.mjs merges page numbers only within one stream.
+        filterKey: filterKey(s),
         coverage: {
-          verdict: s.stop === 'exhausted' ? 'exhausted-all-results' : 'truncated',
+          verdict: rel.warning ? 'off-query' : stream,
+          streamVerdict: stream,
           stop: s.stop,
           endSignal: s.endSignal,
+          startPage,
           pagesRead: s.page,
           requests: s.requests,
           claimedTotal: s.claimedTotal,
           claimedTotalIsUnreliable: true,
         },
+        relevance: rel,
+        warnings: rel.warning ? [rel.warning] : [],
         pages: s.pages,
         cardCount: s.items.length,
         withRating: s.items.filter((i) => i.rating !== null).length,
@@ -618,6 +1074,25 @@ function wallVerdict(sig) {
     },
   };
 
+  /* Installing again (re-pasting this file) must not orphan a running loop
+   * or throw away a harvest: the old loop would keep fetching beside a new
+   * one, uncounted. A running install is left in place; an idle one hands
+   * its state to the new code. */
+  const prev = window.__aeHarvest;
+  if (prev && prev.st && prev.st.running) {
+    return 'aeHarvest already installed and its step() loop is still running: NOT replaced. ' +
+           'Poll __aeHarvest.status() until running is false, then install again.';
+  }
+  if (prev && prev.st) {
+    H.st = prev.st;
+    // A state from an older install lacks newer fields: a start time (its
+    // backup key would sort as the oldest, stamp 0) and a start page.
+    if (!H.st.startedAt) H.st.startedAt = Date.now();
+    if (!H.st.startPage) H.st.startPage = 1;
+    H.st.backup = persist(H.st);
+  }
   window.__aeHarvest = H;
-  return 'aeHarvest ready — __aeHarvest.start({query:"..."}) then __aeHarvest.step(8) until done';
+  return 'aeHarvest ready' + (H.st ? ' (kept the current harvest: ' + H.st.items.length + ' items; start() begins a new one)' : '') +
+         ' — __aeHarvest.start({query:"..."}) then await __aeHarvest.step(6) until done (top-level await); ' +
+         'await __aeHarvest.send(8765) to export; __aeHarvest.restore() reloads a saved harvest';
 })()

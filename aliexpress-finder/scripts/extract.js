@@ -1,7 +1,8 @@
 /* AliExpress search-results extractor.
  *
- * Pass the WHOLE contents of this file as the `text` argument of
- * mcp__Claude_Browser__javascript_tool. It evaluates to a JSON string.
+ * Pass the WHOLE contents of this file (or of dist/extract.min.js, the same
+ * code without comments) as the `text` argument of javascript_tool. It
+ * evaluates to a JSON string.
  *
  * TWO SOURCES, tried in order:
  *
@@ -145,7 +146,7 @@ function wallVerdict(sig) {
   function parseSold(raw) {
     if (raw == null) return null;
     const s = String(raw)
-      .replace(/[‎‏‪-‮⁦-⁩]/g, '')
+      .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '')
       .replace(/\s+/g, '')
       .replace(/\+/g, '');
     if (!s) return null;
@@ -261,12 +262,25 @@ function wallVerdict(sig) {
       const id = (a.href.match(/\/item\/(\d+)/) || [])[1];
       if (!id || seen.has(id)) return;
 
-      // Walk up until we find the ancestor holding the full card text.
+      /* Walk up until we find the ancestor holding the full card text, but
+       * never into an ancestor that also holds ANOTHER item's link: that is
+       * the grid. A short card (no rating, no sold) climbed up to it and
+       * took the first card's title, price, rating and sold (review,
+       * 2026-10-18). */
+      const otherItem = (n) => {
+        try {
+          for (const l of n.querySelectorAll('a[href*="/item/"]')) {
+            const o = (String(l.href || '').match(/\/item\/(\d+)/) || [])[1];
+            if (o && o !== id) return true;
+          }
+        } catch (e) { /* no querySelectorAll */ }
+        return false;
+      };
       let node = a;
       let text = '';
       for (let i = 0; i < 7 && node; i++) {
         node = node.parentElement;
-        if (!node) break;
+        if (!node || otherItem(node)) break;
         const t = clean(node.textContent);
         if (t.length > text.length) text = t;
         if (text.length > 120) break;
@@ -274,8 +288,13 @@ function wallVerdict(sig) {
       if (text.length < 25) return;
       seen.add(id);
 
-      // Rating and sold are glued together: "<rating><sold> נמכרו" / "... sold"
-      const rs = text.match(/([1-5]\.\d)\s*([\d.,]+\s*[KkMm]?\s*\+?)\s*(?:נמכר|sold)/i);
+      /* Rating and sold are glued together: "<rating><sold> נמכרו" / "... sold".
+       * The sold number must be a WELL-FORMED count right after the rating:
+       * digits with 3-digit groups ("1,000", "4.000"), or digits with at most
+       * one decimal before a K/M ("1.2K"). A loose [\d.,]+ let a version
+       * number in the title win: "Bluetooth 5.0 4.81,000+ sold" read as
+       * rating 5.0 and sold "4.81,000+" -> 4.81 (measured 2026-10-18). */
+      const rs = text.match(/([1-5]\.\d)\s*((?:\d{1,3}(?:[.,]\d{3})+|\d+(?:[.,]\d)?(?=\s*[KkMm])|\d+)\s*[KkMm]?\s*\+?)\s*(?:נמכר|sold)/i);
       // Every price, in order: [current, original]; the symbol says the currency
       const moneyM = [...text.matchAll(MONEY_RE)];
       const money = moneyM

@@ -63,19 +63,22 @@ read as they are, never changed.
 | File | Role |
 |------|------|
 | `SKILL.md` | The skill: 8-step workflow plus gotchas verified against the live site |
-| `scripts/harvest.js` | Browser-side paged harvester. Resumable, reads until an empty page or a page with no new ids (the server's `finished` flag is not trusted: it was true on every page of a 230-item stream), detects the anti-bot wall *before* parsing so a block can never be mistaken for a parse error. Runs unchanged in both browsers: `forceEnglish()` for the logged-out in-app browser, `expose()`/`chunks()` to export through the Chrome connector, both `sold` and `נמכר` parsed, currency per item, tab `visibility` reported |
+| `scripts/harvest.js` | Browser-side paged harvester. Resumable, reads until an empty page or a page with no new ids (the server's `finished` flag is not trusted: it was true on every page of a 230-item stream), detects the anti-bot wall *before* parsing so a block can never be mistaken for a parse error, and flags a stream whose titles do not match the query (`off-query`). Saves its state to `localStorage` after every page; `restore()` reloads it in a fresh tab, `resume()` clears a stop, `startPage` skips saved pages. `send()` replies `DELIVERED` / `NOT DELIVERED` / `UNCONFIRMED` and never navigates after a refused fetch. Runs unchanged in both browsers: `forceEnglish()` for the logged-out in-app browser, `expose()`/`chunks()` to export through the Chrome connector, both `sold` and `נמכר` parsed, currency per item, tab `visibility` reported |
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. Reads the embedded `_dida_config_._init_data_` payload (~60 records), falls back to DOM scraping (`₪`, `US $`, `€`, `£`), and flags captcha interstitials |
-| `scripts/receiver.mjs` | Loopback HTTP receiver: `__aeHarvest.send(port)` POSTs the harvest payload to it from either browser and it writes `harvest-<query>-<stamp>.json`, replying with the path. No retyping, no chunking. Exits after one payload or 15 idle minutes |
-| `scripts/decode.mjs` | Fallback decoder: reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps in any order (refuses a partial set), or from a plain payload JSON |
-| `scripts/listing.js` | Detail-page reader (`await read()`). Expands the page, then returns text **and** images in one call; walks the shadow DOM (a bare `querySelectorAll('img')` sees 1 image of dozens); `gallery` is the product's own photos only, full size, with other products counted apart; reads the description from its shadow root, or fetches it when a hidden tab left it unrendered; separates product size from carton size, reads options only from the option selector, returns own vs pooled review counts, reports tab `visibility` and warnings |
+| `scripts/receiver.mjs` | Loopback HTTP receiver: `__aeHarvest.send(port)` POSTs the harvest payload to it from either browser and it writes `harvest-<query>-<stamp>.json`, replying with the path. No retyping, no chunking. Takes any number of payloads, exits after 60 idle minutes, `GET /` answers `ok …` |
+| `scripts/decode.mjs` | Fallback decoder and merger: reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps in any order (refuses a partial set), or from a plain payload JSON or an array of them; several payloads are merged and deduped, never dropped |
+| `scripts/fixtures/` | Test data: the titles of two real 2026-10-17 harvests (a craft-wire stream served for `wired usb mouse`, and a real mouse stream), for the relevance tests |
+| `scripts/build.mjs` | Writes `scripts/dist/*.min.js`, the browser files without comments, for the install paste (about 45% of the source). Run it after editing a browser file; the tests fail on a stale copy |
+| `scripts/listing.js` | Detail-page reader (`await read()`). Expands the page, then returns text **and** images in one call; walks the shadow DOM (a bare `querySelectorAll('img')` sees 1 image of dozens); `gallery` is the product's own photos only, full size, with other products counted apart; reads the description from its shadow root, or fetches it when a hidden tab left it unrendered; separates product size from carton size, reads options only from the option selector (every selected one), returns the Specifications rows and own vs pooled review counts, reports tab `visibility` and warnings |
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). For hardware the label on the case is the spec sheet |
-| `scripts/rank.mjs` | Scoring: shrunk quality + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification, `--constraint` hard requirement filters, absence-is-not-evidence warning, `sold-unparsed` and `own-reviews-unknown` set-asides |
+| `scripts/rank.mjs` | Scoring: shrunk quality (the listing's own rating in final mode) + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification, `--constraint` hard requirement filters, absence-is-not-evidence, off-query and tie-at-cutoff warnings, `sold-unparsed` and `own-reviews-unknown` set-asides, strict flag values |
 | `scripts/lib.mjs` | Pure helpers shared by the ranker, the browser files, the step-5 reader and the tests |
-| `scripts/test.mjs` | Test suite — 410 assertions, including the step-5 reader pulled out of `SKILL.md` |
+| `scripts/test.mjs` | Test suite — 755 assertions, including the step-5 reader pulled out of `SKILL.md` and the harvest scenarios run on the `dist` copy |
 
 ## Tests
 
 ```bash
+node scripts/build.mjs   # after editing a browser file
 node scripts/test.mjs
 ```
 
@@ -108,11 +111,22 @@ found during live runs:
   the pooled one separately, and the ranker refuses to rank on the pooled one
 - listing options read from reviews of other sellers' items instead of the
   option selector
+- a harvest lost on export: `send()` navigated to a dead receiver port after
+  a refused fetch, with no backup; the receiver had exited after one payload
+- an off-category stream (craft wire for `wired usb mouse`) reported as all
+  results, and ranked without a warning
+- a recovery harvest that re-read saved pages, a zero budget turned into 24,
+  and a decoder that kept only the first of two payloads
+- the pooled rating ranked with the own count, a researched house brand
+  ranked below unresearched items, ties and bucket floors misread
+- a product size marked as the carton, a bold-label size skipped, a wall or
+  an HTTP error page read as the description, the description cut off
+- a title's "Bluetooth 5.0" read as the rating
 
 `harvest.js`, `extract.js` and `listing.js` run in the browser and cannot import
 `lib.mjs`, so each inlines the helpers it needs (`parseSold`, `SOLD_RE`,
-`parseReviewBlock`, `wallVerdict`) between `@shared:*` markers, and so does the
-step-5 reader in `SKILL.md`. The test suite pulls every copy out and asserts it
+`parseReviewBlock`, `wallVerdict`, `queryRelevance`) between `@shared:*`
+markers, and so does the step-5 reader in `SKILL.md`. The test suite pulls every copy out and asserts it
 agrees with `lib.mjs` on every fixture, so they cannot silently drift.
 
 The harvester's own logic is tested by loading the real file with a fake

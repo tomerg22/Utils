@@ -1,6 +1,7 @@
 /* AliExpress DETAIL-PAGE reader — expands, then returns text AND images together.
  *
- * Pass the WHOLE contents of this file as the `text` argument of
+ * Pass the WHOLE contents of this file (or of dist/listing.min.js, the same
+ * code without comments) as the `text` argument of
  * javascript_tool (in-app browser or Chrome connector). It installs
  * `window.__aeListing`. read() is ASYNC: drive it with a top-level await.
  *
@@ -9,7 +10,8 @@
  *   r.descriptionImages       // images inside the description (drawings, spec tables)
  *   r.description.source      // 'rendered' | 'fetched' | 'missing' | 'fetch-failed' | 'blocked'
  *   r.reviews                 // { own, ownRating, header, pooledNote }
- *   r.variants                // the option selector only; selectedVariant too
+ *   r.variants                // the option selector only; selectedVariants too
+ *   r.specs                   // the Specifications rows: { 'Power Type': 'Wired', … }
  *   r.warnings, r.visibility  // read these first
  *   __aeListing.last          // the latest result, stored BEFORE the description
  *                             // fetch: if read() timed out, read this next call
@@ -314,31 +316,128 @@ function wallVerdict(sig) {
    * carton size renders as a bare leaf "12x7x4 סמ" while the qualifier
    * "גודל החבילה" ("package size") sits in a SIBLING node. Testing the leaf
    * alone marks the shipping box as if it were the product. */
+  /* A LINE is a leaf, or an element whose children are all inline leaves:
+   * "<li><b>Size:</b> 22 x 12 x 28 cm</li>" holds the size in the <li>,
+   * while its only leaf, <b>, holds just "Size:". Measured 2026-10-18: such
+   * a size reached `text` but never `sizeLines`. */
+  // BR, WBR and IMG are void: "<p><b>Size:</b> 22 x 12 x 28 cm<br></p>" is
+  // still a line. A <br> also SPLITS it: "<p>Size: …<br>Package size: …</p>"
+  // is two lines, each judged on its own words (review of the fix,
+  // 2026-10-18: one joined line let a single "Package" word mark the
+  // product size as the carton).
+  const INLINE = /^(B|STRONG|I|EM|U|SPAN|FONT|SMALL|SUB|SUP|MARK|A|LABEL|BR|WBR|IMG)$/;
+  /* Inline all the way down (a few levels): "<p><strong><span>Size:</span>
+   * </strong> 22 x 12 x 28 cm</p>" and "<a><img></a>" inside a line are still
+   * one line (review, 2026-10-18). */
+  const inlineTree = (k, depth) => {
+    if (!INLINE.test(k.tagName || '') || depth > 4) return false;
+    for (const c of (k.children || [])) if (!inlineTree(c, depth + 1)) return false;
+    return true;
+  };
+  const hasBr = (e, depth) => {
+    for (const k of (e.children || [])) {
+      if ((k.tagName || '') === 'BR' || (depth < 4 && hasBr(k, depth + 1))) return true;
+    }
+    return false;
+  };
+  /* The line's text in tree order, cut at every <br> however deep. */
+  const segmentsOf = (e) => {
+    if (!hasBr(e, 0)) return null;
+    const segs = [''];
+    const visit = (n, depth) => {
+      for (const c of (n.childNodes || [])) {
+        if (c.nodeType === 3) segs[segs.length - 1] += c.nodeValue || '';
+        else if (c.nodeType === 1 && c.tagName === 'BR') segs.push('');
+        else if (c.nodeType === 1 && depth < 5) {
+          if (c.childNodes && c.childNodes.length) visit(c, depth + 1);
+          else segs[segs.length - 1] += c.textContent || '';
+        }
+      }
+    };
+    visit(e, 0);
+    return segs.map(clean).filter(Boolean);
+  };
+  /* A container is a line only when it has text of its OWN beside its
+   * inline children (the "<li><b>Size:</b> 22 x 12 x 28 cm</li>" shape), or
+   * a <br> to split it. A <div> of <span>s with no text of its own is not:
+   * its spans are the lines, and joining them glued "Package1 pcSize12x6x4cm"
+   * into one fake line (review, 2026-10-18). */
+  const ownText = (e) => {
+    for (const c of (e.childNodes || [])) if (c.nodeType === 3 && /\S/.test(c.nodeValue || '')) return true;
+    return false;
+  };
+  const isLine = (e) => {
+    const kids = e.children || [];
+    if (!kids.length) return true;
+    for (const k of kids) if (!inlineTree(k, 0)) return false;
+    return ownText(e) || hasBr(e, 0);
+  };
+  /* The text of the element just before this one: in a table row, a <dl>,
+   * a list, a row of spans or a shadow root, that is the label of a bare
+   * value ("Size" | "12 x 6 x 4 cm"). */
+  const prevText = (e) => {
+    try {
+      const p = e.previousElementSibling;
+      return p ? clean(p.textContent).slice(-80) : '';
+    } catch (err) { return ''; }
+  };
+  /* The parent text AROUND the leaf: up to 120 chars before it, and the
+   * leaf. A fixed first-240-chars cut lost the leaf itself in a long list,
+   * and with it the qualifier, so a carton after a long spec list was called
+   * the product (review, 2026-10-18). */
+  const around = (full, t) => {
+    const at = full.indexOf(t);
+    return at < 0 ? full.slice(0, 240) : full.slice(Math.max(0, at - 120), at + t.length);
+  };
+  // Zones that hold OTHER products: their titles are never this listing's
+  // size lines (a carousel of "Mouse Pad Size 80x30cm" filled all 10 slots).
+  const FOREIGN_ZONE = /^(carousel|footer|menu)$/;
   function leavesOf(root, seenLeaf, out) {
     walk(root, (e) => {
-      if (e.children.length !== 0) return;
+      if (!isLine(e)) return;
+      const segs = segmentsOf(e);
+      if (segs) {
+        if (FOREIGN_ZONE.test(zone(e))) return;
+        const full = segs.join(' ');
+        segs.forEach((t, i) => {
+          if (t.length > 300 || seenLeaf.has(t)) return;
+          seenLeaf.add(t);
+          out.push({ text: t, context: around(full, t), prev: i ? segs[i - 1].slice(-80) : '' });
+        });
+        return;
+      }
       const t = clean(e.textContent);
       if (!t || t.length > 300 || seenLeaf.has(t)) return;
+      if (FOREIGN_ZONE.test(zone(e))) return;
       seenLeaf.add(t);
       let ctx = '';
       try {
         const p = e.parentElement || (e.parentNode && e.parentNode.nodeType === 1 ? e.parentNode : null);
-        ctx = p ? clean(p.textContent).slice(0, 240) : '';
+        ctx = p ? around(clean(p.textContent), t) : '';
       } catch (err) { ctx = ''; }
-      out.push({ text: t, context: ctx });
+      out.push({ text: t, context: ctx, prev: prevText(e) });
     });
     return out;
   }
+
+  /* The slider wall's own sentences, English and Hebrew ("slide [the
+   * slider] ... to verify": להחליק / החלק / גרור ... לאמת / אימות). Not
+   * "please slide" alone: seller copy and reviews use it. */
+  const STRONG_WALL = /unusual traffic|slide to verify|(להחליק|החלק|גרור|המחוון)[^.]{0,40}(לאמת|אימות)/i;
 
   const SHOW_MORE = /^(להציג יותר|הצג עוד|show more|see more|view more|לפרטים נוספים)$/i;
 
   /* Size lines. The Hebrew storefront writes ס"מ / סמ / מ"מ; sellers also use
    * cm/mm/inch. Both "8 x 3.7 x 2" and "80*37*20mm" forms occur. */
+  // A unit may be a word, an inch mark (7.9") and may carry an axis, as in
+  // "22cm (L) x 12cm (W)" (review, 2026-10-18: both forms were lost).
+  const UNIT = '(?:ס"מ|ס״מ|סמ|מ"מ|מ״מ|cm|mm|inch|in|אינץ\'?|"|”|\'\')?(?:\\s*\\([A-Za-z]\\))?';
   const SIZE_RE = new RegExp(
     '(?:גודל|מידות|מימדים|size|dimension[s]?)\\s*[:：]?\\s*' +
-    '[^\\n]{0,80}?\\d+(?:\\.\\d+)?\\s*(?:ס"מ|ס״מ|סמ|מ"מ|מ״מ|cm|mm|inch|אינץ\'?)?' +
+    '[^\\n]{0,80}?\\d+(?:\\.\\d+)?\\s*' + UNIT +
     '\\s*[x×*]\\s*[^\\n]{0,80}', 'i');
-  const TRIPLE_RE = /\d+(?:\.\d+)?\s*(?:ס"מ|ס״מ|סמ|מ"מ|מ״מ|cm|mm)?\s*[x×*]\s*\d+(?:\.\d+)?\s*(?:ס"מ|ס״מ|סמ|מ"מ|מ״מ|cm|mm)?\s*[x×*]\s*\d+(?:\.\d+)?\s*(?:ס"מ|ס״מ|סמ|מ"מ|מ״מ|cm|mm)?/i;
+  const TRIPLE_RE = new RegExp('\\d+(?:\\.\\d+)?\\s*' + UNIT + '\\s*[x×*]\\s*\\d+(?:\\.\\d+)?\\s*' + UNIT +
+    '\\s*[x×*]\\s*\\d+(?:\\.\\d+)?\\s*' + UNIT, 'i');
 
   /* Electrical ratings: "OUTPUT:9V1.6A", "9V 0.6A 5W", "DC 12V/2A", "600mA". */
   const RATING_RE = /(?:output|input|פלט|כניסה)?\s*:?\s*\d+(?:\.\d+)?\s*V\s*[\/,]?\s*\d+(?:\.\d+)?\s*(?:A|mA)/i;
@@ -346,7 +445,57 @@ function wallVerdict(sig) {
 
   /* A "package" size is the shipping box, not the product. Callers must not
    * confuse the two — this cost a wrong report once already. */
-  const PACKAGE_RE = /(חבילה|אריזה|package|packing|shipping)/i;
+  // "packag" covers package and packaging; box and carton sizes are cartons
+  // too (review, 2026-10-18: "Packaging size", "Box size" read as product).
+  const PACKAGE_RE = /(חבילה|אריזה|קופסה|קופסא|קרטון|packag|packing|packed|shipping|carton|(^|[^a-z])box([^a-z]|$))/i;
+  const LABEL_RE = /(גודל|מידות|מימדים|size|dimension)/i;
+
+  /* Is a size line the carton? The leaf's own words decide when it has a
+   * label ("Package size: …", "Size: …"). A BARE leaf ("12×7×4 סמ") takes
+   * its qualifier from the text just BEFORE it in its parent, back to the
+   * previous number: "גודל החבילה: 12×7×4 סמ" is the carton. The whole
+   * parent text used to decide, so in a description list holding
+   * "<li>Size: 22 x 12 x 28 cm</li> … <li>Package includes: 1 x grater</li>"
+   * the PRODUCT size was marked as the carton (measured 2026-10-18).
+   * "Back to the previous measurement" means a number WITH a unit: a label
+   * holding a digit ("Package Size (1pc): 12x7x4cm") keeps its package word.
+   * Known limit, by design: a labelled "Size:" line under a separate
+   * "Package Information" heading is judged on its own words (product). */
+  // No "i" flag: "0.6 kgSize" (cells glued with no space) must still end the
+  // measurement at "kg"; a lower-case letter after the unit still rejects it.
+  const MEASURE_RE = /\d(?:\.\d+)?\s*(?:ס"מ|ס״מ|סמ|מ"מ|מ״מ|[cC][mM]|[mM][mM]|[kK][gG]|קג|ק"ג|גרם|[gG]|inch|in|"|”)(?![a-z])/g;
+  /* The nearest LABEL decides. When the text before the size ends in a
+   * label ("Product size:"), only that label counts, back to the colon
+   * before it; when a value follows the last colon ("Package includes: 1 x
+   * grater" then a bare "Size"), the old label belongs to that value, not to
+   * this size. "Package: 1 x Mouse" then "Product size:" then the size was
+   * called the carton because "Package" sat within 60 characters (review of
+   * the fix, 2026-10-18). */
+  function isPackageLine(text, context, prev) {
+    if (PACKAGE_RE.test(text)) return true;
+    if (LABEL_RE.test(text)) return false;
+    // A bare value whose own label sits in the element before it.
+    if (prev && (PACKAGE_RE.test(prev) || LABEL_RE.test(prev) || /[:：]\s*$/.test(prev))) return PACKAGE_RE.test(prev);
+    if (!context) return false;
+    const at = context.indexOf(text);
+    if (at < 0) return false;
+    const before = context.slice(Math.max(0, at - 60), at);
+    const lastColon = Math.max(before.lastIndexOf(':'), before.lastIndexOf('：'));
+    let region = before;
+    if (lastColon >= 0) {
+      const after = before.slice(lastColon + 1);
+      if (after.trim()) region = after;
+      else {
+        const prev = Math.max(before.lastIndexOf(':', lastColon - 1), before.lastIndexOf('：', lastColon - 1));
+        region = before.slice(prev + 1, lastColon);
+      }
+    }
+    let last = -1, m;
+    MEASURE_RE.lastIndex = 0;
+    while ((m = MEASURE_RE.exec(region))) last = m.index + m[0].length;
+    if (last >= 0) region = region.slice(last);
+    return PACKAGE_RE.test(region);
+  }
 
   /* The description's own URL, from the requests the page already made.
    * Measured 2026-09-29: pdp.aliexpress-media.com/product/description/pc/v2/
@@ -358,6 +507,86 @@ function wallVerdict(sig) {
       const names = perf && perf.getEntriesByType ? perf.getEntriesByType('resource').map((x) => x.name) : [];
       return names.find((n) => /\/product\/description\/pc\//.test(n)) || null;
     } catch (e) { return null; }
+  }
+
+  /* The Specifications table. Hard requirements ("wired", "battery
+   * included") are decided on these rows, not on the title (review finding
+   * 2026-10-18: neither reader returned them, so a constraint was set from
+   * the title or by an ad-hoc read). Two sources, in order:
+   *   dom   element pairs whose class stems are specification--title /
+   *         specification--desc (the live class names are recalled, NOT yet
+   *         measured on a page: if this comes back empty, the text path runs)
+   *   text  body.innerText lines after a line "Specifications": name line,
+   *         value line, until the next section heading */
+  // (?![a-z]) and not \b: \b never matches after a Hebrew letter.
+  // A WHOLE line: "Store display" is a spec value, "Store" a section heading.
+  const SPEC_END = /^(description|report item|more to love|store|reviews?|customer reviews|you may also like|תיאור|ביקורות|חנות)\s*(\(\d[\d,.]*\))?$/i;
+  // Spec names seen on AliExpress detail pages (partial; lower case).
+  const SPEC_KEYS = new Set(['brand name', 'model number', 'origin', 'type', 'item type', 'interface type',
+    'power type', 'power source', 'battery included', 'battery type', 'is batteries included', 'connection',
+    'connectivity', 'wireless type', 'connection type', 'cable length', 'material', 'color', 'size', 'weight',
+    'certification', 'voltage', 'output', 'input', 'capacity', 'style', 'feature', 'application', 'package',
+    'operation mode', 'number of buttons', 'max. dpi', 'max dpi', 'hand orientation', 'charging method',
+    'waterproof', 'plug type', 'use', 'shape', 'pattern', 'quantity', 'dimensions', 'product size',
+    'package size', 'hign-concerned chemical', 'choice', 'semi_choice', 'gender', 'age', 'season',
+    'compatible brand', 'compatible model', 'system support', 'resolution', 'frequency', 'power']);
+  function readSpecs() {
+    const rows = {};
+    let n = 0;
+    walk(document, (e) => {
+      const c = typeof e.className === 'string' ? e.className : '';
+      if (!/specification--prop/.test(c) || n >= 80) return;
+      let k = null, v = null;
+      walk(e, (x) => {
+        const xc = typeof x.className === 'string' ? x.className : '';
+        if (k == null && /specification--title/.test(xc)) k = clean(x.textContent);
+        else if (v == null && /specification--desc/.test(xc)) v = clean((x.getAttribute && x.getAttribute('title')) || x.textContent);
+      });
+      if (k && v != null && k.length <= 60 && !(k in rows)) { rows[k] = v.slice(0, 120); n++; }
+    });
+    if (n) return { rows, source: 'dom' };
+    /* Text path, by KEY NAME. Pairing lines by position (name, value,
+     * name, value) shifted every later row after one empty value, and a
+     * "Specifications" tab label before the table ended the scan at once
+     * (review of the fix, 2026-10-18). So: every "Specifications" line is
+     * tried, a row is a line that is a known spec name, and its value is the
+     * next line unless that is itself a name or a section heading (then the
+     * value is ''). Unknown names are not guessed: `specsText` carries the
+     * raw block for reading by eye. */
+    const lines = String((document.body && document.body.innerText) || '').split(/\n/).map(clean).filter(Boolean);
+    const isKey = (l) => SPEC_KEYS.has(l.toLowerCase().replace(/[:：]$/, ''));
+    let text = '';
+    let heading = false;
+    for (let at = 0; at < lines.length; at++) {
+      if (!/^(specifications|מפרטים|מפרט)$/i.test(lines[at])) continue;
+      const block = [];
+      for (let j = at + 1; j < lines.length && j < at + 80 && !SPEC_END.test(lines[j]); j++) block.push(lines[j]);
+      // A tab label "Specifications" right before "Description" has an empty
+      // block: keep looking for one with lines (review, 2026-10-18).
+      if (!heading && block.length) { heading = true; text = block.join(' | ').slice(0, 1500); }
+      const got = {};
+      let m = 0;
+      for (let i = at + 1; i < lines.length && i < at + 200; i++) {
+        if (SPEC_END.test(lines[i])) break;
+        if (!isKey(lines[i])) continue;
+        const k = lines[i].replace(/[:：]$/, '');
+        const nx = lines[i + 1];
+        const nx2 = lines[i + 2];
+        /* A value can itself be a spec name ("Feature" / "Waterproof"). The
+         * next line is this row's value unless it starts a row of its own,
+         * which shows as a name followed by a non-name. */
+        let v = '';
+        if (nx != null && !SPEC_END.test(nx)) {
+          if (!isKey(nx) || nx2 == null || isKey(nx2) || SPEC_END.test(nx2)) { v = nx; i++; }
+        }
+        if (!(k in got)) { got[k] = v.slice(0, 120); m++; }
+      }
+      if (m > n) { n = m; Object.keys(rows).forEach((kk) => { delete rows[kk]; }); Object.assign(rows, got); text = block.join(' | ').slice(0, 1500); }
+    }
+    if (n) return { rows, source: 'text', text };
+    // A heading but no known name (a Hebrew table, say): the raw lines only.
+    if (heading) return { rows: {}, source: 'text-raw', text };
+    return { rows: {}, source: 'none' };
   }
 
   const L = {
@@ -440,10 +669,40 @@ function wallVerdict(sig) {
          * HTML (the captcha widget) are always checked. A wall here is a
          * real wall: read() raises it to its own top-level `blocked`. */
         const usable = text.length >= 50 || images.length > 0;
-        const v = wallVerdict({ url: res.url || '', text: usable ? '' : text, html, dataNodes: usable ? 1 : 0 });
+        /* The slider wall's own sentences ("unusual traffic", "slide to
+         * verify", and the Hebrew "slide ... to verify") are checked even in a
+         * usable fetch, at any length:
+         * a wall served at the description URL itself, without a redirect,
+         * passed as source 'fetched' and its text was appended to `text` as
+         * the product description (measured 2026-10-18 in a stub; no live
+         * case seen yet). Seller copy "please slide the drum in" does not
+         * carry either sentence, so it stays a description. */
+        // Not "please slide" / "נא להחליק" alone: seller copy uses those.
+        const strongWall = STRONG_WALL.test(text);
+        let v = wallVerdict({ url: res.url || '', text: usable && !strongWall ? '' : text, html,
+                              dataNodes: usable && !strongWall ? 1 : 0 });
+        // A strong wall sentence the shared marker list does not know (a
+        // Hebrew wording) is still a wall (review, 2026-10-18).
+        if (strongWall && v.state === 'clear') {
+          v = Object.assign(wallVerdict({ url: '', text: 'slide to verify', html: '', dataNodes: 0 }), { markers: ['slider-text-strong'] });
+        }
         if (v.state !== 'clear') {
           return { source: v.state === 'blocked' ? 'blocked' : 'suspect-wall',
                    text: '', leaves: [], images: [], wall: v };
+        }
+        /* An HTTP error page (403 token expired, 404) is not the description,
+         * however much text it has. It was reported as 'fetched' and its
+         * text appended as product copy. */
+        if (res && typeof res.status === 'number' && (res.status < 200 || res.status >= 300)) {
+          return { source: 'fetch-failed', text: '', leaves: [], images: [], error: 'http ' + res.status };
+        }
+        /* Nothing usable (an empty 200, a JSON error such as TOKEN_EXPIRED)
+         * is not a description: it was reported as 'fetched' with no text. */
+        // Empty, or a short JSON error: not a description. A short real
+        // description ("Size: 12 x 6 x 4 cm") still is one.
+        if ((!text.trim() && !images.length) || (/^\s*[{[]/.test(text) && text.length < 500)) {
+          return { source: 'fetch-failed', text: '', leaves: [], images: [],
+                   error: 'no description in the reply (' + text.length + ' chars of text, no images)' };
         }
         const leaves = leavesOf(doc, new Set(), []);
         return { source: 'fetched', text, leaves, images };
@@ -476,8 +735,13 @@ function wallVerdict(sig) {
       let pageHtml = '', ldCount = 0;
       try { pageHtml = (document.documentElement && document.documentElement.outerHTML) || ''; } catch (e) {}
       try { ldCount = document.querySelectorAll('script[type="application/ld+json"]').length; } catch (e) {}
+      /* A page that served JSON-LD is a product page: its text markers count
+       * only for the wall's own sentences. A review saying "please slide the
+       * drum in" made read() return nothing but "CONFIRMED anti-bot wall"
+       * (review, 2026-10-18). The URL and the captcha HTML always count. */
+      const strongPageWall = STRONG_WALL.test(bodyText);
       const verdict = wallVerdict({
-        url: url, text: bodyText, html: pageHtml,
+        url: url, text: ldCount && !strongPageWall ? '' : bodyText, html: pageHtml,
         dataNodes: ldCount || (bodyText.length > 2000 ? 1 : 0),
       });
       // Path only in every result: a punish URL carries x5secdata=... and the
@@ -547,17 +811,30 @@ function wallVerdict(sig) {
        * 9-key pad in the title. Live class names: sku-item--image--<hash>,
        * sku-item--text--<hash>, sku-item--selected--<hash> on the same node. */
       const variants = [];
+      const selectedVariants = [];
       let selectedVariant = null;
       walk(document, (e) => {
         const cls = (e.className && e.className.toString ? e.className.toString() : '');
         if (!/sku-item--(image|text)|sku-property-item/.test(cls)) return;
         const img = e.querySelector ? e.querySelector('img') : null;
-        const v = clean((img && img.getAttribute && (img.getAttribute('alt') || img.getAttribute('title'))) ||
+        let v = clean((img && img.getAttribute && (img.getAttribute('alt') || img.getAttribute('title'))) ||
                         (e.getAttribute && e.getAttribute('title')) || e.textContent);
-        if (!v || v.length > 60) return;
+        // Long option names are cut, never dropped: a 68-char selected
+        // option used to vanish, and with it the option the price is for.
+        if (!v) return;
+        if (v.length > 80) v = v.slice(0, 80);
         variants.push(v);
-        if (!selectedVariant && /sku-item--selected|\bselected\b|\bactive\b/i.test(cls)) selectedVariant = v;
+        /* One selected tile per option property (Color AND Type): all of
+         * them name the option the JSON-LD price belongs to. Only the first
+         * used to be kept, so "Wired" vs "Wireless" could be lost. */
+        if (/sku-item--selected|\bselected\b|\bactive\b/i.test(cls)) {
+          if (!selectedVariant) selectedVariant = v;
+          if (!selectedVariants.includes(v)) selectedVariants.push(v);
+        }
       });
+
+      // ---- specification rows ------------------------------------------
+      const specs = readSpecs();
 
       // Review counts, read AFTER expanding: the review block renders lazily.
       const reviews = parseReviewBlock((document.body && document.body.innerText) || '');
@@ -567,25 +844,68 @@ function wallVerdict(sig) {
       // a 'pending' description (stored in `last` before the fetch), once
       // with the real one.
       const build = (desc) => {
-        const seen = new Set(pageLeaves.map((l) => l.text));
-        const leaves = pageLeaves.slice();
-        for (const l of desc.leaves) {
+        // The description first: it is this product's own copy, and the
+        // 10-line caps below used to cut it after the page's lines.
+        const seen = new Set(desc.leaves.map((l) => l.text));
+        const leaves = desc.leaves.slice();
+        for (const l of pageLeaves) {
           if (!seen.has(l.text)) { seen.add(l.text); leaves.push(l); }
         }
-        const sizeLines = leaves
-          .filter((l) => SIZE_RE.test(l.text) || TRIPLE_RE.test(l.text))
-          .map((l) => ({
-            text: l.text,
-            // The qualifier may live in the leaf OR in its parent — check both.
-            isPackage: PACKAGE_RE.test(l.text) || PACKAGE_RE.test(l.context),
-            context: l.context && l.context !== l.text ? l.context.slice(0, 120) : undefined,
-          }));
+        /* One line can hold several pieces: "Package: 1 x Mouse. Size: 12 x 6 x
+         * 4 cm" or "Product size: … / Package size: …". Each size piece is
+         * judged on its own words; judging the whole line let one package
+         * word make the product size the carton (review, 2026-10-18). */
+        const isSize = (t) => SIZE_RE.test(t) || TRIPLE_RE.test(t);
+        const sizeLines = [];
+        for (const l of leaves) {
+          if (!isSize(l.text)) continue;
+          const pieces = l.text.split(/\s*(?:;|\||\s\/\s|,\s|(?<!\d)\.\s)\s*/).filter(Boolean);
+          const parts = pieces.length > 1 ? pieces.filter(isSize) : [l.text];
+          for (const t of (parts.length ? parts : [l.text])) {
+            sizeLines.push({
+              text: t,
+              // The qualifier may live in the piece OR just before it in the parent.
+              isPackage: t === l.text ? isPackageLine(t, l.context, l.prev) : isPackageLine(t, l.text),
+              context: l.context && l.context !== l.text ? l.context.slice(0, 120) : undefined,
+            });
+          }
+        }
         const ratingLines = leaves
           .filter((l) => RATING_RE.test(l.text) || WATT_RE.test(l.text))
           .map((l) => l.text);
         const descriptionImages = uniqByStem([...descImgs, ...desc.images]);
 
+        /* The description goes LAST in `text`, so a plain cut at maxText
+         * dropped it whole when the page text alone passed the limit, while
+         * `description.source` still said 'fetched' (measured 2026-10-18 in
+         * a stub: 25,000 chars of page text). The page text is cut first,
+         * and the cut is reported. */
+        const maxText = opts.maxText || 20000;
+        const descPart = desc.text ? ' [DESCRIPTION] ' + desc.text : '';
+        const joined = { text: pageText + descPart, cut: null };
+        if (joined.text.length > maxText) {
+          const keepDesc = descPart.slice(0, maxText);
+          const keepPage = pageText.slice(0, Math.max(0, maxText - keepDesc.length));
+          joined.cut = { pageText: pageText.length, pageKept: keepPage.length,
+                         description: descPart.length, descriptionKept: keepDesc.length };
+          joined.text = keepPage + keepDesc;
+        }
+
         const warnings = [];
+        if (joined.cut) {
+          warnings.push('text-cut: `text` was over maxText (' + maxText + '). Page text kept ' + joined.cut.pageKept +
+                        ' of ' + joined.cut.pageText + ' chars, description ' + joined.cut.descriptionKept + ' of ' +
+                        joined.cut.description + '. Pass read({ maxText }) higher to read the rest.');
+        }
+        if (specs.source === 'none' || specs.source === 'text-raw') {
+          warnings.push('specs-not-found: no Specifications rows were read' +
+                        (specs.source === 'text-raw' ? ' by name; the raw lines are in `specsText`' : '') +
+                        '. A hard requirement (Type, Power Type, Interface Type, Battery Included) is UNKNOWN until ' +
+                        'you read it from `specsText`, `text` or a screenshot.');
+        } else if (specs.source === 'text') {
+          warnings.push('specs-from-text: the rows were matched by NAME from the page text, not read from the spec ' +
+                        'table. Before setting a hard requirement from one, confirm it in `specsText` or a screenshot.');
+        }
         let top = { blocked: false };
         if (galleryScope === 'unscoped') {
           warnings.push('gallery-unscoped: no product-image container was found, so `gallery` holds ' +
@@ -622,6 +942,15 @@ function wallVerdict(sig) {
           pageGrew: after.height !== before.height || after.textLen !== before.textLen,
           variants: [...new Set(variants)].slice(0, 40),
           selectedVariant,
+          selectedVariants,
+          // The Specifications table as { name: value }. `specsSource` says
+          // where it came from: 'dom' (the spec rows), 'text' (the lines
+          // after the "Specifications" heading) or 'none' (not found: then
+          // the rows are UNKNOWN, never "not stated").
+          specs: specs.rows,
+          specsSource: specs.source,
+          // The raw lines after "Specifications" when the text path ran.
+          specsText: specs.text || undefined,
           // { own, ownRating, header, pooledNote }. `own` is the listing's own
           // rating count; `header` equals JSON-LD reviewCount and is usually
           // pooled across other sellers. Rank on `own`; null means unknown.
@@ -643,7 +972,8 @@ function wallVerdict(sig) {
           // Big images that are NOT this product, counted by where they sat.
           excludedImages: excluded,
           description: { source: desc.source, textLen: desc.text.length, imageCount: descriptionImages.length },
-          text: (pageText + (desc.text ? ' [DESCRIPTION] ' + desc.text : '')).slice(0, opts.maxText || 20000),
+          text: joined.text,
+          textCut: joined.cut,
           // Loud, because both halves were skipped in the failure this file exists for.
           reminder: 'Specs printed on the product PHOTO outrank every text field. ' +
                     'Download `gallery` AND `descriptionImages` with labels.sh and READ the label before quoting any rating. ' +

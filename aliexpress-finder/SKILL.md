@@ -18,9 +18,11 @@ because personal skills and both browser tool sets are absent there.
 Read this whole file. The gotchas below are verified against the live site
 (last full run 2026-08-21); skipping them produces silently empty or wrong results.
 
-Sanity-check the tooling whenever you change it:
+Sanity-check the tooling whenever you change it. After editing a browser
+file, rebuild its install copy first (the tests fail on a stale one):
 
 ```bash
+node ~/.claude/skills/aliexpress-finder/scripts/build.mjs
 node ~/.claude/skills/aliexpress-finder/scripts/test.mjs
 ```
 
@@ -123,7 +125,7 @@ this list is so you do not fight the symptoms:
 
 | Limit | Symptom | What to do |
 |---|---|---|
-| Result cut at **1,000 characters** | `…[TRUNCATED]` | Never return `payload()`. Use `__aeHarvest.expose(i)` + `get_page_text` (step 3). |
+| Result cut at **1,000 characters** | `…[TRUNCATED]` | Never return `payload()`. Export with `await __aeHarvest.send(<port>)` to `receiver.mjs` (step 3). `expose(i)` + `get_page_text` is the fallback, visible tab only. |
 | Result with a cookie or a **query string** is replaced | `[BLOCKED: Cookie/query string data]` | Never return `document.cookie`, `location.href` of a search page, or any URL with `?`. `start()`/`status()`/`payload()` are already clean; `debugUrl()` is in-app only. |
 | An async IIFE returns `{}` | `(async () => {...})()` → `{}` | Use a **top-level `await`**: `await __aeHarvest.step(6)`. |
 | Call timeout between 25 s and 45 s | `CDP Runtime.evaluate timed out after 45000ms` | Keep `step(6)`; 25 s passed, 45 s failed. In-app died at 30 s (2026-09-14) and at 45 s (2026-09-29), so the unit of work is the same. |
@@ -131,6 +133,9 @@ this list is so you do not fight the symptoms:
 Also: tab ids are **numbers** and must be passed explicitly inside
 `browser_batch`; `get_page_text` returns at most 50,000 characters (the
 `max_chars` argument is ignored there); close the tab you opened when done.
+`tabs_context_mcp{createIfEmpty:true}` creates a blank starter tab when the
+group is empty, and that tab is the work tab. If you open another one with
+`tabs_create_mcp`, close the starter tab as well at the end.
 
 ### A hidden tab — measured 2026-09-29
 
@@ -147,18 +152,42 @@ In that state:
 | | lazy rendering: the product description was not rendered anywhere (the page had fetched it) |
 
 When `fetch()` hangs (`step()` or `read()` times out with no result), do
-NOT close the tab first: the harvest lives only in that tab's `window`.
+NOT close the tab first: the harvest lives in that tab's `window`. Since
+2026-10-18 `harvest.js` also saves it to `localStorage` after every page
+(`status().backup`), and `localStorage` belongs to the origin, not the tab.
 
-1. In the stuck tab, `__aeHarvest.status()` still answers. Export what you
+1. Check the receiver is up: `curl -s http://127.0.0.1:8765/` must answer
+   `ok …`. It has no payload limit and exits after 60 idle minutes; if it is
+   gone, start it again (step 3). **Do not skip this check in a hidden
+   tab.** In a visible tab a `send()` to a dead port returns `NOT DELIVERED`
+   and does not navigate. A hidden tab cannot test the port (the test needs
+   a timer), so `send()` there posts the form at once, and with the
+   receiver gone the tab navigates to an error page. Only the
+   `localStorage` backup (and `restore()`) is left then.
+2. In the stuck tab, `__aeHarvest.status()` still answers. Export what you
    have: `await __aeHarvest.send(<port>)` (hidden, it posts the form and
-   needs no fetch), and read the saved path from the receiver's output. For
-   a detail page, `__aeListing.last` holds everything but the description.
-2. Then close the tab and open a fresh one with `tabs_context_mcp`. That
+   needs no fetch). The reply starts with `UNCONFIRMED`: the receiver's own
+   output must print `saved <path>`. For a detail page, `__aeListing.last`
+   holds everything but the description.
+3. Then close the tab and open a fresh one with `tabs_context_mcp`. That
    recovered the 2026-09-17 run.
-3. The harvest does **not** resume in the new tab: paste `harvest.js`
-   again, and `start()` begins at page 1. Pass `maxRequests` reduced by the
-   requests already spent; they still count toward the wall budget. Merge
-   the two saved payloads (`rank.mjs` accepts an array and dedupes by id).
+4. In the new tab (any `he.aliexpress.com` page), install `harvest.js` and
+   call `__aeHarvest.restore()`. The saved harvest comes back with its
+   items, the pages read and the requests spent, and `await
+   __aeHarvest.step(6)` carries on from the next unread page; the requests
+   still count toward the wall budget. `__aeHarvest.backups()` lists what is
+   saved. Only when `restore()` finds nothing: `start({ query, startPage:
+   <last page read + 1>, maxRequests: <24 minus the requests spent> })`,
+   plus the SAME `fourStar` and `extra` as the first run (other filters are
+   another search stream, and `decode.mjs` will not join their pages), so
+   the budget is not spent re-reading saved pages. `maxRequests: 0` means
+   no request is left; it is not replaced by the default any more.
+5. Export again. Two saved payloads merge with `decode.mjs a.json b.json >
+   harvest.json`: items are deduped by id, and the merged verdict is
+   `exhausted-all-results` only when the pages read, together, run from
+   page 1 with no gap up to where the stream ran dry. Only `decode.mjs`
+   gives a merged verdict: `rank.mjs` on an array merges the items, but
+   reports no coverage.
 
 What to do:
 
@@ -174,9 +203,10 @@ What to do:
   bring that Chrome window to the front." Until then, report the wall as
   unresolved. Never report "not blocked".
 - **Exports still work.** `__aeHarvest.send()` sees `hidden` and posts the
-  form without its fetch race (the race needs a timer). Read the saved path
-  from the receiver's own output (the background task), not from the tab.
-  `expose()` + `get_page_text` does NOT work hidden.
+  form without its fetch race (the race needs a timer), after saving the
+  harvest to `localStorage`. Its reply starts with `UNCONFIRMED`: read the
+  saved path from the receiver's own output (the background task), not from
+  the tab. `expose()` + `get_page_text` does NOT work hidden.
 - **The description is fetched, not rendered.** `listing.js` fetches it from
   the URL the page already requested; `description.source` says `fetched`.
 
@@ -322,8 +352,11 @@ exist" from the text channel alone.** Look first.
 a positive reason to suspect a wall — screenshot before concluding anything),
 `clear` (data came back, so nothing withheld it — or the page is plainly a
 short malformed response, which keeps its more useful `parse-error` name).
-- When they say it is cleared, verify with ONE cheap request and report what it
-  returned before resuming.
+- When they say it is cleared, verify with ONE request and report what it
+  returned before going on: `__aeHarvest.resume()` then
+  `await __aeHarvest.step(1)`. `resume()` clears the stop and keeps every
+  item, and the page that hit the wall is fetched again. Never `start()`
+  again for this: it throws the harvest away.
 
 **Budget your requests.** The wall tripped after roughly 50-60 rapid fetches in
 one session. That is a measured count, not a documented limit, so treat it as an
@@ -333,19 +366,34 @@ the edge. Three is over it.
 
 **Every code path that can fetch MUST carry block detection with it.** A blocked
 response has no payload, so a naive parser returns null and the caller logs
-"parse failed" — which reads like a bug, not a wall. `harvest.js` checks
-`blockedBy()` *before* parsing and sets `stop: 'blocked'`; `extract.js` sets
-`blocked: true`. Never add a fetch path without one of them.
+"parse failed" — which reads like a bug, not a wall. `harvest.js` runs
+`wallVerdict()` *before* parsing and sets `stop: 'blocked'` (or
+`'suspect-wall'` for a quiet wall); `extract.js` and `listing.js` set
+`blocked: true` / `suspectedWall: true`. Never add a fetch path without one
+of them.
 
 ## Step 3 — Harvest (paged)
 
-Pass the **entire contents** of `scripts/harvest.js` as the `text` argument of
-`javascript_tool`. It installs `window.__aeHarvest` and returns a status string.
+Pass the **entire contents** of `scripts/dist/harvest.min.js` as the `text`
+argument of `javascript_tool`. It is `scripts/harvest.js` without comments
+and indentation (about 26 KB instead of 57 KB), generated by
+`node scripts/build.mjs`, and it has no invisible characters: the bidi
+marks the parsers strip are written as `\u` escapes. Never retype or shorten
+either file: only these two copies are tested. `test.mjs` runs the WHOLE suite
+a second time on the three dist copies (`harvest`, `listing`, `extract`,
+with `AEF_DIST=1`), and fails when a dist copy is stale; `build.mjs` refuses a
+copy that does not parse or is not the same program as its source (node's
+own parser compares the two). It installs
+`window.__aeHarvest` and returns a status string. Installing again while a
+`step()` loop runs is refused; installing again when idle keeps the
+current harvest.
 
 ```js
 __aeHarvest.forceEnglish()                      // in-app browser ONLY, once
 __aeHarvest.start({ query: 'wire brush set' })  // returns the plan (path, flags — no URL)
 await __aeHarvest.step(6)                       // repeat until .done (top-level await)
+await __aeHarvest.send(8765)                    // export to receiver.mjs (below)
+__aeHarvest.restore()                           // a fresh tab: reload the saved harvest
 __aeHarvest.payload()                           // in-app browser: JSON string for decode.mjs
 ```
 
@@ -357,10 +405,25 @@ the Chrome connector blocks any result carrying a query string.
 between 25 s and 45 s in Chrome), which is about 8-12 fetches. Drive it with a
 **top-level `await`** — an async IIFE comes back as `{}` in Chrome. Call it
 repeatedly until `done: true`. It stops on `exhausted`, `page-cap`,
-`request-budget`, `blocked`, `fetch-error` or `parse-error` — and
-**`blocked` means go to step 2 and alert the user.** `exhausted` carries an
-`endSignal`: `empty-page` (the server served nothing) or `no-new-ids` (every
-id on the page was already seen).
+`request-budget`, `blocked`, `suspect-wall`, `fetch-error` or
+`parse-error`:
+
+- **`blocked`** means go to step 2 and alert the user, as the headline.
+- **`suspect-wall`** means no data came back and a wall marker fired. Take
+  a screenshot before anything else (step 2, the quiet wall); never report
+  it as a short harvest or as "no results".
+- **`fetch-error`**, **`parse-error`**: read `lastErr`. `__aeHarvest.resume()`
+  clears the stop and keeps the items, so one retry costs one request.
+  A non-2xx reply (`http 429`, `http 503`) and a redirect off the storefront
+  (a login page) are `fetch-error`s that name the status or the host. A page
+  whose rows mostly have no `productId` is a `parse-error` (`shape:…`), not
+  the end of the stream: the site changed its format.
+- **`request-budget`**, **`page-cap`**: the run was cut short on purpose.
+  `resume({ maxRequests })` lifts a `request-budget` stop and
+  `resume({ maxPages })` a `page-cap` stop, only if the wall budget (step 2)
+  allows it.
+- **`exhausted`** carries an `endSignal`: `empty-page` (the server served
+  nothing) or `no-new-ids` (every id on the page was already seen).
 
 **After a `step()` call times out, its loop is still running** in the page
 (a promise cannot be cancelled). Do not call `step()` again at once: it
@@ -379,7 +442,9 @@ is not the end either: `vegetable slicer` served 48 on page 4 and 1 more item
 on page 5. Reading to the empty page costs one request. Each entry in
 `payload().pages` still records the flag, for diagnosis.
 
-Defaults are `maxPages: 20`, `maxRequests: 24`, `fourStar: true`.
+Defaults are `maxPages: 20` (the last page number read), `maxRequests: 24`,
+`startPage: 1`, `fourStar: true`. `maxRequests: 0` is a budget of zero, not
+the default.
 
 **Read until the stream runs dry, then report which happened.** Do not assume a
 fixed depth — it varies enormously by query and is not even stable between runs:
@@ -396,14 +461,38 @@ fixed depth — it varies enormously by query and is not even stable between run
 claimed **160,188** results and served nothing past page 4. In signed-in
 Chrome it did the opposite: it grew with each page read (60, 120, 180), so it
 counted what had been served. Never report coverage as a percentage of it.
-Report `coverage.verdict`: `exhausted-all-results` or `truncated`.
+Report `coverage.verdict`: `exhausted-all-results`, `truncated`,
+`exhausted-from-start-page` (a `startPage` run: merge it before calling it
+complete) or `off-query` (below).
 
 **Paging works — the old warning was wrong.** This file used to claim `&page=2`
 returns recommendations rather than results. Measured: pages 1-12 of `wire brush
 set` gave 709 unique items with 59-60 fresh on *every* page, zero duplicates and
 zero category drift. Drift is real but only **deep** and only **unfiltered** —
 page 40 of an unfiltered brush search returns hair clips, and page 60 is the
-hard ceiling. With the 4★ filter, on-category stayed 97-100% through page 20.
+hard ceiling. With the 4★ filter, on-category stayed 97-100% through page 20
+on `wire brush set` and `travel duffel bag`. That is two queries, not a
+guarantee.
+
+**Check that the stream is the product at all.** Measured 2026-10-17: the
+slug `wholesale-wired-usb-mouse` was served as craft wire, 281 of 282
+items, and the run ended `exhausted-all-results` with no warning. Now
+`payload().relevance` (and `status().relevance`, short) counts the titles
+holding at least one query keyword as a whole word (a plural or a shared
+stem counts; `wire` is not `wired`). When fewer than half do,
+`coverage.verdict` is `off-query`, `payload().warnings` says so, and
+`rank.mjs` repeats the warning. Then the harvest is not a result: re-word
+the query (`usb wired mouse`, `mouse wired`), tell the user, and never
+report the stream as all results. The rule is loose on purpose: a stricter
+"head word" rule raised false alarms on correct streams ("mouse wired",
+"rc car", "coil spring"), and a false alarm throws a good harvest away. So
+an off stream that shares one keyword passes (craft wire for `wire brush
+set`): read `relevance.keywordShare`, and when the noun's share is low,
+look at a few titles. Titles in Hebrew, and Latin-script titles in another
+language (Spanish, German, French: their function words give them away),
+cannot be compared with English keywords: `relevance.measured` is `false`
+(`titles-not-latin` / `titles-not-english`), so check a few titles yourself. `pages[].onQuery` gives the share per page, which shows
+where deep drift begins.
 
 ### Single-page fallback
 
@@ -420,38 +509,69 @@ whatever scraping blogs claim — but `_dida_config_._init_data_` is not.
 
 ### Getting a large payload out of the browser
 
-A full harvest is ~90KB per 400 items. **Primary channel, both browsers:**
+A full harvest is ~200 KB per 400 items (about 500 chars per item, measured on the 2026-10-17 harvests). **Primary channel, both browsers:**
 the page POSTs it to a loopback receiver that writes the file. Start the
 receiver as a background Bash task *before* the harvest so the harness
-tracks it (it exits after one payload or 15 idle minutes):
+tracks it:
 
 ```bash
 node ~/.claude/skills/aliexpress-finder/scripts/receiver.mjs --dir <scratchpad> --port 8765
 ```
 
+It takes any number of payloads and exits after 60 minutes without a
+request to it (`--count N` / `--idle S` change that). The harvest's own
+fetches go to AliExpress and do **not** reset that timer, so before every
+`send()` check it is up: `curl -s http://127.0.0.1:8765/` answers
+`ok <n> saved, …`. (Until 2026-10-18 it exited after ONE payload or 15
+idle minutes. The hidden-tab recovery needs two sends, and the second one
+met a closed port.)
+
 then in the browser:
+
+**In the in-app browser use `send(8765, {via: 'form'})`, after the curl
+check.** Measured 2026-10-18 (Chromium 152 in the app): every `fetch()` from
+an https page to loopback is refused by the browser itself
+(`net::ERR_BLOCKED_BY_CLIENT`), so a plain `send(8765)` always answers
+`NOT DELIVERED: FETCH-ERROR` there, receiver up or not. In Chrome, plain
+`send(8765)` is right.
 
 ```js
 await __aeHarvest.send(8765)
-// in-app:  "sent 91234 chars; receiver replied 200: saved <path> (…)"
-// Chrome:  "form-posted 91234 chars to http://127.0.0.1:8765/harvest - the
-//           receiver prints the saved path in its own output: read it there,
-//           or with get_page_text on this tab, then navigate back"
-// hidden:  "form-posted … (tab hidden: fetch skipped) - … (get_page_text hangs
-//           on a hidden tab), then navigate back"
+// fetch reached it: "DELIVERED: sent 91234 chars; receiver replied 200: saved <path> (…)"
+// no receiver:      "NOT DELIVERED: FETCH-ERROR … The page did NOT navigate: the harvest is still here. …"
+// Chrome held it:   "UNCONFIRMED: form-posted 91234 chars to http://127.0.0.1:8765/harvest (fetch held 3000 ms);
+//                    backup saved (400 items) - delivered only if the receiver prints "saved <path>" …"
+// hidden tab:       "UNCONFIRMED: form-posted … (tab hidden: fetch skipped); backup saved … "
 ```
 
-`send()` tries a `fetch()` POST first and, if Chrome holds it (its
-local-network permission gate held such a request for 45 s without it ever
-reaching the receiver, measured on Chrome 153), submits a top-level
-`text/plain` form to the same URL. A form POST is a navigation, and it
-arrived. In a **hidden** tab it skips the fetch and posts the form at once,
-because the fetch race needs a timer (see "A hidden tab"). The receiver
-prints `saved <path>` in its own output: read it from the background task,
-which works whether or not the tab is visible. Then `navigate` back to
-AliExpress. Window state is gone after that navigation — export once, at the
-end of the harvest. Nothing is retyped and nothing is chunked; the saved file
-is `harvest.json`.
+The reply starts with the outcome. **Only `DELIVERED`, or `saved <path>` in
+the receiver's own output, means the file exists.** `UNCONFIRMED` also covers
+`send(8765, {via: 'fetch'})` when the fetch is still pending: it may still
+arrive, so read the receiver output before sending again. `send()` tries a
+`fetch()` POST first. A refused fetch (nothing listening, or a browser that
+blocks loopback) returns `NOT DELIVERED` and does **not** navigate: check the
+receiver with curl; if it is down, start it and send again; if it is up,
+`send(8765, {via: 'form'})`. If Chrome *holds* the fetch (its local-network permission gate held
+such a request for 45 s without it ever reaching the receiver, measured on
+Chrome 153), `send()` saves the harvest to `localStorage` (one key per run; the 3 newest
+runs are kept), then submits a
+top-level `text/plain` form to the same URL. A form POST is a navigation,
+and it arrived. In a **hidden** tab it skips the fetch and posts the form at
+once, because the fetch race needs a timer (see "A hidden tab"). If the
+backup cannot be written, no form is posted unless you pass
+`{force: true}`. `send(8765, {via: 'form'})` posts the form even after a
+refused fetch, for a receiver you know is up.
+
+After a form POST, read `saved <path>` from the background task, which works
+whether or not the tab is visible. Then `navigate` back to AliExpress.
+Window state is gone after that navigation, but the backup is not: if the
+receiver printed nothing, install `harvest.js` again and call
+`__aeHarvest.restore()`. Nothing is retyped and nothing is chunked.
+
+The receiver writes `harvest-<query>-<stamp>.json` in `--dir` and prints
+that path (a `-2`, `-3` suffix when two arrive in the same millisecond; a
+write error answers 500 and the receiver stays up). The commands below call the file `harvest.json`: copy the printed
+path to it, or pass the printed path instead.
 
 **Fallbacks**, decoded by the one decoder:
 
@@ -459,6 +579,17 @@ is `harvest.json`.
 node ~/.claude/skills/aliexpress-finder/scripts/decode.mjs <file...> > harvest.json
 node ~/.claude/skills/aliexpress-finder/scripts/decode.mjs --check <file...>   # coverage only
 ```
+
+Several payloads in one call are **merged**, never dropped (until 2026-10-18
+the decoder kept the first and dropped the rest with exit 0): items deduped
+by id, `parts` per input (a merged file can be merged again), and the
+verdict worked out per search stream (query, `fourStar`, `extra`):
+`exhausted-all-results` only when a part ran dry at page P, pages 1..P were
+all read, and no part read items past P (`stream-changed` otherwise). A part
+whose titles do not match its query makes the merge `off-query`, even from
+an old harvest.js. A JSON array of payloads is accepted too. A dump whose
+`AEPAYLOAD … START` has no matching `END` (cut, or saved with CRLF and
+then changed) is an error, never a silent drop.
 
 - *In-app browser:* call `__aeHarvest.payload()`. The result exceeds the
   tool-result limit, the harness saves it to a file and prints the path —
@@ -481,7 +612,12 @@ node ~/.claude/skills/aliexpress-finder/scripts/rank.mjs --mode shortlist --top 
 ```
 
 Accepts one payload, an array of payloads, or a bare item array; dedupes by id.
-The `harvest.js` envelope is consumed directly.
+The `harvest.js` envelope is consumed directly. For every payload that names
+its query, `rank.mjs` repeats the `off-query-results` warning (step 3) when
+the titles do not match it. A bad flag value (`--top abc`, a bare
+`--spread`, a blank `--min-evidence ''`) and an unknown flag (`--constriant`)
+are errors, exit 2, never an empty list or a dropped requirement.
+`--name=value` works as well as `--name value`.
 
 **Class separation is mandatory once the pool is large, not optional.** With 60
 items a mixed pool was survivable. With 1,166 it is not: a `wire brush set`
@@ -505,7 +641,10 @@ like "milk frother containeraliexpress milk frother…", all fields null). The 4
 URL filter from step 1 already removes nearly all of these upstream.
 
 Expect **ties**. Sold is bucketed ("10,000+", "50,000+", "100K+"), so top
-candidates score identically. That is exactly why step 5 exists.
+candidates score identically. That is exactly why step 5 exists. When a tie
+crosses the `--top` cut, the items that get in are chosen by input order;
+`rank.mjs` names that in a `tie-at-cutoff` warning with the tied ids it left
+out. Raise `--top` to fetch them too, or say the shortlist split a tie.
 
 **A sold text the parser cannot read is set aside, never judged.** `rank.mjs`
 drops such an item as `sold-unparsed` and names the text in a warning. On
@@ -536,7 +675,8 @@ So spend the step-5 budget on a **spread**, using the flag rather than by hand:
 node .../rank.mjs --mode shortlist --top 10 --spread 4 < harvest.json
 ```
 
-`--spread K` reserves K of the K+N slots for a stratified sample across sold
+`--spread K` reserves K of the `--top N` slots (the output stays N items, N-K
+of them by score) for a stratified sample across sold
 tiers (`10000+`, `5000+`, `3000+`, `1000+`, `500+`, `100+`), taking the
 best-scoring candidate from each starting at the **lowest** — the head already
 covers the saturated top. Picks are labelled `pick: "spread"` and flagged
@@ -600,22 +740,59 @@ here, between the markers, and run the tests after any change.
   if (!p) return JSON.stringify({ error: 'no JSON-LD: take a SCREENSHOT before concluding anything', path, bodyLen: tx.length });
   const o = p.offers || {}, ar = p.aggregateRating || {}, rv = parseReviewBlock(tx);
   const sold = tx.match(new RegExp('Reviews\\s*\\S?\\s*' + SOLD_RE.source, 'i')) || tx.match(SOLD_RE);
-  const opts = [];
+  // Spec rows a hard requirement is decided on. Edit WANT per requirement.
+  const WANT = ['Type', 'Interface Type', 'Power Type', 'Battery Included'];
+  const want = (k) => WANT.find((w) => w.toLowerCase() === String(k || '').trim().toLowerCase());
+  const spec = {}, opts = [];
   const walk = (r) => { for (const e of r.querySelectorAll('*')) {
     const c = String(e.className || '');
     if (/sku-item--(image|text)|sku-property-item/.test(c)) {
       const im = e.querySelector && e.querySelector('img');
-      opts.push(((im && im.getAttribute('alt')) || e.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 22) + (/selected/.test(c) ? '*' : ''));
+      opts.push(((im && (im.getAttribute('alt') || im.getAttribute('title'))) || e.textContent || '').replace(/\s+/g, ' ').trim() + (/selected/.test(c) ? '*' : ''));
+    }
+    if (/specification--prop/.test(c) && e.querySelector) {
+      const k = e.querySelector('[class*="specification--title"]'), v = e.querySelector('[class*="specification--desc"]');
+      const w = k && want(k.textContent);
+      if (w && v) spec[w] = v.textContent.replace(/\s+/g, ' ').trim().slice(0, 40);
     }
     if (e.shadowRoot) walk(e.shadowRoot);
   } };
   walk(document);
-  return JSON.stringify({ id: (path.match(/(\d+)\.html/) || [])[1],
+  let specFrom = Object.keys(spec).length ? 'dom' : 'none';
+  if (specFrom === 'none') {
+    const ls = ((document.body && document.body.innerText) || '').split(/\n+/).map((l) => l.trim()).filter(Boolean);
+    // Every "Specifications" line (the first may be a tab label); the scan
+    // stops at the next section heading; the richest block wins.
+    const END = /^(description|store|reviews?|customer reviews|report item|more to love)\s*(\(\d[\d,.]*\))?$/i;
+    let best = {};
+    ls.forEach((l, at) => {
+      if (!/^specifications$/i.test(l)) return;
+      const got = {};
+      for (let i = at + 1; i + 1 < ls.length && i < at + 120 && !END.test(ls[i]); i++) {
+        const w = want(ls[i]); if (!w || w in got) continue;
+        // A wanted name right after it, then a value: this row's value is empty.
+        got[w] = END.test(ls[i + 1]) || (want(ls[i + 1]) && ls[i + 2] != null && !want(ls[i + 2])) ? '' : ls[i + 1].slice(0, 40);
+      }
+      if (Object.keys(got).length > Object.keys(best).length) best = got;
+    });
+    Object.assign(spec, best);
+    if (Object.keys(spec).length) specFrom = 'text';
+  }
+  // Deduped on the WHOLE name, then shortened keeping both ends, so
+  // "Bluetooth Rechargeable Black" and "... Grey" stay two options.
+  const short = (x) => (x.length > 24 ? x.slice(0, 13) + '…' + x.slice(-10) : x);
+  const uo = [...new Set(opts)], shown = uo.slice(0, 10);
+  for (const x of uo) if (/\*$/.test(x) && !shown.includes(x)) shown.push(x);
+  const out = { id: (path.match(/(\d+)\.html/) || [])[1],
     rating: ar.ratingValue != null ? Number(ar.ratingValue) : null,
     reviews: rv.own, ownRating: rv.ownRating,
     pooledReviews: ar.reviewCount != null ? Number(ar.reviewCount) : null, pooledNote: rv.pooledNote,
     price: o.price != null ? Number(o.price) : null, currency: o.priceCurrency || null,
-    soldRaw: sold ? sold[1].replace(/\s/g, '') : null, options: [...new Set(opts)].slice(0, 8) });
+    soldRaw: sold ? sold[1].replace(/\s/g, '') : null, spec, specFrom, optionCount: uo.length, options: shown.map(short) };
+  // Never past the connector's 1,000 characters: options go first, named.
+  let s = JSON.stringify(out);
+  while (s.length > 990 && out.options.length) { out.options.pop(); out.optionsCut = true; s = JSON.stringify(out); }
+  return s;
 })()
 ```
 <!-- @snippet:step5:end -->
@@ -631,16 +808,35 @@ What comes back, and why each field is there (all measured 2026-09-25):
   4,779 vs 488. On the one listing without that note the two were equal
   (37 vs 37). **Rank on `reviews`, and report both numbers.** That `reviews` is
   the own count is read from the page, not from any AliExpress documentation.
+- **`ownRating` is the listing's own rating**, from the same review block.
+  `rating` is the JSON-LD `ratingValue`, which is pooled like `pooledReviews`.
+  Measured 2026-10-18 in the reader: pooled 4.9, own 4.1 from 1,090 ratings.
+  Pass `ownRating` to step 7 (`rank.mjs --mode final` ranks on it when it
+  is there) and report it in the table, not the pooled `rating`.
 - **`reviews: null` means unknown**, for example on a Hebrew page, where the
   wording of the review block has not been observed yet. Never put the pooled
   number in its place. `rank.mjs` sets such a finalist aside as
-  `own-reviews-unknown`.
+  `own-reviews-unknown`, also when it carries no pooled count either.
 - **`soldRaw`** comes from the header ("... Reviews 100K+ sold"), with the first
   sold text on the page as the fallback. From 100,000 up it carries a K.
 - **`options`** are the listing's own options, read from the option selector;
-  `*` marks the selected one. The JSON-LD `price` is the selected option's
-  price, so say which option it is. A "$2.14 keychain" was the 1-key option,
-  not the 9-key pad in its title.
+  `*` marks the selected one, one per option property (Color AND Type). The
+  first 10 come back, plus every selected one past them; `optionCount` is the
+  total. The JSON-LD `price` is the selected options' price, so say which
+  they are. A "$2.14 keychain" was the 1-key option, not the 9-key pad in its
+  title.
+- **`spec`** holds the Specifications rows named in `WANT` (default `Type`,
+  `Interface Type`, `Power Type`, `Battery Included`; edit `WANT` to match
+  the user's hard requirements), and `specFrom` says where they came from:
+  `dom` (the `specification--prop` rows), `text` (the lines after a
+  "Specifications" heading) or `none`. **The class names and the line layout
+  are recalled, not yet measured on a live page.** `specFrom: 'none'` means
+  unknown, never "not stated": then read the rows with `listing.js`
+  (`__r.specs`, `__r.specsText`) or a screenshot before setting a
+  constraint. `listing.js` reads the text path by spec NAME (`specsSource:
+  'text'`, with a `specs-from-text` warning: confirm the row in `specsText`
+  before a constraint rests on it); a table with no known name (a Hebrew
+  one) comes back as `specsSource: 'text-raw'` with only `specsText`.
 - Brand is not here. It comes from step 6.
 
 ### Read the whole listing — both channels, one call
@@ -650,13 +846,15 @@ dimensions, what is on the output — install `scripts/listing.js` and run:
 
 ```js
 window.__r = await __aeListing.read()   // async since 2026-09-29: top-level await
-__r.warnings                              // read first; then return fields in pieces
+[__r.blocked, __r.suspectedWall, __r.warnings]  // read `blocked` / `suspectedWall` first, then warnings
 ```
 
 It expands every "show more" first, then returns **text and images together**:
-`sizeLines`, `ratingLines`, `variants`, `selectedVariant`, `reviews`,
-`gallery`, `descriptionImages`, `description`, `text`, `visibility`,
-`warnings`, plus a `fingerprint`. One call, both channels, deliberately —
+`sizeLines`, `ratingLines`, `variants`, `selectedVariant` (the first) and
+`selectedVariants` (one per option property), `specs` / `specsSource` (the
+whole Specifications table), `reviews`, `gallery`, `descriptionImages`,
+`description`, `text`, `textCut`, `visibility`, `warnings`, plus a
+`fingerprint`. One call, both channels, deliberately —
 see the defect below. In Chrome the whole result is far over 1,000
 characters: keep it on `window` and return the fields you need in pieces.
 
@@ -672,8 +870,11 @@ characters: keep it on `window` and return the fields you need in pieces.
   it). Its text is appended to
   `text` after `[DESCRIPTION]` and feeds `sizeLines`; its images are
   `descriptionImages`, where dimension drawings usually are. `missing`,
-  `fetch-failed`, `skipped` or `pending` means **unknown**: never write "the
-  listing does not state the size" from that. `blocked` or `suspect-wall`
+  `fetch-failed` (also an HTTP error such as a 403 token page),
+  `skipped` or `pending` means **unknown**: never write "the
+  listing does not state the size" from that. When `text` passes `maxText`
+  (20,000), the PAGE text is cut first so the description stays, and
+  `textCut` plus a `text-cut` warning say how much was kept. `blocked` or `suspect-wall`
   means a **wall answered the description fetch**: the top-level `blocked` /
   `suspectedWall` is set, and it is the same STOP as step 2.
 - **A stalled description fetch does not lose the read.** `read()` stores a
@@ -701,7 +902,12 @@ Five things it encodes that cost real time to discover:
   re-read is owed. If you clicked anything, you owe one.
 - **A "size" line may be the shipping box.** `isPackage: true` marks it, and
   `productSizeLines` / `packageSizeLines` keep them apart. `12 x 7 x 4 cm /
-  59 g` was the carton; the product was `8 x 3.7 x 2 cm`.
+  59 g` was the carton; the product was `8 x 3.7 x 2 cm`. A labelled line
+  ("Size: …", "Package size: …") is judged on its own words; a bare size
+  takes its qualifier from the text just before it. (The whole parent text
+  used to decide, so `Size: 22 x 12 x 28 cm` in a list that also said
+  "Package includes" was marked as the carton.) A line with a bold label,
+  `<li><b>Size:</b> 22 x 12 x 28 cm</li>`, is read as one line.
 - **The description lives in a shadow root, and `innerText` never sees
   shadow content.** `text` used to be `body.innerText`, so "Weight: about
   750 g" was on screen and absent from `text` (2026-09-29). The description
@@ -743,6 +949,13 @@ like "מוביל ב-AliExpress" (a ranking badge, not a brand).
 **Brandless → skip this item entirely.** Set no `brandScore`; `rank.mjs` scores
 it at the neutral `--brand-default` (0.5) rather than punishing it.
 
+**The scale, and the rule that keeps it honest:** 0.5 is "no evidence either
+way". **A score below 0.5 needs evidence of a problem** (specs or price the
+brand cannot back, impersonation, bad independent reviews), named in the
+reason. A score above 0.5 needs independent evidence of a good reputation.
+So an unknown house brand that does not impersonate anyone and has nothing
+against it scores **0.5**, the same as a brandless listing.
+
 **Branded → research each distinct brand** for both:
 
 1. **Plausibility.** Are these specs and this price credible for this brand? A
@@ -755,7 +968,10 @@ it at the neutral `--brand-default` (0.5) rather than punishing it.
 
 Produce `brandScore` 0..1 and a one-line reason. Score a counterfeit-implausible
 listing near 0 so it cannot be promoted. Score an unknown-but-not-impersonating
-house brand mid-low (~0.35) — unsupported is not the same as fraudulent.
+house brand **0.5**: unsupported is not the same as fraudulent. (This file
+used to say ~0.35 for it. With identical evidence that ranked a researched
+house brand BELOW an unresearched or brandless listing, so doing step 6 cost
+a listing score and skipping it paid; measured 2026-10-18.)
 
 Use parallel subagents (one per brand) when the environment allows it; otherwise
 do the research inline with web search. Either satisfies this step.
@@ -765,11 +981,24 @@ rule promotes counterfeits, because the fakes wear the strongest brand names.
 
 ## Step 7 — Final rank
 
-Add `reviews` (the listing's OWN count from the step-5 reader), `pooledReviews`,
-any `brandScore`, and a `constraints` status per hard requirement to each
-finalist, then pass every requirement as `--constraint`. Never copy the pooled
-count into `reviews`. A finalist with `reviews: null` is set aside as
-`own-reviews-unknown` and named in a warning; re-read its review block.
+Add `reviews` and `ownRating` (the listing's OWN count and rating from the
+step-5 reader), `pooledReviews`, `soldRaw`, any `brandScore`, and a
+`constraints` status per hard requirement to each finalist, then pass every
+requirement as `--constraint`. Never copy the pooled count into `reviews`.
+A finalist with `reviews: null` is set aside as `own-reviews-unknown` and
+named in a warning; re-read its review block. In `final` mode the rank uses
+`ownRating` when it is there; a finalist without it but with a pooled count
+that differs from its own is flagged `rating-may-be-pooled`.
+
+**Set each constraint from the spec rows, never from the title alone:**
+
+1. `pass` needs a positive statement in a spec row (step-5 `spec`, or
+   `listing.js` `specs`), the description, or the product photo. A title
+   "Wired" with a spec row `Type: 2.4Ghz Wireless` or `Power Type:
+   Rechargeable` is a `fail`: say the two disagree.
+2. `fail` needs a statement that contradicts the requirement.
+3. Anything else is `unknown`, including `specFrom: 'none'` and a
+   description that was not read. `unknown` is held out of `ranked`.
 
 ```bash
 node ~/.claude/skills/aliexpress-finder/scripts/rank.mjs --mode final --top 4 --constraint wires < finalists.json
@@ -788,29 +1017,36 @@ data.
 ## Step 8 — Report
 
 Table of the 4: title, detail price (in the currency the account shows),
-rating, OWN rating count, sold, brand verdict, link. Say once that the header
+OWN rating (`ownRating`), OWN rating count, sold, brand verdict, link. Say once that the header
 count on the page is pooled across other sellers, with one example pair. Then,
 briefly:
 
 - **the hard requirements, and that every listed item passes them.** If any
   item in the table fails one, it does not belong in the table. If `ranked` is
-  empty, say plainly that nothing satisfies the requirement — that is the
-  answer, not a reason to substitute something else.
+  empty, read `note`: only "no candidate satisfies the stated constraints"
+  means that nothing satisfies the requirement — then say so plainly, it is
+  the answer, not a reason to substitute something else. "no candidate is
+  VERIFIED" means the items are unchecked, not failing.
 - **anything in `unverified`** — named, with what is unchecked about it. Never
   present an unverified item as satisfying a requirement.
 - **which specs came from the product photo** rather than a text field, and any
   place where the two disagree. The photo wins; say so.
 - **dimensions**, and whether the figure is the product or the shipping carton.
 - why each won (cite the actual numbers)
-- **coverage, honestly**: whether the harvest was `exhausted-all-results` or
-  `truncated`, how many unique items and how many pages. Never a percentage of
-  `totalResults`.
+- **coverage, honestly**: whether the harvest was `exhausted-all-results`,
+  `truncated` or `off-query`, how many unique items and how many pages. Never
+  a percentage of `totalResults`.
 - which product class was ranked, and what was excluded
 - that step-5 detail fetches were a spread (`--spread`), which tiers it reached,
   and that stratification samples the range rather than proving one winner
 - any `flags` raised (`extreme-discount`, `price-outlier-low`, `sold-saturated`,
-  `reviews-exceed-sold`, `few-reviews-for-sales`, `brand-unresearched`), and
-  any `sold-unparsed` or `own-reviews-unknown` warning, with the items it names
+  `reviews-exceed-sold` (only against an exact sold count, not a "1,000+"
+  floor), `few-reviews-for-sales`, `brand-unresearched`, `brand-implausible`
+  (a `brandScore` under 0.2: the brand weight can only demote it a little,
+  so say it is likely a counterfeit), `rating-may-be-pooled`), and any
+  `sold-unparsed`, `own-reviews-unknown`, `off-query-results`,
+  `tie-at-cutoff`, `tie-in-spread`, `unverified-only` or `empty-input`
+  warning, with the items it names
 - which option the detail price belongs to (the selected one in `options`)
 - any large search-vs-detail price gap
 - anything dropped for a notable reason (off-category, SEO junk, thin evidence)
@@ -835,24 +1071,106 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 
 | File | Role |
 |------|------|
-| `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until an empty page or a page with no new ids (never on `finished`), reports `coverage.verdict` and `endSignal`, and `visibility` in `status()`. Runs unchanged in both browsers; `forceEnglish()` (in-app only), `send()` (skips its fetch race in a hidden tab), one `step()` loop at a time (`running` in `status()`), `expose()`/`chunks()` (Chrome export, visible tab only), `debugUrl()` (in-app only). |
-| `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; `__aeHarvest.send(port)` POSTs the payload to it and it writes `harvest-<query>-<stamp>.json`, replying with the path. Exits after one payload or 15 idle minutes. |
-| `scripts/decode.mjs` | **Fallback decoder.** Reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps (any order, refuses a partial set), or from a plain payload JSON. |
+| `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until an empty page or a page with no new ids (never on `finished`), reports `coverage.verdict`, `endSignal`, `relevance` (off-query streams) and `visibility`. Runs unchanged in both browsers; `forceEnglish()` (in-app only), `send()` (outcome-first reply, never navigates after a refused fetch, saves a backup before any form POST, skips its fetch race in a hidden tab), `restore()`/`backups()`/`dropBackup()` (localStorage backup per page), `resume()` (clears a stop, keeps the items), `startPage`, one `step()` loop at a time (`running` in `status()`), `expose()`/`chunks()` (Chrome export, visible tab only), `debugUrl()` (in-app only). |
+| `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; `__aeHarvest.send(port)` POSTs the payload to it and it writes `harvest-<query>-<stamp>.json`, replying with the path. No payload limit by default; exits after 60 idle minutes; `GET /` answers `ok …`. |
+| `scripts/decode.mjs` | **Fallback decoder and merger.** Reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps (any order, refuses a partial set), or from a plain payload JSON or an array of them. Several payloads are merged, deduped by id, never dropped. |
+| `scripts/build.mjs` | Writes `scripts/dist/*.min.js`: the three browser files without comments, for the install paste. `--check` reports a stale copy; `test.mjs` fails on one. |
+| `scripts/dist/*.min.js` | Generated install copies. Never edit them; edit the source and run `build.mjs`. |
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. `_init_data_` first, DOM fallback, reports `source`, `blocked` and `visibility`. |
 | `scripts/listing.js` | **Detail-page reader.** `await read()`: expands, then returns text AND images in one call. Shadow-DOM aware, block-aware; `gallery` is the product's own photos only (other products counted in `excludedImages`); reads the description (from its shadow tree, or fetched when a hidden tab left it unrendered) into `text`, `sizeLines` and `descriptionImages`; separates product size from carton size, reads options only from the option selector (`selectedVariant` too), returns the own vs pooled review counts, reports `visibility` and `warnings`, keeps the result in `last` before the description fetch, `changed()` proves a re-read is owed. |
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). The label on the case is the spec sheet. |
-| `scripts/rank.mjs` | Ranker. Bayesian shrinkage, log volume, neutral brand default, `--require` filter, `--spread` tier stratification, `--constraint` hard filters, absence warning, `sold-unparsed` and `own-reviews-unknown` set-asides with warnings. |
-| `scripts/lib.mjs` | Pure helpers (`parseSold`, `SOLD_RE`, `parseReviewBlock`, `median`, `clean`, **`wallVerdict`**) shared by ranker, browser files, the step-5 reader and tests. |
+| `scripts/rank.mjs` | Ranker. Bayesian shrinkage (own rating in final mode), log volume, neutral brand default, `--require` filter, `--spread` tier stratification, `--constraint` hard filters, absence, `off-query-results` and `tie-at-cutoff` warnings, `sold-unparsed` and `own-reviews-unknown` set-asides with warnings, strict flag values. |
+| `scripts/lib.mjs` | Pure helpers (`parseSold`, `SOLD_RE`, `parseReviewBlock`, `median`, `clean`, **`wallVerdict`**, `queryRelevance`) shared by ranker, browser files, the step-5 reader and tests. |
 | `scripts/test.mjs` | Assertion suite incl. regression guards for every defect below. It also runs the step-5 reader, pulled out of this file. |
 
 `harvest.js`, `extract.js` and `listing.js` run in the browser and cannot import
 `lib.mjs`, so each inlines the helpers it needs (`parseSold`, `SOLD_RE`,
-`parseReviewBlock`, `wallVerdict`) between `@shared:*` markers, and so does the
-step-5 reader in this file. `test.mjs` pulls **every** copy out and asserts it
+`parseReviewBlock`, `wallVerdict`, `queryRelevance`) between `@shared:*`
+markers, and so does the step-5 reader in this file. `test.mjs` pulls **every** copy out and asserts it
 matches `lib.mjs` on every fixture — keep them in sync, the test will catch you
 if you don't. A drifted `wallVerdict` means one entry point silently stops
 detecting walls; a drifted `SOLD_RE` means best sellers silently lose their
 sold count.
+
+### Defects fixed 2026-10-18 (the wired-USB-mouse session and its review)
+
+Found in a live run on 2026-10-17, then a review ran the real code (41
+confirmed findings, about 30 distinct). Each has a test in `test.mjs` that
+fails on the code before the fix.
+
+1. **The harvest was lost twice on export.** The receiver had exited after
+   its one payload; `send()` treated the refused fetch like a held one,
+   posted the form to the dead port, the tab went to `chrome-error://`, and
+   the reply still read "form-posted …". Guards: a refused fetch returns
+   `NOT DELIVERED` and never navigates; every reply starts with
+   `DELIVERED` / `NOT DELIVERED` / `UNCONFIRMED`; the state is saved to
+   `localStorage` after every page and before any form POST, and
+   `restore()` brings it back in any tab of the origin; no backup, no form
+   (unless `force`). The receiver now takes any number of payloads and idles
+   out after 60 minutes; `GET /` answers `ok …` for a check before `send()`.
+2. **An off-category stream was "all results".** `wired usb mouse` was
+   served as craft wire (281 of 282 items) and ranked. Guard:
+   `queryRelevance()` (lib.mjs, inlined in `harvest.js`): verdict
+   `off-query`, a warning in the payload and in `rank.mjs`.
+3. **The recovery path re-read what it had.** `start()` always began at
+   page 1 and `maxRequests: 0` became 24; `decode.mjs` kept only the first of
+   several payloads. Guards: `restore()`, `startPage`, a zero budget stays
+   zero, `decode.mjs` merges (verdict complete only for pages 1..N with no
+   gap).
+4. **Silent stops and wrong stops.** A carved page of another shape threw
+   out of `step()` and its page was skipped; stops were final; a re-install
+   or `start()` beside a running loop made two loops; the big-HTML wall rule
+   could never fire in the harvester. Guards: a named `parse-error`,
+   `resume()`, refusals, and the rule run on the page's visible text.
+5. **The ranker scored the wrong things.** The pooled JSON-LD rating was
+   shrunk with the own count (now `ownRating` in final mode); a researched
+   house brand at the old ~0.35 ranked below unresearched items (now 0.5,
+   below 0.5 needs a named problem); a finalist with no count at all was
+   "thin"; `--require` was blamed when constraints emptied the pool; a typo
+   in a flag value gave an empty ranking; ties at the cut, reviews against
+   a sold floor, and `--min-evidence 0` were mishandled.
+6. **The detail reader hid things.** The product size was called the carton
+   when a sibling said "Package includes"; bold-label sizes were skipped; a
+   wall or an HTTP error page passed as the description; a 20,000-character
+   cut dropped the description whole; only the first selected option was
+   kept; no reader returned the spec rows a hard requirement is decided on.
+   Guards: each one in `listing.js` and the step-5 reader (`spec`,
+   `specs`).
+7. **The DOM fallback read "Bluetooth 5.0" as the rating.** The sold number
+   after the rating must now be a well-formed count.
+8. **The install paste was 31 KB with invisible characters.** Now
+   `dist/*.min.js`, generated and tested, and every bidi mark in the source
+   is a `\u` escape.
+
+Common cause: a result was reported without checking that it happened (a
+send, a stream, a page, a rating).
+
+Two review rounds of these fixes then ran the real code and confirmed 27
+more (19, then 8), all fixed with tests that fail on the reviewed code. The
+ones that change how to work: backups are one key per run, newest 3 kept,
+and `start()` saves at once; a page is counted only after all of it parsed;
+the relevance rule is "any keyword" (a head-word rule and a qualifier list
+both raised false alarms on correct streams); `decode.mjs` joins pages only
+within one stream (query, `fourStar`, `extra`) and names chunk sets by a
+payload hash; `rank.mjs` repeats every warning a payload carries; a `<br>`
+splits a size line; the nearest label decides carton vs product;
+`listing.js` reads spec text rows by name and returns `specsText`;
+`build.mjs` refuses a copy that does not parse.
+
+A third review, at higher effort (six reviewers, the listing cases run in real
+Chromium), confirmed about 50 more, all fixed with tests that fail on the
+reviewed code. What changes how to work: **in the in-app browser export with
+`send(8765, {via: 'form'})`** (it blocks every loopback fetch); a bare size
+takes its label from the element before it (a table cell, a `<dt>`, a span);
+"Packaging", "Box" and "Carton" sizes are cartons; carousel titles are never
+this product's sizes; relevance matches whole words and their inflections
+only ("water" is not "waterproof") and leaves non-English titles unmeasured;
+`decode.mjs` keeps every part's pages so a merged file can be merged again,
+and calls a stream that changed between runs `truncated`; `rank.mjs` says
+WHY a ranking is empty (unchecked is not failing), refuses unknown flags and
+blank values, and flags `brand-implausible`; `test.mjs` runs the whole suite a
+second time on the dist copies, compares every shared block's CODE with
+`lib.mjs`, and checks the README's assertion count.
 
 ### Defects fixed 2026-09-29 (the rotary-grater session)
 
@@ -991,7 +1309,9 @@ measured behaviour of the two browsers (the mop-and-sheets session).
    is one decoder, tested, instead of a snippet retyped per run.
 6. **Pooled reviews flagged.** Many detail pages show "Review for similar
    item": the review count is aggregated across sellers. The step-5 snippet
-   now returns `ownReviews`/`pooled` so the report can say which it is.
+   now returns `reviews` (own) and `pooledReviews`, plus `pooledNote`, so the
+   report can say which it is. (This line used to name `ownReviews`/`pooled`,
+   names no code ever read.)
 
 ### Defect fixed 2026-08-25 — the quiet wall (the jump-starter session)
 

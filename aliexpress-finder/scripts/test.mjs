@@ -15,6 +15,12 @@ import { parseSold, SOLD_RE, parseReviewBlock, median, clean, wallVerdict } from
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RANK = join(HERE, 'rank.mjs');
+/* AEF_DIST=1 runs the whole suite against the dist/*.min.js copies, the
+ * files the operator pastes (the main run starts that child run at the end).
+ * SRC() is always the source text: drift guards and doc checks read it. */
+const DIST = process.env.AEF_DIST === '1';
+const SRC = (name) => readFileSync(join(HERE, name), 'utf8');
+const RUN = (name) => (DIST ? readFileSync(join(HERE, 'dist', name.replace(/\.js$/, '.min.js')), 'utf8') : SRC(name));
 
 let pass = 0;
 const fails = [];
@@ -45,7 +51,7 @@ eq('null passthrough', parseSold(null), null);
 eq('undefined passthrough', parseSold(undefined), null);
 eq('empty string', parseSold(''), null);
 eq('garbage', parseSold('abc'), null);
-eq('bidi marks stripped', parseSold('‎10,000+‏'), 10000);
+eq('bidi marks stripped', parseSold('\u200e10,000+\u200f'), 10000);
 eq('inner whitespace', parseSold('10, 000 +'), 10000);
 eq('real decimal NOT treated as thousands', parseSold('1.5'), 1.5);
 eq('short group is not a thousands sep', parseSold('10,00'), null);
@@ -67,7 +73,7 @@ eq('decimal comma "1,2K"', parseSold('1,2K'), 1200);
 eq('"12.5K+"', parseSold('12.5K+'), 12500);
 eq('"1.1K" has no float noise', parseSold('1.1K'), 1100);
 eq('"2M+"', parseSold('2M+'), 2000000);
-eq('bidi marks around "100K+"', parseSold('‎100K+‏'), 100000);
+eq('bidi marks around "100K+"', parseSold('\u200e100K+\u200f'), 100000);
 eq('a bare "K" is not a number', parseSold('K'), null);
 eq('"K100" is not a number', parseSold('K100'), null);
 eq('the bucket below is unchanged: "50,000+"', parseSold('50,000+'), 50000);
@@ -78,8 +84,8 @@ ok('"100K+" clears the shortlist evidence floor', parseSold('100K+') >= 100);
 // and cannot import lib.mjs. Both copies must agree with lib.mjs.
 console.log('\nbrowser files inline parseSold — assert no copy has drifted');
 const SHARED_FIXTURES = ['10,000+', '4.000+', '3.000+', '456', '1,000+', '900+', '1,234,567',
-  '', 'abc', '1.5', '10,00', '‎10,000+‏', '10, 000 +',
-  '100K+', '100k', '1.2K', '1,2K', '12.5K+', '1.1K', '2M+', '‎100K+‏', 'K', 'K100', '50,000+'];
+  '', 'abc', '1.5', '10,00', '\u200e10,000+\u200f', '10, 000 +',
+  '100K+', '100k', '1.2K', '1,2K', '12.5K+', '1.1K', '2M+', '\u200e100K+\u200f', 'K', 'K100', '50,000+'];
 for (const file of ['extract.js', 'harvest.js']) {
   const src = readFileSync(join(HERE, file), 'utf8');
   const block = src.match(/\/\* @shared:parseSold:start \*\/([\s\S]*?)\/\* @shared:parseSold:end \*\//);
@@ -182,7 +188,7 @@ console.log('\nhelpers');
 eq('median odd', median([3, 1, 2]), 2);
 eq('median even', median([1, 2, 3, 4]), 2.5);
 eq('median empty', median([]), null);
-eq('clean strips bidi + collapses ws', clean('‎a   b‏'), 'a b');
+eq('clean strips bidi + collapses ws', clean('\u200ea   b\u200f'), 'a b');
 
 // ------------------------------------------------------- Bayesian shrinkage
 console.log('\nrank — Bayesian shrinkage beats raw rating');
@@ -321,7 +327,8 @@ console.log('\nrank — degenerate input');
  * lookalike reimplementation, which is how a confidently-wrong "proof" happens.
  */
 console.log('\nharvest.js — URL construction');
-const harvestSrc = readFileSync(join(HERE, 'harvest.js'), 'utf8');
+const harvestSrc = RUN('harvest.js');   // the code that runs (dist/ under AEF_DIST=1)
+const harvestText = SRC('harvest.js'); // the source text (markers, comments)
 const loadHarvest = (fetchImpl) => {
   const win = {};
   new Function('window', 'fetch', harvestSrc)(win, fetchImpl);
@@ -350,6 +357,13 @@ const makeItem = (id, over = {}) => ({
 });
 const reply = (html, url = 'https://he.aliexpress.com/w/x.html') =>
   ({ url, text: async () => html });
+/* localStorage stand-in: harvest.js saves its state there (2026-10-18). */
+const fakeStorage = () => {
+  const m = new Map();
+  return { get length() { return m.size; }, key: (i) => [...m.keys()][i] ?? null,
+    getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => { m.set(k, String(v)); },
+    removeItem: (k) => { m.delete(k); }, _m: m };
+};
 
 {
   const H = loadHarvest(async () => reply(makePage()));
@@ -864,7 +878,7 @@ console.log('\nrank — a collapsed title filter is NOT evidence of absence');
  */
 console.log('\nlisting.js — text and images come back together, shadow DOM included');
 {
-  const listingSrc = readFileSync(join(HERE, 'listing.js'), 'utf8');
+  const listingSrc = RUN('listing.js');
 
   // Minimal DOM stub: enough for querySelectorAll('*'), shadowRoot, innerText.
   const mkEl = (tag, props = {}) => ({
@@ -1236,7 +1250,7 @@ console.log('\nharvest.js — forceEnglish() writes the three locale cookies (in
   const jar = [];
   const fakeWin = { document: { set cookie(v) { jar.push(v); }, get cookie() { return jar.join('; '); } } };
   // harvest.js reads window.document; give the fake window one.
-  const src = readFileSync(join(HERE, 'harvest.js'), 'utf8');
+  const src = RUN('harvest.js');
   new Function('window', 'fetch', src)(fakeWin, async () => reply(makePage()));
   const msg = fakeWin.__aeHarvest.forceEnglish();
   ok('three cookies written', jar.length === 3, JSON.stringify(jar));
@@ -1258,7 +1272,7 @@ console.log('\nharvest.js — forceEnglish() writes the three locale cookies (in
  * and read back one chunk at a time. */
 console.log('\nharvest.js — expose() chunks the payload into the page for get_page_text');
 {
-  const src = readFileSync(join(HERE, 'harvest.js'), 'utf8');
+  const src = RUN('harvest.js');
   const els = {};
   const body = { children: [], get firstChild() { return this.children[0] || null; },
     insertBefore(el, ref) { this.children = [el, ...this.children.filter((c) => c !== el)]; return el; } };
@@ -1286,7 +1300,7 @@ console.log('\nharvest.js — expose() chunks the payload into the page for get_
     msgs.push(msg);
     const pre = els.__aePayload;
     ok(`chunk ${i} lands in a <pre> that is the first child of body`, body.children[0] === pre);
-    ok(`chunk ${i} is wrapped in markers`, new RegExp(`^AEPAYLOAD ${i}/${info.count} START\\n[\\s\\S]*\\nAEPAYLOAD END$`).test(pre.textContent));
+    ok(`chunk ${i} is wrapped in markers`, new RegExp(`^AEPAYLOAD ${i}/${info.count} [0-9a-z]+ START\\n[\\s\\S]*\\nAEPAYLOAD END$`).test(pre.textContent));
   }
   ok('expose() return text is short enough for the 1,000-char cap', msgs.every((m) => m.length < 200));
   ok('one <pre> is reused, not one per chunk', body.children.length === 1);
@@ -1306,7 +1320,7 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
   const recv = await startReceiver({ dir, port: 0, count: 1, idle: 30, log: (m) => logs.push(m) });
   ok('receiver picks an ephemeral port', recv.port > 0, String(recv.port));
 
-  const src = readFileSync(join(HERE, 'harvest.js'), 'utf8');
+  const src = RUN('harvest.js');
   const win = {};
   new Function('window', 'fetch', src)(win, async (url, init) => {
     if (typeof url === 'string' && url.startsWith('http://127.0.0.1:')) return fetch(url, init); // the real loopback POST
@@ -1351,12 +1365,12 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
     const forms = [];
     const doc = { createElement: (tag) => ({ tag, appendChild(c) { (this.children = this.children || []).push(c); }, submit() { this.submitted = true; forms.push(this); } }),
       body: { appendChild() {} } };
-    const winHeld = { document: doc };
+    const winHeld = { document: doc, localStorage: fakeStorage() };
     new Function('window', 'fetch', src)(winHeld, (url) => url.startsWith('http://127.0.0.1:') ? new Promise(() => {}) : Promise.resolve(reply(makePage({ items: [makeItem('h1')], finished: true }))));
     winHeld.__aeHarvest.start({ query: 'wire brush set' });
     await winHeld.__aeHarvest.step(1);
     const msg2 = await winHeld.__aeHarvest.send(9999, { timeoutMs: 50 });
-    ok('a held fetch falls back to a form POST', /^form-posted /.test(msg2), msg2);
+    ok('a held fetch falls back to a form POST, reported as UNCONFIRMED', /^UNCONFIRMED: form-posted /.test(msg2), msg2);
     eq('the form targets the receiver URL', forms[0].action, 'http://127.0.0.1:9999/harvest');
     eq('the form is text/plain (no preflight, one field)', forms[0].enctype, 'text/plain');
     eq('the textarea carries the payload verbatim', forms[0].children[0].value, winHeld.__aeHarvest.payload());
@@ -1377,7 +1391,7 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
      * fetch here would succeed, so if send() raced at all, it would return
      * the fetch reply and post no form: both halves are asserted. */
     const hiddenDoc = { ...doc, visibilityState: 'hidden' };
-    const winHidden = { document: hiddenDoc };
+    const winHidden = { document: hiddenDoc, localStorage: fakeStorage() };
     let loopbackCalls = 0;
     new Function('window', 'fetch', src)(winHidden, (url) => {
       if (url.startsWith('http://127.0.0.1:')) { loopbackCalls++; return Promise.resolve({ status: 200, text: async () => 'saved /tmp/y.json' }); }
@@ -1387,10 +1401,10 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
     await winHidden.__aeHarvest.step(1);
     const msg4 = await winHidden.__aeHarvest.send(9999);
     eq('a hidden tab never calls the loopback fetch', loopbackCalls, 0);
-    ok('a hidden tab posts the form straight away', /^form-posted /.test(msg4) && forms.length === 2, msg4);
+    ok('a hidden tab posts the form straight away', /^UNCONFIRMED: form-posted /.test(msg4) && forms.length === 2, msg4);
     ok('the reply says why the fetch was skipped', /tab hidden: fetch skipped/.test(msg4), msg4);
     ok('the reply points at the receiver output, not get_page_text',
-      /receiver prints the saved path in its own output/.test(msg4) && /get_page_text hangs/.test(msg4), msg4);
+      /receiver prints "saved <path>" in its own output/.test(msg4) && /get_page_text hangs/.test(msg4), msg4);
     const msg5 = await winHidden.__aeHarvest.send(9999, { via: 'fetch' });
     ok('an explicit via:"fetch" is still honoured in a hidden tab', /receiver replied 200/.test(msg5) && loopbackCalls === 1, msg5);
   }
@@ -1410,7 +1424,7 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
 console.log('\ndecode.mjs — one decoder for the in-app file and the Chrome chunks');
 {
   const { assemble, textsOf } = await import('./decode.mjs');
-  const src = readFileSync(join(HERE, 'harvest.js'), 'utf8');
+  const src = RUN('harvest.js');
   const els = {};
   const body = { children: [], get firstChild() { return this.children[0] || null; },
     insertBefore(el) { this.children = [el]; return el; } };
@@ -1457,7 +1471,7 @@ console.log('\ndecode.mjs — one decoder for the in-app file and the Chrome chu
 // ------------------------------------------- extract.js on an English page
 console.log('\nextract.js — English grid, USD prices, path-only URL');
 {
-  const extractSrc = readFileSync(join(HERE, 'extract.js'), 'utf8');
+  const extractSrc = RUN('extract.js');
   // extract.js is a bare IIFE expression; wrap it in parentheses so the leading
   // comment's newlines cannot trigger ASI after `return`.
   const run = (win, doc, loc) => JSON.parse(new Function('window', 'document', 'location', 'return (' + extractSrc + '\n)')(win, doc, loc));
@@ -1619,6 +1633,1375 @@ console.log('\nrank — a finalist with only the pooled count is set aside, not 
     r.warnings.some((w) => w.startsWith('own-reviews-unknown') && w.includes('pooledOnly')), JSON.stringify(r.warnings));
   const s = rank([{ id: 'x', title: 'y', rating: 4.9, sold: 5000 }], ['--mode', 'shortlist']);
   eq('shortlist mode is untouched by the own-count rule', s.ranked.map((x) => x.id), ['x']);
+}
+
+// ============================================================================
+// 2026-10-18 — the wired-USB-mouse review (41 confirmed findings, merged).
+// Every block below fails on the code of 2026-09-29. A block that throws is
+// one failure (old code lacks some functions), never a crash of the suite.
+// ============================================================================
+const block = async (name, fn) => {
+  try { await fn(); } catch (e) { fails.push(`${name} — threw ${String(e).slice(0, 160)}`); console.log(`  FAIL ${name} threw ${e}`); }
+};
+const { startReceiver: startRx } = await import('./receiver.mjs');
+const fsx = await import('node:fs');
+const osx = await import('node:os');
+const tmp = (p) => fsx.mkdtempSync(join(osx.tmpdir(), p));
+const freePort = async () => {
+  const net = await import('node:net');
+  return new Promise((res) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); }); });
+};
+const formDoc = (forms, extra = {}) => ({
+  createElement: (tag) => ({ tag, appendChild(c) { (this.children = this.children || []).push(c); },
+    submit() { this.submitted = true; forms.push(this); if (extra.onSubmit) extra.onSubmit(this); } }),
+  body: { appendChild() {} }, ...extra.doc,
+});
+const harvestWith = async (win, fetchImpl, query = 'wire brush set', src = harvestSrc) => {
+  new Function('window', 'fetch', src)(win, fetchImpl);
+  win.__aeHarvest.start({ query });
+  await win.__aeHarvest.step(1);
+  return win.__aeHarvest;
+};
+const pageFetch = (pages) => async (url) => {
+  if (url.startsWith('http://127.0.0.1:')) throw new TypeError('fetch failed');
+  const p = Number(new URL(url).searchParams.get('page'));
+  const ids = pages[p] || [];
+  return reply(makePage({ items: ids.map((i) => makeItem(i)), page: p }));
+};
+
+console.log('\nsend() — a refused fetch must not navigate the harvest away (findings 0, 4, 30)');
+await block('send refused fetch', async () => {
+  const port = await freePort(); // nothing listens here
+  const forms = [];
+  const win = { document: formDoc(forms), localStorage: fakeStorage() };
+  const H = await harvestWith(win, (url, init) => url.startsWith('http://127.0.0.1:')
+    ? fetch(url, init) : Promise.resolve(reply(makePage({ items: [makeItem('s1')], finished: true }))));
+  const msg = await H.send(port);
+  ok('a refused fetch is reported NOT DELIVERED', /^NOT DELIVERED: FETCH-ERROR/.test(msg), msg);
+  eq('and no form is posted (no navigation)', forms.length, 0);
+  ok('the reply says the page did not navigate', /did NOT navigate/.test(msg), msg);
+  ok('the reply names the liveness check', /curl -s http:\/\/127\.0\.0\.1:\d+\//.test(msg), msg);
+  ok('the reply has no query string and fits the Chrome cap', !msg.includes('?') && msg.length < 1000, String(msg.length));
+  eq('the harvest is still in the page', JSON.parse(H.payload()).items.length, 1);
+  const forced = await H.send(port, { via: 'form' });
+  ok('via:"form" still posts the form on purpose', /^UNCONFIRMED: form-posted/.test(forced) && forms.length === 1, forced);
+});
+
+console.log('\nsend() — every form POST is preceded by a localStorage backup (findings 0, 5, 30)');
+await block('send backup before form', async () => {
+  const forms = [];
+  const ls = fakeStorage();
+  let backupAtSubmit = null;
+  const win = { document: formDoc(forms, { onSubmit: () => {
+    const k = [...ls._m.keys()].find((x) => x.startsWith('__aeHarvest:wire-brush-set:'));
+    backupAtSubmit = k ? ls.getItem(k) : null; } }), localStorage: ls };
+  const H = await harvestWith(win, (url) => url.startsWith('http://127.0.0.1:')
+    ? new Promise(() => {}) : Promise.resolve(reply(makePage({ items: [makeItem('b1'), makeItem('b2')], finished: true }))));
+  const msg = await H.send(9999, { timeoutMs: 30 });
+  ok('a held fetch is UNCONFIRMED, not a success', /^UNCONFIRMED: /.test(msg), msg);
+  ok('the backup existed when the form was submitted', backupAtSubmit !== null && JSON.parse(backupAtSubmit).items.length === 2,
+    String(backupAtSubmit).slice(0, 80));
+  ok('the reply says the backup was saved and how to restore it', /backup saved \(2 items\)/.test(msg) && /restore\(\)/.test(msg), msg);
+  // No storage at all: no form, because the navigation would end the only copy.
+  const forms2 = [];
+  const win2 = { document: formDoc(forms2, { doc: { visibilityState: 'hidden' } }) };
+  const H2 = await harvestWith(win2, async () => reply(makePage({ items: [makeItem('n1')], finished: true })));
+  const msg2 = await H2.send(9999);
+  ok('without a backup no form is posted', /^NOT DELIVERED: no form posted/.test(msg2) && forms2.length === 0, msg2);
+  const msg3 = await H2.send(9999, { force: true });
+  ok('force:true posts anyway and says there is no backup', /^UNCONFIRMED: .*NO backup/.test(msg3) && forms2.length === 1, msg3);
+  // A receiver that answers but rejects: NOT DELIVERED, and no form either.
+  const forms3 = [];
+  const win3 = { document: formDoc(forms3), localStorage: fakeStorage() };
+  const H3 = await harvestWith(win3, (url) => url.startsWith('http://127.0.0.1:')
+    ? Promise.resolve({ status: 400, text: async () => 'JSON has no items[]' })
+    : Promise.resolve(reply(makePage({ items: [makeItem('r9')], finished: true }))));
+  const msg4 = await H3.send(9999, { timeoutMs: 50 });
+  ok('a 400 from the receiver is NOT DELIVERED', /^NOT DELIVERED: .*replied 400/.test(msg4) && forms3.length === 0, msg4);
+});
+
+console.log('\nrestore() — a fresh tab carries on from the next unread page (findings 1, 8, 33)');
+await block('restore', async () => {
+  const ls = fakeStorage();
+  const fetched = [];
+  const pages = { 1: ['a1', 'a2'], 2: ['b1', 'b2'], 3: ['c1'], 4: [] };
+  const f = async (url) => { const p = Number(new URL(url).searchParams.get('page')); fetched.push(p); return pageFetch(pages)(url); };
+  const w1 = { localStorage: ls };
+  new Function('window', 'fetch', harvestSrc)(w1, f);
+  w1.__aeHarvest.start({ query: 'wire brush set' });
+  await w1.__aeHarvest.step(2);
+  eq('status() reports the backup', w1.__aeHarvest.status().backup, { saved: true, items: 4 });
+  // The stuck tab is closed. A new tab on the same origin shares localStorage.
+  const w2 = { localStorage: ls };
+  new Function('window', 'fetch', harvestSrc)(w2, f);
+  const r = w2.__aeHarvest.restore();
+  ok('restore() brings the harvest back', r.restored === true && r.unique === 4 && r.pagesRead === 2 && r.requests === 2, JSON.stringify(r));
+  ok('restore() output carries no query string', !JSON.stringify(r).includes('?'), JSON.stringify(r));
+  fetched.length = 0;
+  const st = await w2.__aeHarvest.step(6);
+  eq('step() goes on from page 3, never re-reading 1-2', fetched, [3, 4]);
+  eq('the harvest is complete', [st.unique, st.stop, st.requests], [5, 'exhausted', 4]);
+  const list = w2.__aeHarvest.backups();
+  ok('backups() lists it without any URL', list.length === 1 && list[0].query === 'wire brush set' && !JSON.stringify(list).includes('?'),
+    JSON.stringify(list));
+  ok('dropBackup() removes it', /dropped/.test(w2.__aeHarvest.dropBackup('wire brush set')) && w2.__aeHarvest.backups().length === 0);
+  const w3 = { localStorage: fakeStorage() };
+  new Function('window', 'fetch', harvestSrc)(w3, f);
+  ok('restore() with nothing saved says so', /no harvest backup/.test(w3.__aeHarvest.restore().err || ''));
+});
+
+console.log('\nreceiver.mjs — takes the second send, and its doc says how to check it (findings 1, 2, 4)');
+await block('receiver defaults', async () => {
+  const dir = tmp('ae-rx2-');
+  const rx = await startRx({ dir, port: 0 }); // the defaults
+  const post = (q) => fetch('http://127.0.0.1:' + rx.port + '/harvest', { method: 'POST', body: JSON.stringify({ query: q, items: [] }) });
+  const a = await post('one'); const b = await post('two');
+  eq('two payloads are both saved by default (it used to exit after one)', [a.status, b.status], [200, 200]);
+  await new Promise((r) => setTimeout(r, 120));
+  ok('and it is still listening', rx.server.listening === true);
+  const g = await (await fetch('http://127.0.0.1:' + rx.port + '/')).text();
+  ok('GET / says it is up, how many were saved, and the idle limit', /^ok 2 saved, idle 3600 s/.test(g), g);
+  await rx.close();
+  const { spawn } = await import('node:child_process');
+  const port = await freePort();
+  const cp = spawn('node', [join(HERE, 'receiver.mjs'), '--dir', dir, '--port', String(port)]);
+  const line = await new Promise((res) => { let b2 = ''; cp.stdout.on('data', (d) => { b2 += d; if (b2.includes('\n')) res(b2); }); });
+  ok('the CLI names its limits', /no payload limit, or 3600 s idle/.test(line), line);
+  const c1 = await fetch('http://127.0.0.1:' + port + '/harvest', { method: 'POST', body: '{"query":"x","items":[]}' });
+  const c2 = await fetch('http://127.0.0.1:' + port + '/harvest', { method: 'POST', body: '{"query":"y","items":[]}' });
+  eq('the CLI with no --count takes two payloads', [c1.status, c2.status], [200, 200]);
+  cp.kill();
+  const bad = spawn('node', [join(HERE, 'receiver.mjs'), '--dir', dir, '--count', 'x']);
+  const code = await new Promise((res) => bad.on('exit', res));
+  eq('a bad --count is an error, not NaN', code, 2);
+  ok('SKILL.md no longer says the receiver exits after one payload', !/exits after one payload/.test(skillSrc));
+  ok('SKILL.md tells the operator to check the receiver before send()', /curl -s http:\/\/127\.0\.0\.1:8765\//.test(skillSrc));
+});
+
+console.log('\ndecode.mjs — several payloads are merged, never dropped (findings 3, 32)');
+await block('decode merge', async () => {
+  const { assemble, textsOf, mergePayloads } = await import('./decode.mjs');
+  const P = (q, ids, pagesRead, verdict) => ({ query: q, source: 'harvest-paged', coverage: { verdict },
+    pages: pagesRead.map((p) => ({ page: p })), items: ids.map((id) => ({ id, title: 't' + id, rating: 4.8 })) });
+  const a = P('wire brush set', ['a', 'b'], [1, 2], 'truncated');
+  const b = P('wire brush set', ['b', 'c'], [3, 4], 'exhausted-from-start-page');
+  const r = assemble([JSON.stringify(a), JSON.stringify(b)]);
+  eq('both payloads are kept, deduped by id', r.payload.items.map((i) => i.id), ['a', 'b', 'c']);
+  ok('the merge is named', /^merged\(/.test(r.via), r.via);
+  eq('pages 1-4 with no gap, one part ran dry: exhausted-all-results', r.payload.coverage.verdict, 'exhausted-all-results');
+  eq('each input is listed', r.payload.parts.length, 2);
+  const gap = mergePayloads([a, P('wire brush set', ['d'], [4, 5], 'exhausted-from-start-page')]);
+  eq('a gap in the pages read is truncated, not complete', gap.coverage.verdict, 'truncated');
+  const arr = assemble(textsOf(JSON.stringify([a, b])));
+  eq('a JSON array of payloads is accepted (it was refused)', arr.payload.items.length, 3);
+  const off = mergePayloads([a, { ...b, coverage: { verdict: 'off-query' } }]);
+  eq('an off-query part makes the merge off-query', off.coverage.verdict, 'off-query');
+  const dir = tmp('ae-dec-');
+  fsx.writeFileSync(join(dir, 'a.json'), JSON.stringify(a)); fsx.writeFileSync(join(dir, 'b.json'), JSON.stringify(b));
+  const out = execFileSync('node', [join(HERE, 'decode.mjs'), join(dir, 'a.json'), join(dir, 'b.json')], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+  eq('the CLI keeps the second file\'s items', JSON.parse(out).items.map((i) => i.id), ['a', 'b', 'c']);
+});
+
+console.log('\nstart() — startPage, and a zero budget stays zero (findings 8, 9, 33)');
+await block('start options', async () => {
+  const fetched = [];
+  const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page')); fetched.push(p);
+    return reply(makePage({ items: p < 14 ? [makeItem('sp' + p)] : [], page: p })); });
+  const plan = H.start({ query: 'wire brush set', startPage: 12, maxRequests: 5 });
+  eq('the plan names startPage', plan.startPage, 12);
+  const st = await H.step(6);
+  eq('fetching begins at startPage', fetched, [12, 13, 14]);
+  eq('a startPage run that ran dry is not "all results"', JSON.parse(H.payload()).coverage.verdict, 'exhausted-from-start-page');
+  eq('status names the start page', st.startPage, 12);
+  let calls = 0;
+  const H0 = loadHarvest(async () => { calls++; return reply(makePage({ items: [makeItem('z')] })); });
+  eq('maxRequests: 0 stays 0 (it became 24)', H0.start({ query: 'x', maxRequests: 0 }).maxRequests, 0);
+  const s0 = await H0.step(6);
+  eq('and no request is made', [calls, s0.stop], [0, 'request-budget']);
+  eq('maxPages: 0 stays 0 (it became 20)', H0.start({ query: 'x', maxPages: 0 }).maxPages, 0);
+  let threw = '';
+  try { H0.start({ query: 'x', maxRequests: 'lots' }); } catch (e) { threw = String(e); }
+  ok('a non-number budget is refused', /maxRequests must be a whole number/.test(threw), threw);
+});
+
+console.log('\nstep() — a page with the anchor but another shape is a named stop (finding 10)');
+await block('shape guard', async () => {
+  let n = 0;
+  const odd = '<html><script>/*--init-data-start--*/ window.x = { data: {"other":1} };</script></html>';
+  const H = loadHarvest(async (url) => { n++; const p = Number(new URL(url).searchParams.get('page'));
+    return reply(n === 1 ? odd : makePage({ items: p === 1 ? [makeItem('ok1')] : [], page: p })); });
+  H.start({ query: 'wire brush set' });
+  const st = await H.step(3);
+  eq('it stops as parse-error instead of throwing', st.stop, 'parse-error');
+  ok('lastErr names the missing shape', /no data\.root\.fields/.test(st.lastErr || ''), st.lastErr);
+  eq('the page is not counted as read', st.pagesRead, 0);
+  const r = H.resume();
+  eq('resume() clears it and points at the same page', [r.resumed, r.nextPage], ['parse-error', 1]);
+  const st2 = await H.step(3);
+  eq('the retry reads page 1, not page 2', JSON.parse(H.payload()).items.map((i) => i.id), ['ok1']);
+  eq('and the run then ends normally', st2.stop, 'exhausted');
+});
+
+console.log('\nresume() — a stop is no longer final (finding 12)');
+await block('resume', async () => {
+  let fail = true;
+  const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    if (p === 2 && fail) { fail = false; throw new Error('net blip'); }
+    return reply(makePage({ items: p <= 3 ? [makeItem('rs' + p)] : [], page: p })); });
+  H.start({ query: 'wire brush set' });
+  const a = await H.step(6);
+  eq('a transient error stops the run', [a.stop, a.pagesRead], ['fetch-error', 1]);
+  H.resume();
+  const b = await H.step(6);
+  eq('after resume() the items are kept and the run completes', [b.stop, b.unique, b.requests], ['exhausted', 3, 5]);
+  ok('an exhausted run is not resumed', /already ran dry/.test(H.resume().err || ''));
+  const B = loadHarvest(async () => reply(makePage({ items: [makeItem('q')] })));
+  B.start({ query: 'x', maxRequests: 1 });
+  await B.step(3);
+  B.resume({ maxRequests: 2 });
+  eq('resume({ maxRequests }) lifts a budget stop on purpose', (await B.step(3)).requests, 2);
+});
+
+console.log('\nstart() / re-install while a loop runs (finding 13)');
+await block('reentrancy', async () => {
+  const win = {};
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  new Function('window', 'fetch', harvestSrc)(win, async (url) => { await gate; const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p === 1 ? [makeItem('ri')] : [], page: p })); });
+  win.__aeHarvest.start({ query: 'wire brush set' });
+  const loop = win.__aeHarvest.step(3);
+  let threw = '';
+  try { win.__aeHarvest.start({ query: 'other' }); } catch (e) { threw = String(e); }
+  ok('start() is refused while a loop runs', /still running/.test(threw), threw);
+  const old = win.__aeHarvest;
+  const msg = new Function('window', 'fetch', 'return (' + harvestSrc + '\n)')(win, async () => reply(makePage()));
+  ok('re-installing while it runs leaves the running copy in place', win.__aeHarvest === old && /NOT replaced/.test(msg), msg);
+  release();
+  await loop;
+  const msg2 = new Function('window', 'fetch', 'return (' + harvestSrc + '\n)')(win, async () => reply(makePage()));
+  ok('re-installing when idle keeps the harvest', win.__aeHarvest !== old && win.__aeHarvest.status().unique === 1 && /kept the current harvest/.test(msg2), msg2);
+});
+
+console.log('\nstep() — a big quiet interstitial is a suspected wall, not a parse bug (finding 14)');
+await block('big html no content', async () => {
+  const big = '<html><head><script>' + 'var a=1;'.repeat(40000) + '</script></head><body><div>Loading</div></body></html>';
+  const H = loadHarvest(async () => reply(big));
+  H.start({ query: 'wire brush set' });
+  const st = await H.step(2);
+  eq('300 KB of HTML, no anchor, no punish string: suspect-wall', st.stop, 'suspect-wall');
+  ok('named by the big-html rule', (st.wall && st.wall.markers || []).includes('big-html-no-content'), JSON.stringify(st.wall));
+  const small = loadHarvest(async () => reply('<html>no payload here</html>'));
+  small.start({ query: 'wire brush set' });
+  eq('a short malformed page is still a parse-error', (await small.step(1)).stop, 'parse-error');
+});
+
+console.log('\nrelevance — an off-category stream is not "all results" (findings 6, 31)');
+await block('relevance', async () => {
+  const { queryRelevance } = await import('./lib.mjs');
+  const wire = Array.from({ length: 30 }, (_, i) => makeItem('w' + i, { title: 'Aluminum Craft Wire 20 Gauge ' + i }));
+  wire.push(makeItem('m1', { title: 'Wired USB Mouse Optical' }));
+  const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p === 1 ? wire : [], page: p })); });
+  H.start({ query: 'wired usb mouse' });
+  const st = await H.step(3);
+  eq('status() says the stream is off-query', st.relevance.offQuery, true);
+  ok('status() stays under the Chrome cap', JSON.stringify(st).length < 1000, String(JSON.stringify(st).length));
+  const pl = JSON.parse(H.payload());
+  eq('the verdict is off-query, not exhausted-all-results', pl.coverage.verdict, 'off-query');
+  eq('the stream itself did run dry', pl.coverage.streamVerdict, 'exhausted-all-results');
+  ok('the payload carries the warning', pl.warnings.some((w) => /^off-query-results: only 1 of 31/.test(w)), JSON.stringify(pl.warnings));
+  ok('pages[] carries the per-page share', pl.pages[0].onQuery < 0.1, JSON.stringify(pl.pages[0]));
+  const r = rank(pl, ['--mode', 'shortlist']);
+  ok('rank.mjs repeats the warning', r.warnings.some((w) => /^off-query-results/.test(w)), JSON.stringify(r.warnings));
+  const good = queryRelevance('wired usb mouse', ['Wired USB Mouse', 'USB Gaming Mouse', 'Optical Mouse for PC', 'Logitech M90 Mouse', 'Silent Mouse']);
+  eq('a stream of mice raises nothing', [good.measured, good.warning], [true, null]);
+  const he = queryRelevance('cheese grater', ['מגרדת גבינה', 'מגרדה סיבובית', 'מגרדת ירקות', 'מגרדת לימון', 'מגרדה']);
+  eq('Hebrew titles are unmeasured, never off-query', [he.measured, he.reason], [false, 'titles-not-latin']);
+  const brush = queryRelevance('wire brush set', ['Copper craft wire', 'Brass wire 1mm', 'Steel wire', 'Wire rope', 'Wire Brush 3pcs']);
+  // The documented limit of the any-keyword rule: a stream sharing one keyword
+  // passes, and keywordShare shows the noun's low share for a look by eye.
+  ok('a stream sharing one keyword passes, with the noun\'s share visible ("craft wire" for "wire brush set")',
+    brush.warning === null && brush.keywordShare.brush === 0.2, JSON.stringify(brush));
+  const blk = harvestText.match(/\/\* @shared:queryRelevance:start \*\/([\s\S]*?)\/\* @shared:queryRelevance:end \*\//);
+  ok('harvest.js exposes the @shared:queryRelevance block', !!blk);
+  const inl = new Function(`${blk[1]}; return queryRelevance;`)();
+  const cases = [['wired usb mouse', wire.map((w) => w.title.displayTitle)], ['wired usb mouse', ['Wired USB Mouse', 'x']],
+    ['cheese grater', ['מגרדת גבינה']], ['', ['a']], ['mouse', []], ['wire brush set', ['Copper craft wire', 'Wire Brush']]];
+  const drift = cases.filter(([q, t]) => JSON.stringify(inl(q, t)) !== JSON.stringify(queryRelevance(q, t)));
+  eq('harvest.js queryRelevance agrees with lib.mjs', drift.length, 0);
+});
+
+console.log('\nSKILL.md / harvest.js — stop list, names, wording (findings 15, 35, 36-40)');
+await block('doc names', async () => {
+  const step3 = skillSrc.slice(skillSrc.indexOf('## Step 3'), skillSrc.indexOf('### Single-page fallback'));
+  ok('the step-3 stop list names suspect-wall and what it means', /`suspect-wall`\*\* means .*screenshot/s.test(step3), 'missing');
+  ok('harvest.js no longer names the removed blockedBy()', !/blockedBy/.test(harvestText));
+  ok('SKILL.md names blockedBy() only as replaced history', (skillSrc.match(/blockedBy/g) || []).length === 1 && /replaces the old boolean `blockedBy\(\)`/.test(skillSrc));
+  ok('SKILL.md presents no ownReviews field', !/now returns `ownReviews`/.test(skillSrc));
+  ok('--spread is K of the --top N slots, not K+N', !/K\+N slots/.test(skillSrc) && /K of the `--top N` slots/.test(skillSrc));
+  ok('the saved file name is the receiver\'s, and harvest.json is explained', /harvest-<query>-<stamp>\.json` in `--dir` and prints/.test(skillSrc));
+  const ready = new Function('window', 'fetch', 'return (' + harvestSrc + '\n)')({}, null);
+  ok('the install reply says await step(6), not step(8)', /await __aeHarvest\.step\(6\)/.test(ready) && !/step\(8\)/.test(ready), ready);
+  ok('the harvest.js header says step(6) too', !/step\(8\)/.test(harvestText));
+  const row = (skillSrc.match(/\| Result cut at \*\*1,000 characters\*\*[^\n]*/) || [''])[0];
+  ok('the step-0 table names send() as the way out', /send\(/.test(row) && /fallback, visible tab only/.test(row), row);
+  ok('the starter tab of createIfEmpty is to be closed too', /close the starter tab/.test(skillSrc));
+});
+
+console.log('\nrank — the brand rule: researching a house brand must not cost it score (finding 16)');
+await block('brand rule', async () => {
+  const m = skillSrc.match(/house brand \*\*([0-9.]+)\*\*/) || skillSrc.match(/house brand mid-low \(~([0-9.]+)\)/);
+  ok('SKILL.md step 6 states a number for a house brand', !!m);
+  const house = Number(m[1]);
+  const r = rank([
+    { id: 'house', title: 'house brand', rating: 4.9, reviews: 1000, sold: 5000, brandScore: house },
+    { id: 'plain', title: 'no brand', rating: 4.9, reviews: 1000, sold: 5000 },
+    { id: 'other', title: 'other', rating: 4.9, reviews: 1000, sold: 5000, brandScore: 0.85 },
+  ], ['--mode', 'final', '--top', '5']);
+  const g = (id) => r.ranked.find((x) => x.id === id).score;
+  ok('a researched house brand does not rank below an identical brandless item', g('house') >= g('plain'), `house ${g('house')} plain ${g('plain')}`);
+  ok('SKILL.md says below 0.5 needs evidence of a problem', /A score below 0\.5 needs evidence of a problem/.test(skillSrc));
+});
+
+console.log('\nrank — the absence warning blames the regex only when the regex emptied the pool (finding 17)');
+await block('absence', async () => {
+  const pool = Array.from({ length: 12 }, (_, i) => ({ id: 'w' + i, title: 'wired usb mouse', rating: 4.8, reviews: 50, sold: 500,
+    constraints: { wired: 'fail' } }));
+  const r = rank(pool, ['--mode', 'final', '--require', 'mouse', '--constraint', 'wired']);
+  ok('no absence warning when the regex matched every title', !r.warnings.some((w) => /absence-is-not-evidence/.test(w)), JSON.stringify(r.warnings));
+  ok('the constraint warning still fires', r.warnings.some((w) => /no candidate satisfies/.test(w)));
+  const r2 = rank(pool.slice(0, 3), ['--mode', 'final', '--require', 'keyboard']);
+  ok('a regex that drops a small pool whole still warns', r2.warnings.some((w) => /absence-is-not-evidence/.test(w)), JSON.stringify(r2.warnings));
+});
+
+console.log('\nrank — no own count and no pooled count is unknown, not thin (finding 18)');
+await block('own unknown', async () => {
+  const r = rank([
+    { id: 'a', title: 'x', rating: 4.9, reviews: 800, pooledReviews: 800, sold: 5000 },
+    { id: 'b', title: 'y', rating: 4.9, reviews: null, pooledReviews: null, sold: 50000 },
+  ], ['--mode', 'final']);
+  eq('dropped as own-reviews-unknown, not evidence<10', r.droppedReasons, { 'own-reviews-unknown': 1 });
+  ok('and named in the warning', r.warnings.some((w) => /^own-reviews-unknown/.test(w) && w.includes('b')), JSON.stringify(r.warnings));
+});
+
+console.log('\nrank — a bad flag value is an error, never an empty ranking (finding 19)');
+await block('flags', async () => {
+  const pool = [{ id: 'a', title: 'x', rating: 4.9, sold: 5000 }, { id: 'b', title: 'y', rating: 4.8, sold: 3000 }];
+  for (const args of [['--spread', 'x'], ['--spread'], ['--top'], ['--top', 'abc'], ['--spread', '--top', '5']]) {
+    let code = 0, err = '';
+    try { rank(pool, ['--mode', 'shortlist', ...args]); } catch (e) { code = e.status; err = String(e.stderr || ''); }
+    ok(`${args.join(' ')} exits 2 with a message`, code === 2 && /rank\.mjs: --/.test(err), `code ${code} ${err}`);
+  }
+});
+
+console.log('\nrank — a tie across the --top cut is named (finding 20)');
+await block('ties', async () => {
+  const pool = Array.from({ length: 14 }, (_, i) => ({ id: 't' + i, title: 'x', rating: 4.8, sold: 10000, soldBucketed: true }));
+  const r = rank(pool, ['--mode', 'shortlist', '--top', '10']);
+  const w = r.warnings.find((x) => /^tie-at-cutoff/.test(x)) || '';
+  ok('the warning fires', !!w, JSON.stringify(r.warnings));
+  ok('it counts and names the items left out', /14 items share score/.test(w) && /4 of them were left out/.test(w) && /t10, t11, t12, t13/.test(w), w);
+  const r2 = rank(pool.slice(0, 10), ['--mode', 'shortlist', '--top', '10']);
+  ok('no warning when nothing tied was left out', !r2.warnings.some((x) => /tie-at-cutoff/.test(x)));
+});
+
+console.log('\nrank — reviews-exceed-sold is not raised against a bucket floor (finding 21)');
+await block('exceed floor', async () => {
+  const r = rank([
+    { id: 'floor', title: 'x', rating: 4.9, reviews: 1090, pooledReviews: 5479, ownRating: 4.9, soldRaw: '1,000+' },
+    { id: 'exact', title: 'y', rating: 4.9, reviews: 1090, ownRating: 4.9, soldRaw: '455' },
+    { id: 'sat', title: 'z', rating: 4.9, reviews: 300, ownRating: 4.9, soldRaw: '10,000+' },
+  ], ['--mode', 'final', '--top', '5']);
+  const f = (id) => r.ranked.find((x) => x.id === id).flags;
+  ok('1,090 own reviews vs "1,000+" sold is not flagged', !f('floor').includes('reviews-exceed-sold'), JSON.stringify(f('floor')));
+  ok('1,090 vs an exact 455 still is', f('exact').includes('reviews-exceed-sold'), JSON.stringify(f('exact')));
+  ok('a reader record with "10,000+" now gets sold-saturated', f('sat').includes('sold-saturated'), JSON.stringify(f('sat')));
+});
+
+console.log('\nrank — --min-evidence 0 keeps a zero (finding 22)');
+await block('min evidence 0', async () => {
+  const r = rank([{ id: 'a', title: 'x', rating: 4.8, sold: 0 }, { id: 'b', title: 'y', rating: 4.8, sold: 50 }],
+    ['--mode', 'shortlist', '--min-evidence', '0']);
+  eq('both items are kept', r.ranked.map((x) => x.id).sort(), ['a', 'b']);
+  ok('no false "evidence<0" reason', !Object.keys(r.droppedReasons).includes('evidence<0'), JSON.stringify(r.droppedReasons));
+  ok('scores are numbers', r.ranked.every((x) => Number.isFinite(x.score)), JSON.stringify(r.ranked.map((x) => x.score)));
+});
+
+console.log('\nrank — final mode ranks on the listing\'s own rating (finding 23)');
+await block('own rating', async () => {
+  const r = rank([
+    { id: 'A', title: 'pooled high', rating: 4.9, ownRating: 4.1, reviews: 1090, pooledReviews: 5479, sold: 5000 },
+    { id: 'B', title: 'honest', rating: 4.6, ownRating: 4.6, reviews: 1090, pooledReviews: 1090, sold: 5000 },
+  ], ['--mode', 'final', '--top', '2']);
+  eq('the listing its own buyers rate higher ranks first', r.ranked.map((x) => x.id), ['B', 'A']);
+  eq('ratingUsed is the own rating', r.ranked.find((x) => x.id === 'A').ratingUsed, 4.1);
+  const r2 = rank([{ id: 'C', title: 'no own rating passed', rating: 4.9, reviews: 1090, pooledReviews: 5479, sold: 5000 }], ['--mode', 'final']);
+  ok('a pooled listing without ownRating is flagged', r2.ranked[0].flags.includes('rating-may-be-pooled'), JSON.stringify(r2.ranked[0].flags));
+  ok('SKILL.md step 7 tells the operator to pass ownRating', /Add `reviews` and `ownRating`/.test(skillSrc));
+});
+
+console.log('\nlisting.js — size lines, carton rule, description wall, HTTP error, text cut, options, specs (findings 24-29, 34)');
+await block('listing', async () => {
+  const listingSrc = RUN('listing.js');
+  const el = (tag, p = {}) => ({ tagName: tag, children: p.children || [], textContent: p.text || '', className: p.cls || '',
+    naturalWidth: 0, naturalHeight: 0, currentSrc: '', src: '', shadowRoot: null, parentElement: p.parent || null,
+    getAttribute: (k) => (p.attrs || {})[k] || null, querySelector: () => null, querySelectorAll: () => p.qsa || [],
+    closest: () => null, click() {}, id: p.id || '', nodeType: 1,
+    childNodes: p.nodes || (p.text ? [{ nodeType: 3, nodeValue: p.text }] : []) });
+  const run = ({ els = [], bodyText = 'x'.repeat(2500), win = {} }) => {
+    const document = { body: { scrollHeight: 5000, innerText: bodyText }, documentElement: { outerHTML: '' },
+      querySelectorAll: (sel) => (/ld\+json/.test(sel || '') ? [] : els) };
+    const w = { scrollTo() {}, ...win, document };
+    return new Function('window', 'document', 'location', `${listingSrc}; return window.__aeListing;`)(w, document, { href: 'https://he.aliexpress.com/item/1.html' });
+  };
+  // 24: a product size in a list that also says "Package includes"
+  const ul = { textContent: 'Size: 22 x 12 x 28 cmWeight: 680 gPackage includes: 1 x grater' };
+  const r24 = await run({ els: [el('LI', { text: 'Size: 22 x 12 x 28 cm', parent: ul }), el('LI', { text: 'Weight: 680 g', parent: ul }),
+    el('LI', { text: 'Package includes: 1 x grater', parent: ul })] }).read({ description: false });
+  eq('the product size stays a product size', r24.productSizeLines, ['Size: 22 x 12 x 28 cm']);
+  eq('nothing is called the carton', r24.packageSizeLines, []);
+  const pkgParent = { textContent: 'גודל המוצר: 8x3.7x2 סמ, גודל החבילה: 12×7×4 סמ' };
+  const r24b = await run({ els: [el('SPAN', { text: '8x3.7x2 סמ', parent: pkgParent }), el('SPAN', { text: '12×7×4 סמ', parent: pkgParent })] })
+    .read({ description: false });
+  eq('a bare size takes the qualifier just before it', [r24b.productSizeLines, r24b.packageSizeLines], [['8x3.7x2 סמ'], ['12×7×4 סמ']]);
+  // 25: <li><b>Size:</b> 22 x 12 x 28 cm</li>
+  const b = el('B', { text: 'Size:' });
+  const li = el('LI', { text: 'Size: 22 x 12 x 28 cm', children: [b] });
+  const r25 = await run({ els: [li, b] }).read({ description: false });
+  eq('a bold-label size is read as one line', r25.productSizeLines, ['Size: 22 x 12 x 28 cm']);
+  const DESC = 'https://pdp.aliexpress-media.com/product/description/pc/v2/en_US/desc.htm?productId=1';
+  const descWin = (body, status = 200) => ({
+    performance: { getEntriesByType: () => [{ name: DESC }] },
+    fetch: async () => ({ url: DESC, status, ok: status < 300, text: async () => '<html>' + body + '</html>' }),
+    DOMParser: class { parseFromString() { const p = el('P', { text: body }); return { body: el('BODY', { qsa: [p], nodes: [p] }), querySelectorAll: () => [p] }; } },
+  });
+  // 26: the slider wall's text served at the description URL, no redirect
+  const r26 = await run({ win: descWin('Sorry, we have detected unusual traffic from your network. Please slide to verify.') }).read();
+  eq('a wall sentence in a short description fetch is a wall', [r26.description.source, r26.blocked], ['blocked', true]);
+  ok('and it never reaches `text`', !/unusual traffic/.test(r26.text));
+  const r26b = await run({ win: descWin('Please slide the drum into the holder until it clicks. Weight: about 680 g. Package includes 3 drums.') }).read();
+  eq('seller copy "please slide" is still the description', r26b.description.source, 'fetched');
+  // 29: an HTTP error page is not the description
+  const r29 = await run({ win: descWin('403 Forbidden. Access denied: the request token has expired, please reload.', 403) }).read();
+  eq('a 403 answer is fetch-failed, not fetched', r29.description.source, 'fetch-failed');
+  ok('and its text is not product copy', !/Access denied/.test(r29.text));
+  // 27: the description survives a long page
+  const r27 = await run({ bodyText: 'p'.repeat(25000), win: descWin('Type: Wired. Weight: about 750 g, cable 1.8 m long.') }).read();
+  ok('the description is kept when the page text passes maxText', /\[DESCRIPTION\] Type: Wired/.test(r27.text) && r27.text.length <= 20000, String(r27.text.length));
+  ok('the cut is reported', r27.warnings.some((w) => /^text-cut/.test(w)) && r27.textCut.pageKept < 25000, JSON.stringify(r27.textCut));
+  // 28: two option properties, both selected tiles kept
+  const tile = (name, sel) => el('DIV', { cls: 'sku-item--text--Q' + (sel ? ' sku-item--selected--I' : ''), text: name });
+  const r28 = await run({ els: [tile('Black', true), tile('White'), tile('Wireless'), tile('Wired USB', true)] }).read({ description: false });
+  eq('every selected option is named', r28.selectedVariants, ['Black', 'Wired USB']);
+  eq('selectedVariant is still the first', r28.selectedVariant, 'Black');
+  // 34: specification rows
+  const t = el('DIV', { cls: 'specification--title--S', text: 'Power Type' });
+  const v = el('DIV', { cls: 'specification--desc--D', text: 'Wired' });
+  const prop = el('DIV', { cls: 'specification--prop--J', children: [t, v], qsa: [t, v] });
+  const r34 = await run({ els: [prop, t, v] }).read({ description: false });
+  eq('spec rows come back as name: value', [r34.specs, r34.specsSource], [{ 'Power Type': 'Wired' }, 'dom']);
+  const r34t = await run({ bodyText: 'Specifications\nBrand Name\nNONE\nType\nWired\nInterface Type\nUSB\nDescription\nmore' + 'x'.repeat(2500) })
+    .read({ description: false });
+  eq('the text fallback reads the lines after the heading', r34t.specs, { 'Brand Name': 'NONE', Type: 'Wired', 'Interface Type': 'USB' });
+  const r34n = await run({}).read({ description: false });
+  ok('no spec rows is a warning, never "not stated"', r34n.specsSource === 'none' && r34n.warnings.some((w) => /^specs-not-found/.test(w)));
+});
+
+console.log('\nSKILL.md step-5 reader — spec rows and every selected option (findings 28, 34)');
+await block('step5 spec', async () => {
+  const optEl = (name, sel) => ({ className: 'sku-item--text--Qa1' + (sel ? ' sku-item--selected--I' : ''), querySelector: () => null, textContent: name, shadowRoot: null });
+  const specEl = (k, val) => ({ className: 'specification--prop--J', textContent: k + val, shadowRoot: null,
+    querySelector: (sel) => (/title/.test(sel) ? { textContent: k } : /desc/.test(sel) ? { textContent: val } : null) });
+  const els = [...['Black*', 'White', 'Pink', 'Blue', 'Green', 'Grey', 'Red', 'Purple', 'Gold', 'Navy', 'Teal']
+    .map((n) => optEl(n.replace('*', ''), n.endsWith('*'))), optEl('Wireless'), optEl('Wired USB', true),
+    specEl('Type', 'Wired'), specEl('Power Type', 'USB'), specEl('Battery Included', 'No'), specEl('Interface Type', 'USB'), specEl('Brand Name', 'NONE')];
+  const ldj = [{ textContent: JSON.stringify({ '@type': 'Product', aggregateRating: { ratingValue: '4.9', reviewCount: '5479' }, offers: { price: '3.1', priceCurrency: 'USD' } }) }];
+  const doc = { title: 'Mouse', body: { innerText: RV.gyro }, querySelectorAll: (sel) => (/ld\+json/.test(sel) ? ldj : els) };
+  const out = new Function('document', 'location', 'return (' + step5 + '\n)')(doc, { pathname: '/item/1005007038434772.html' });
+  const g = JSON.parse(out);
+  eq('the wanted spec rows come back', [g.spec, g.specFrom], [{ Type: 'Wired', 'Power Type': 'USB', 'Battery Included': 'No', 'Interface Type': 'USB' }, 'dom']);
+  ok('a selected option past the cap is still returned', g.options.includes('Wired USB*'), JSON.stringify(g.options));
+  eq('optionCount is the total', g.optionCount, 13);
+  ok('the result still fits the 1,000-character cap', out.length < 1000, String(out.length));
+  const doc2 = { title: 'Mouse', body: { innerText: 'x\nSpecifications\nType\n2.4Ghz Wireless\nPower Type\nRechargeable\nDescription\n' + RV.gyro },
+    querySelectorAll: (sel) => (/ld\+json/.test(sel) ? ldj : []) };
+  const g2 = JSON.parse(new Function('document', 'location', 'return (' + step5 + '\n)')(doc2, { pathname: '/item/1.html' }));
+  eq('the text fallback reads the rows after "Specifications"', [g2.spec, g2.specFrom], [{ Type: '2.4Ghz Wireless', 'Power Type': 'Rechargeable' }, 'text']);
+  const g3 = JSON.parse(new Function('document', 'location', 'return (' + step5 + '\n)')({ ...doc2, body: { innerText: RV.gyro } }, { pathname: '/item/1.html' }));
+  eq('no rows: specFrom none, spec empty', [g3.spec, g3.specFrom], [{}, 'none']);
+});
+
+console.log('\nextract.js — a version number in the title is not the rating (finding 7)');
+await block('extract rating', async () => {
+  const extractSrc = RUN('extract.js');
+  const runX = (text) => JSON.parse(new Function('window', 'document', 'location', 'return (' + extractSrc + '\n)')({},
+    { querySelectorAll: (sel) => (/ld\+json/.test(sel) ? [] : [{ href: 'https://he.aliexpress.com/item/1005000000000009.html',
+      parentElement: { parentElement: null, textContent: text } }]),
+      body: { innerText: 'x'.repeat(3000) }, documentElement: { outerHTML: '' }, title: 't' },
+    { href: 'https://he.aliexpress.com/w/x.html', origin: 'https://he.aliexpress.com', pathname: '/w/x.html', search: '' })).items[0];
+  const a = runX('Wireless Mouse Bluetooth 5.0 4.81,000+ sold US $4.92');
+  eq('"Bluetooth 5.0 4.81,000+ sold" is 4.8 and 1,000', [a.rating, a.sold], [4.8, 1000]);
+  const b = runX('USB Hub 3.0 4.9200+ sold US $2.10');
+  eq('"USB Hub 3.0 4.9200+ sold" is 4.9 and 200', [b.rating, b.sold], [4.9, 200]);
+  const c = runX('Glitter Squishy 4.9100K+ sold US $2.48');
+  eq('the glued K form still works', [c.rating, c.sold], [4.9, 100000]);
+});
+
+console.log('\ninstall copies — compact, generated, no invisible characters, same behaviour (finding 11)');
+await block('dist', async () => {
+  const { build, SOURCES } = await import('./build.mjs');
+  for (const name of SOURCES) {
+    const dist = join(HERE, 'dist', name.replace(/\.js$/, '.min.js'));
+    const cur = fsx.existsSync(dist) ? readFileSync(dist, 'utf8') : null;
+    ok(`dist/${name.replace(/\.js$/, '.min.js')} equals a fresh build (run node scripts/build.mjs)`, cur === build(name));
+    ok(`dist copy of ${name} is under 60% of the source`, cur && cur.length < 0.6 * readFileSync(join(HERE, name), 'utf8').length);
+  }
+  const CF = new RegExp('\\p{Cf}', 'u');
+  const files = [...fsx.readdirSync(HERE).filter((f) => /\.(m?js|sh)$/.test(f)).map((f) => join(HERE, f)),
+    ...fsx.readdirSync(join(HERE, 'dist')).map((f) => join(HERE, 'dist', f)), join(HERE, '..', 'SKILL.md'), join(HERE, '..', 'README.md')];
+  const dirty = files.filter((f) => CF.test(readFileSync(f, 'utf8')));
+  eq('no file holds a raw invisible format character', dirty, []);
+  const minSrc = readFileSync(join(HERE, 'dist', 'harvest.min.js'), 'utf8');
+  const scenario = async (src) => {
+    const ls = fakeStorage(); const forms = [];
+    const win = { document: formDoc(forms, { doc: { visibilityState: 'hidden' } }), localStorage: ls };
+    const pages = { 1: ['m1', 'm2'], 2: ['m3'], 3: [] };
+    new Function('window', 'fetch', src)(win, pageFetch(pages));
+    const H = win.__aeHarvest;
+    H.start({ query: 'wire brush set' });
+    const st = await H.step(6);
+    const sent = await H.send(9999);
+    const w2 = { localStorage: ls };
+    new Function('window', 'fetch', src)(w2, pageFetch(pages));
+    const rs = w2.__aeHarvest.restore();
+    const wall = loadHarvestFrom(src, async () => reply('<html>Please slide to verify</html>', 'https://he.aliexpress.com/_____tmd_____/punish?x5secdata=1'));
+    wall.start({ query: 'x' });
+    const ws = await wall.step(2);
+    return JSON.stringify([st, JSON.parse(H.payload()).items.map((i) => i.sold), sent.slice(0, 40), forms.length, rs.unique, ws.stop]);
+  };
+  const loadHarvestFrom = (src, f) => { const w = {}; new Function('window', 'fetch', src)(w, f); return w.__aeHarvest; };
+  const a = await scenario(harvestSrc), b2 = await scenario(minSrc);
+  eq('dist/harvest.min.js behaves like harvest.js (paging, send, restore, wall)', b2.replace(/"visibility":"[a-z]+"/g, ''), a.replace(/"visibility":"[a-z]+"/g, ''));
+  ok('SKILL.md step 3 installs the dist copy', /entire contents\*\* of `scripts\/dist\/harvest\.min\.js`/.test(skillSrc));
+});
+
+// ============================================================================
+// 2026-10-18, second pass — a review of the fixes above ran the real code and
+// confirmed 19 more defects (R0-R18). Each block fails on the first-pass code.
+// ============================================================================
+console.log('\nR0/R1 — send() in a hidden tab, and a held fetch, are not "not delivered"');
+await block('R0 R1', async () => {
+  ok('SKILL.md no longer says a dead port is harmless in every tab',
+    !/start it again \(step 3\)\. A `send\(\)` to a dead port returns\s+`NOT DELIVERED`/.test(skillSrc));
+  ok('SKILL.md says a hidden tab posts the form at once, so check first',
+    /Do not skip this check in a hidden\s+tab/.test(skillSrc) && /posts the form at once/.test(skillSrc));
+  const H = loadHarvest((url) => (url.startsWith('http://127.0.0.1:') ? new Promise(() => {})
+    : Promise.resolve(reply(makePage({ items: [makeItem('h1')], finished: true })))));
+  H.start({ query: 'wire brush set' });
+  await H.step(1);
+  const msg = await H.send(9999, { via: 'fetch', timeoutMs: 20 });
+  ok('a held fetch with via:"fetch" is UNCONFIRMED: it may still arrive', /^UNCONFIRMED: FETCH-HELD/.test(msg), msg);
+});
+
+console.log('\nR2/R3 — one backup per run, newest first, only a few kept');
+await block('R2 R3', async () => {
+  const ls = fakeStorage();
+  const mk2 = (pages, hang) => async (url) => {
+    const p = Number(new URL(url).searchParams.get('page'));
+    if (hang) return new Promise(() => {});
+    return reply(makePage({ items: (pages[p] || []).map((i) => makeItem(i)), page: p }));
+  };
+  const w1 = { localStorage: ls };
+  new Function('window', 'fetch', harvestSrc)(w1, mk2({ 1: ['old1', 'old2'], 2: [] }));
+  w1.__aeHarvest.start({ query: 'usb mouse' });
+  await w1.__aeHarvest.step(6);
+  await new Promise((r) => setTimeout(r, 5)); // a later start time
+  const w2 = { localStorage: ls };
+  new Function('window', 'fetch', harvestSrc)(w2, mk2({}, true));
+  w2.__aeHarvest.start({ query: 'usb mouse', fourStar: false, extra: '&shpf_co=CN' });
+  void w2.__aeHarvest.step(6); // page 1 hangs; the tab is then lost
+  const w3 = { localStorage: ls };
+  new Function('window', 'fetch', harvestSrc)(w3, mk2({}));
+  const r = w3.__aeHarvest.restore('usb mouse');
+  eq('restore() returns the CURRENT run, not the older one of the same query', [r.unique, r.stop, r.pagesRead], [0, null, 0]);
+  const pl = JSON.parse(w3.__aeHarvest.payload());
+  eq('with its own filters', [pl.fourStar, pl.extraApplied], [false, true]);
+  const r2 = w3.__aeHarvest.restore();
+  eq('restore() with no query takes the newest run too', r2.unique, 0);
+  // Pruning: at most 3 runs are kept.
+  for (let k = 0; k < 5; k++) {
+    await new Promise((res) => setTimeout(res, 3));
+    const w = { localStorage: ls };
+    new Function('window', 'fetch', harvestSrc)(w, mk2({ 1: ['p' + k], 2: [] }));
+    w.__aeHarvest.start({ query: 'query ' + k });
+    await w.__aeHarvest.step(3);
+  }
+  const keys = [...ls._m.keys()].filter((k) => k.startsWith('__aeHarvest:'));
+  eq('only the 3 newest runs stay in localStorage', keys.length, 3);
+  const list = w3.__aeHarvest.backups();
+  eq('backups() lists them newest first', list.map((b) => b.query), ['query 4', 'query 3', 'query 2']);
+  ok('backups() fits the Chrome cap', JSON.stringify(list).length < 1000, String(JSON.stringify(list).length));
+  ok('dropBackup() of a query never saved says so', /^no backup for/.test(w3.__aeHarvest.dropBackup('never harvested')));
+  // A full store: older runs are dropped and the save is tried again.
+  const full = fakeStorage();
+  const cap = 6000;
+  const setItem = full.setItem;
+  full.setItem = (k, v) => {
+    const used = [...full._m.entries()].reduce((a, [kk, vv]) => a + (kk === k ? 0 : vv.length), 0);
+    if (used + String(v).length > cap) { const e = new Error('QuotaExceededError'); e.name = 'QuotaExceededError'; throw e; }
+    setItem(k, v);
+  };
+  full._m.set('__aeHarvest:big-old:1', 'x'.repeat(5500));
+  const wq = { localStorage: full };
+  new Function('window', 'fetch', harvestSrc)(wq, mk2({ 1: ['q1', 'q2'], 2: [] }));
+  wq.__aeHarvest.start({ query: 'garlic press' });
+  const sq = await wq.__aeHarvest.step(3);
+  eq('a full store drops the older run and saves this one', [sq.backup && sq.backup.saved, full._m.has('__aeHarvest:big-old:1')], [true, false]);
+});
+
+console.log('\nR4 — receiver flags that would exit at once or bind a random port');
+await block('R4', async () => {
+  const { spawn } = await import('node:child_process');
+  const dir = tmp('ae-rx4-');
+  // Never the default port 8765: a live session may hold it.
+  const fp = String(await freePort());
+  for (const args of [['--port', fp, '--idle', '99999999'], ['--port', ''], ['--port', fp, '--idle', '0'], ['--port', '70000']]) {
+    const cp = spawn('node', [join(HERE, 'receiver.mjs'), '--dir', dir, ...args]);
+    let err = '';
+    cp.stderr.on('data', (d) => { err += d; });
+    const code = await new Promise((res) => { const t = setTimeout(() => { cp.kill(); res('running'); }, 1500); cp.on('exit', (c) => { clearTimeout(t); res(c); }); });
+    ok(`receiver ${args.join(' ')} is refused with exit 2`, code === 2 && /must be a whole number/.test(err), `exit ${code} ${err}`);
+  }
+});
+
+console.log('\nR5 — a page that throws half way is never half counted');
+await block('R5', async () => {
+  const odd = (id, field) => { const it = makeItem(id); if (field === 'img') it.image = { imgUrl: 12345 }; if (field === 'desc') it.trade = { tradeDesc: 777 };
+    if (field === 'title') it.title = { displayTitle: 42 }; return it; };
+  const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p === 1 ? [odd('a', 'img'), odd('b', 'desc'), odd('c', 'title'), makeItem('d')] : [], page: p })); });
+  H.start({ query: 'wire brush set' });
+  const st = await H.step(3);
+  eq('number-typed fields are read, not thrown on', [st.stop, st.unique], ['exhausted', 4]);
+  let boom = true;
+  const bad = makeItem('x2');
+  Object.defineProperty(bad, 'prices', { get() { if (boom) throw new Error('odd item'); return {}; } });
+  const pages2 = { 1: [makeItem('x1')], 2: [makeItem('y1'), bad], 3: [] };
+  // Direct check on the real loop: a fetch reply whose JSON holds a getter cannot exist, so drive it with a
+  // page object: patch JSON.parse for page 2 to return live objects.
+  const realParse = JSON.parse;
+  const W = {};
+  new Function('window', 'fetch', 'JSON', harvestSrc)(W, async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    return reply(`<html>/*init-data-start*/ x = { data: {"p":${p}} };</html>`); },
+  { stringify: JSON.stringify, parse: (t) => { const o = realParse(t); if (o && o.p) return { data: { root: { fields: { pageInfo: {}, mods: { itemList: { content: pages2[o.p] } } } } } }; return o; } });
+  W.__aeHarvest.start({ query: 'wire brush set' });
+  const s1 = await W.__aeHarvest.step(6);
+  eq('the throw stops the run on page 2, named', [s1.stop, /odd item/.test(s1.lastErr || '')], ['parse-error', true]);
+  eq('page 2 is not counted, none of its items kept', [s1.pagesRead, s1.unique], [1, 1]);
+  eq('resume() points back at page 2', W.__aeHarvest.resume().nextPage, 2);
+  boom = false;
+  const s2 = await W.__aeHarvest.step(6);
+  const pl = JSON.parse(W.__aeHarvest.payload());
+  eq('the retry reads page 2 whole and the pages have no gap', [s2.unique, pl.pages.map((x) => x.page)], [3, [1, 2, 3]]);
+});
+
+console.log('\nR6/R7 — a broken payload stays a parse-error; blank budgets are refused');
+await block('R6 R7', async () => {
+  const broken = '<html><script>' + 'var a=1;'.repeat(12000) + '</script><script>/*--init-data-start--*/ x = { data: {"a":1,} };</script></html>';
+  const H = loadHarvest(async () => reply(broken));
+  H.start({ query: 'wire brush set' });
+  const st = await H.step(2);
+  eq('anchor present, JSON broken: parse-error, not suspect-wall', st.stop, 'parse-error');
+  ok('with the JSON error as the cause', /^json:/.test(st.lastErr || ''), st.lastErr);
+  for (const v of ['', ' ', false, [], [3]]) {
+    let threw = '';
+    try { H.start({ query: 'x', maxRequests: v }); } catch (e) { threw = String(e); }
+    ok(`maxRequests ${JSON.stringify(v)} is refused`, /must be a whole number/.test(threw), threw || 'accepted');
+  }
+  eq('a digit string is still fine', H.start({ query: 'x', maxRequests: '12' }).maxRequests, 12);
+});
+
+console.log('\nR8-R10 — relevance: a qualifier typed last, and Hebrew titles with English words');
+await block('R8-R10', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  const mice = ['Gaming Mouse RGB 7200DPI', 'Silent Mouse for Laptop', 'Ergonomic Vertical Mouse', 'Optical Mouse Office', 'Logitech M90 Mouse'];
+  for (const q of ['mouse wired', 'usb wired mouse', 'wired usb mouse']) {
+    eq(`"${q}" on a stream of mice raises nothing`, qr(q, mice).warning, null);
+  }
+  for (const [q, ts] of [['headphones bluetooth', ['Wireless Headphones', 'Sport Headphones', 'Kids Headphones', 'Headphones Mic', 'Over Ear Headphones']],
+    ['socks cotton', ['Men Socks', 'Ankle Socks', 'Thermal Socks', 'Sports Socks', 'Wool Socks']],
+    ['knife kitchen', ['Chef Knife', 'Paring Knife', 'Bread Knife', 'Santoku Knife', 'Steak Knife']]]) {
+    eq(`"${q}" on its own product raises nothing`, qr(q, ts).warning, null);
+  }
+  ok('the craft-wire stream is still off-query', qr('wired usb mouse', Array(10).fill('Aluminum Craft Wire 20 Gauge')).warning !== null);
+  const he = ['כבל USB Type C 3A טעינה מהירה Samsung Xiaomi Huawei', 'כבל טעינה Type-C 2M Xiaomi Redmi', 'מתאם USB C OTG',
+    'כבל USB C ל-USB C 100W', 'Baseus כבל USB Type C'];
+  eq('Hebrew titles with English brands are unmeasured, not off-query', [qr('usb c cable 2m', he).measured, qr('usb c cable 2m', he).reason],
+    [false, 'titles-not-latin']);
+  const reword = (skillSrc.match(/re-word\s+the\s+query\s+\(([^)]*)\)/) || [])[1] || '';
+  const sugg = [...reword.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+  ok('SKILL.md suggests re-wordings', sugg.length >= 1, reword);
+  ok('none of them raises the alarm on real mice', sugg.every((q) => qr(q, mice).warning === null), JSON.stringify(sugg));
+});
+
+console.log('\nR11/R12 — decode.mjs: two chunk sets, and a merge across queries');
+await block('R11 R12', async () => {
+  const { assemble, mergePayloads } = await import('./decode.mjs');
+  const exportChunks = async (ids, startPage) => {
+    const els = {};
+    const body = { children: [], get firstChild() { return this.children[0] || null; }, insertBefore(el) { this.children = [el]; return el; } };
+    const doc = { body, getElementById: (id) => els[id] || null,
+      createElement: () => { const el = { textContent: '', setAttribute() {} };
+        Object.defineProperty(el, 'id', { set(v) { els[v] = el; }, get() { return '__aePayload'; } }); return el; } };
+    const win = { document: doc };
+    new Function('window', 'fetch', harvestSrc)(win, async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+      return reply(makePage({ items: p === startPage ? ids.map((i) => makeItem(i, { title: 'brush ' + 'z'.repeat(60) })) : [], page: p })); });
+    win.__aeHarvest.start({ query: 'wire brush set', startPage });
+    await win.__aeHarvest.step(3);
+    const n = win.__aeHarvest.chunks(400).count;
+    const dumps = [];
+    const dumpOf = (i) => { win.__aeHarvest.expose(i, 400); return 'Title\n' + els.__aePayload.textContent + '\nfooter'; };
+    for (let i = 0; i < n; i++) dumps.push(dumpOf(i));
+    return { dumps, n, H: win.__aeHarvest, dumpOf };
+  };
+  const one = await exportChunks(['a1', 'a2', 'a3'], 1);
+  const two = await exportChunks(['b1', 'b2', 'b3'], 1);
+  ok('the fixture has the same chunk count twice', one.n === two.n && one.n >= 2, `${one.n} ${two.n}`);
+  const r = assemble([...one.dumps, ...two.dumps]);
+  eq('two chunk sets with the same count are both kept', r.payload.items.map((i) => i.id).sort(), ['a1', 'a2', 'a3', 'b1', 'b2', 'b3']);
+  // A payload that changed between two exposes cannot be stitched together.
+  const mid = await exportChunks(['c1', 'c2', 'c3'], 1);
+  mid.H.st.items.push({ id: 'late', title: 'brush late' }); // the harvest changed between two exposes
+  let err = '';
+  try { assemble([mid.dumps[0], mid.dumpOf(1)]); } catch (e) { err = String(e); }
+  ok('chunks of two different payload states are never stitched', /missing chunk/.test(err), err || 'decoded');
+  const P = (q, ids, pages, verdict) => ({ query: q, coverage: { verdict }, pages: pages.map((page) => ({ page })), items: ids.map((id) => ({ id, title: q, rating: 4.8, sold: 500 })) });
+  const m = mergePayloads([P('cheese grater', ['g1'], [1, 2, 3, 4, 5], 'exhausted-all-results'), P('vegetable slicer', ['v1'], [1, 2], 'truncated')]);
+  eq('a truncated query keeps the merge truncated', m.coverage.verdict, 'truncated');
+  eq('each query has its own verdict', m.coverage.byQuery.map((x) => x.verdict), ['exhausted-all-results', 'truncated']);
+  const rr = rank(m, ['--mode', 'shortlist', '--min-evidence', '1']);
+  ok('rank.mjs repeats the merged-queries warning', rr.warnings.some((w) => /^merged-queries/.test(w)), JSON.stringify(rr.warnings));
+});
+
+console.log('\nR13 — tie-at-cutoff with --spread names only items really left out');
+await block('R13', async () => {
+  const pool = Array.from({ length: 14 }, (_, i) => ({ id: 't' + i, title: 'x', rating: 4.8, sold: 10000, soldBucketed: true }));
+  const r = rank(pool, ['--mode', 'shortlist', '--top', '10', '--spread', '4']);
+  const w = r.warnings.find((x) => /^tie-at-cutoff/.test(x)) || '';
+  const inIds = new Set(r.ranked.map((x) => x.id));
+  const named = (w.match(/\(([^)]*)\)/) || ['', ''])[1].split(', ').filter((x) => /^t\d+$/.test(x));
+  ok('no id named as left out is in ranked', named.length > 0 && named.every((id) => !inIds.has(id)), w);
+  ok('the count is the real one (4)', /4 of them were left out/.test(w), w);
+  const r2 = rank(pool.slice(0, 10), ['--mode', 'shortlist', '--top', '10', '--spread', '4']);
+  ok('no warning when every tied item is in', !r2.warnings.some((x) => /tie-at-cutoff/.test(x)), JSON.stringify(r2.warnings));
+});
+
+console.log('\nR14-R17 — listing.js: <br> lines, a digit in the carton label, a Hebrew wall, spec rows by name');
+const listingScenarios = async (src) => {
+  const el = (tag, p = {}) => ({ tagName: tag, children: p.children || [], textContent: p.text || '', className: p.cls || '',
+    naturalWidth: 0, naturalHeight: 0, currentSrc: '', src: '', shadowRoot: null, parentElement: p.parent || null,
+    getAttribute: (k) => (p.attrs || {})[k] || null, querySelector: () => null, querySelectorAll: () => p.qsa || [],
+    closest: () => null, click() {}, id: p.id || '', nodeType: 1,
+    childNodes: p.nodes || (p.text ? [{ nodeType: 3, nodeValue: p.text }] : []) });
+  const run = ({ els = [], bodyText = 'x'.repeat(2500), win = {} }) => {
+    const document = { body: { scrollHeight: 5000, innerText: bodyText }, documentElement: { outerHTML: '' },
+      querySelectorAll: (sel) => (/ld\+json/.test(sel || '') ? [] : els) };
+    const w = { scrollTo() {}, ...win, document };
+    return new Function('window', 'document', 'location', `${src}; return window.__aeListing;`)(w, document, { href: 'https://he.aliexpress.com/item/1.html' });
+  };
+  const DESC = 'https://pdp.aliexpress-media.com/product/description/pc/v2/he_IL/desc.htm?productId=1';
+  const descWin = (body, status = 200) => ({ performance: { getEntriesByType: () => [{ name: DESC }] },
+    fetch: async () => ({ url: DESC, status, text: async () => '<html>' + body + '</html>' }),
+    DOMParser: class { parseFromString() { const p = el('P', { text: body }); return { body: el('BODY', { qsa: [p], nodes: [p] }), querySelectorAll: () => [p] }; } } });
+  const out = {};
+  const b = el('B', { text: 'Size:' }); const br = el('BR');
+  out.br = (await run({ els: [el('P', { text: 'Size: 22 x 12 x 28 cm', children: [b, br] }), b, br] }).read({ description: false })).productSizeLines;
+  const par = { textContent: 'Package Size (1pc): 12x7x4cm Weight: 59 g' };
+  const r15 = await run({ els: [el('SPAN', { text: '12x7x4cm', parent: par })] }).read({ description: false });
+  out.pkg = [r15.productSizeLines, r15.packageSizeLines];
+  const r16 = await run({ win: descWin('אנו מזהים תעבורה חריגה מהרשת שלך. נא להחליק את המחוון כדי לאמת שאתה אנושי.') }).read();
+  out.heWall = [r16.description.source, r16.blocked];
+  const r16b = await run({ win: descWin('Sorry, we have detected unusual traffic from your network. ' + 'Please slide to verify. '.repeat(50)) }).read();
+  out.enLong = [r16b.description.source, r16b.blocked];
+  const r16c = await run({ win: descWin('נא להחליק את המכסה עד הסוף. משקל: 680 גרם. באריזה: 3 תופים ומגרדה אחת.') }).read();
+  out.heCopy = r16c.description.source;
+  const r17 = await run({ bodyText: 'Customer Reviews\nSpecifications\nDescription\nx\nSpecifications\nBrand Name\nNONE\nModel Number\n\nType\nWired\nPower Type\nUSB\nDescription\n' + 'y'.repeat(2500) })
+    .read({ description: false });
+  out.specs = [r17.specs, r17.specsSource];
+  return out;
+};
+await block('R14-R17', async () => {
+  const listingSrc = RUN('listing.js');
+  const o = await listingScenarios(listingSrc);
+  eq('<p><b>Size:</b> 22 x 12 x 28 cm<br></p> is a product size line', o.br, ['Size: 22 x 12 x 28 cm']);
+  eq('"Package Size (1pc): 12x7x4cm" is the carton', o.pkg, [[], ['12x7x4cm']]);
+  eq('a Hebrew slider wall at the description URL is a wall', o.heWall, ['blocked', true]);
+  eq('an English wall past 1,000 chars is a wall too', o.enLong, ['blocked', true]);
+  eq('Hebrew seller copy "נא להחליק את המכסה" is still the description', o.heCopy, 'fetched');
+  eq('spec rows by name: an empty value shifts nothing, a tab label is skipped', o.specs,
+    [{ 'Brand Name': 'NONE', 'Model Number': '', Type: 'Wired', 'Power Type': 'USB' }, 'text']);
+});
+
+console.log('\nR18 — build.mjs: a regex after if (...), line continuations, and the dist copies behave');
+await block('R18', async () => {
+  const { strip, buildSource } = await import('./build.mjs');
+  const code = 'var s = "a//b"; var hit = 0; if (s) /\\/\\//.test(s) && hit++; var t = (4) / 2 / 1;';
+  const stripped = strip(code);
+  eq('a regex after the ")" of if(...) survives', [new Function(code + ' return [hit, t];')(), new Function(stripped + ' return [hit, t];')()],
+    [[1, 2], [1, 2]]);
+  let threw = '';
+  try { strip('var a = "ab\\\n  cd";'); } catch (e) { threw = String(e); }
+  ok('a string line continuation is refused, not silently changed', /continues over a line/.test(threw), threw);
+  let bt = '';
+  try { buildSource('x.js', '(() => { var a = ; })()'); } catch (e) { bt = String(e); }
+  ok('a copy that would not parse is refused by the build', /does not parse/.test(bt), bt || 'built');
+  const listingDist = readFileSync(join(HERE, 'dist', 'listing.min.js'), 'utf8');
+  const a = await listingScenarios(readFileSync(join(HERE, 'listing.js'), 'utf8'));
+  const b = await listingScenarios(listingDist);
+  eq('dist/listing.min.js behaves like listing.js', JSON.stringify(b), JSON.stringify(a));
+  const exSrc = readFileSync(join(HERE, 'extract.js'), 'utf8');
+  const exDist = readFileSync(join(HERE, 'dist', 'extract.min.js'), 'utf8');
+  const runX = (src, text, win = {}) => new Function('window', 'document', 'location', 'return (' + src + '\n)')(win,
+    { querySelectorAll: (sel) => (/ld\+json/.test(sel) ? [] : [{ href: 'https://he.aliexpress.com/item/1005000000000009.html',
+      parentElement: { parentElement: null, textContent: text } }]), body: { innerText: 'x'.repeat(3000) }, documentElement: { outerHTML: '' }, title: 't' },
+    { href: 'https://he.aliexpress.com/w/x.html?page=2', origin: 'https://he.aliexpress.com', pathname: '/w/x.html', search: '?page=2' });
+  const cards = ['Wireless Mouse Bluetooth 5.0 4.81,000+ sold US $4.92 US $9.90 -50% Free shipping', 'מגב 4.9 2,000+ נמכרו ₪18.30', 'Squishy 4.9100K+ sold US $2.48'];
+  const initWin = { _dida_config_: { _init_data_: { data: { data: { root: { fields: { mods: { itemList: { content: [
+    { productId: 'e1', title: { displayTitle: 'Clip Mop' }, prices: { salePrice: { minPrice: 9.5, currencyCode: 'USD' } }, evaluation: { starRating: 4.8 }, trade: { tradeDesc: '3,000+ sold' } }] } } } } } } } } };
+  eq('dist/extract.min.js behaves like extract.js', [...cards.map((t) => runX(exDist, t)), runX(exDist, '', initWin)],
+    [...cards.map((t) => runX(exSrc, t)), runX(exSrc, '', initWin)]);
+  ok('SKILL.md says the whole suite runs on the dist copies', /runs the WHOLE suite\s+a second time on the three dist copies/.test(skillSrc));
+});
+
+// ============================================================================
+// 2026-10-18, third pass — a review of the second pass confirmed 8 more
+// (S1-S8). Each block fails on the second-pass code.
+// ============================================================================
+console.log('\nS1/S2 — relevance never flags a correct stream, whatever word comes last');
+await block('S1 S2', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  const cases = [
+    ['rc car', ['RC Car 1:16 4WD Off Road', 'Remote Control Car for Kids', 'Drift Car RC 2.4G', 'Off Road Car Toy', 'Monster Truck RC Car']],
+    ['coil spring', ['Compression Spring 10pcs', 'Steel Spring Assortment Kit', 'Extension Springs', 'Torsion Spring', 'Spring Set 200pcs']],
+    ['faux leather', ['PU Leather Sheet A4', 'Faux Leather Fabric Roll', 'Leather Vinyl Roll', 'Synthetic Leather Craft', 'Litchi Leather Sheets']],
+    ['magnifying glass', ['Magnifier 10X Handheld', 'Handheld Magnifying Glass LED', 'Reading Magnifier', 'Loupe 30X', 'Glass Lens Magnifier']],
+    ['mouse optical', ['Gaming Mouse RGB', 'Silent Mouse', 'Ergonomic Vertical Mouse', 'Wired Mouse USB', 'Office Mouse']],
+    ['mouse for computer', ['Gaming Mouse RGB', 'Silent Mouse', 'Ergonomic Vertical Mouse', 'Wired Mouse USB', 'Office Mouse']],
+    ['mouse wired quiet', ['Gaming Mouse RGB', 'Silent Mouse', 'Ergonomic Vertical Mouse', 'Wired Mouse USB', 'Office Mouse']],
+  ];
+  for (const [q, ts] of cases) eq(`"${q}" on its own product raises nothing`, qr(q, ts).warning, null);
+  // The real 2026-10-17 streams, from the fixture inside the skill (it used
+  // to read another session's scratchpad and skip when that was gone).
+  const fx = JSON.parse(SRC('fixtures/real-titles-2026-10-17.json'));
+  for (const q of ['wired usb mouse', 'mouse wired', 'mouse corded', 'mouse for computer']) {
+    ok(`real craft-wire stream is off-query for "${q}"`, qr(q, fx.craftWire.titles).warning !== null);
+    eq(`real mouse stream (${fx.mice.titles.length} titles) is never off-query for "${q}"`, qr(q, fx.mice.titles).warning, null);
+  }
+  ok('wire is still not wired', qr('wired usb mouse', Array(10).fill('Aluminum Craft Wire 20 Gauge')).warning !== null);
+});
+
+console.log('\nS3 — rank.mjs keeps a merged part\'s off-query warning');
+await block('S3', async () => {
+  const { mergePayloads } = await import('./decode.mjs');
+  const off = { query: 'wired usb mouse', coverage: { verdict: 'off-query' }, pages: [{ page: 1 }],
+    warnings: ['off-query-results: only 0 of 20 titles hold any of the keywords [wired, usb, mouse]. ...'],
+    items: Array.from({ length: 20 }, (_, i) => ({ id: 'w' + i, title: 'Aluminum Craft Wire ' + i, rating: 4.8, sold: 5000 })) };
+  const good = { query: 'usb mouse', coverage: { verdict: 'exhausted-all-results' }, pages: [{ page: 1 }, { page: 2 }], warnings: [],
+    items: Array.from({ length: 40 }, (_, i) => ({ id: 'm' + i, title: 'USB Mouse ' + i, rating: 4.8, sold: 5000 })) };
+  const m = mergePayloads([off, good]);
+  const r = rank(m, ['--mode', 'shortlist']);
+  ok('the part\'s off-query warning reaches the ranking', r.warnings.some((w) => /^off-query-results: only 0 of 20/.test(w)), JSON.stringify(r.warnings));
+});
+
+console.log('\nS4/S5 — the nearest label decides, and a <br> block is split into lines');
+const listingScenarios2 = async (src) => {
+  const el = (tag, p = {}) => ({ tagName: tag, children: p.children || [], textContent: p.text || '', className: p.cls || '',
+    naturalWidth: 0, naturalHeight: 0, currentSrc: '', src: '', shadowRoot: null, parentElement: p.parent || null,
+    getAttribute: () => null, querySelector: () => null, querySelectorAll: () => [], closest: () => null, click() {}, id: '',
+    nodeType: 1, childNodes: p.nodes || (p.text ? [{ nodeType: 3, nodeValue: p.text }] : []) });
+  const t = (v) => ({ nodeType: 3, nodeValue: v });
+  const run = (els, bodyText = 'x'.repeat(2500)) => {
+    const document = { body: { scrollHeight: 5000, innerText: bodyText }, documentElement: { outerHTML: '' },
+      querySelectorAll: (sel) => (/ld\+json/.test(sel || '') ? [] : els) };
+    return new Function('window', 'document', 'location', `${src}; return window.__aeListing;`)({ scrollTo() {}, document }, document,
+      { href: 'https://he.aliexpress.com/item/1.html' }).read({ description: false });
+  };
+  const sizes = (r) => [r.productSizeLines, r.packageSizeLines];
+  const out = {};
+  const ul1 = { textContent: 'Package: 1 x MouseProduct size:12 x 6 x 4 cm' };
+  out.nearest = sizes(await run([el('LI', { text: 'Package: 1 x Mouse', parent: ul1 }), el('LI', { text: 'Product size:', parent: ul1 }),
+    el('LI', { text: '12 x 6 x 4 cm', parent: ul1 })]));
+  const ul2 = { textContent: 'Package includes: 1 x graterSize22 x 12 x 28 cm' };
+  out.afterValue = sizes(await run([el('LI', { text: 'Package includes: 1 x grater', parent: ul2 }), el('LI', { text: 'Size', parent: ul2 }),
+    el('LI', { text: '22 x 12 x 28 cm', parent: ul2 })]));
+  const old = { textContent: 'גודל החבילה: 12×7×4 סמ, משקל: 0.059 קג' };
+  out.carton = sizes(await run([el('SPAN', { text: '12×7×4 סמ', parent: old })]));
+  const br1 = el('BR'), br2 = el('BR'), br3 = el('BR'), br4 = el('BR'), br5 = el('BR');
+  out.block = sizes(await run([el('P', { text: 'Specification:Material: ABSSize: 22*12*28cmWeight: 500gPackage Included:1 x Grater',
+    children: [br1, br2, br3, br4, br5],
+    nodes: [t('Specification:'), br1, t('Material: ABS'), br2, t('Size: 22*12*28cm'), br3, t('Weight: 500g'), br4, t('Package Included:'), br5, t('1 x Grater')] })]));
+  const b1 = el('BR');
+  out.two = sizes(await run([el('P', { text: 'Size: 22 x 12 x 28 cmPackage size: 30 x 20 x 10 cm', children: [b1],
+    nodes: [t('Size: 22 x 12 x 28 cm'), b1, t('Package size: 30 x 20 x 10 cm')] })]));
+  const s1 = el('SPAN', { text: 'Size: 22x12x28cm' }), s2 = el('SPAN', { text: 'Package size: 30x20x10cm' }), b2 = el('BR');
+  out.spans = sizes(await run([el('P', { text: 'Size: 22x12x28cmPackage size: 30x20x10cm', children: [s1, b2, s2], nodes: [s1, b2, s2] }), s1, s2]));
+  return out;
+};
+await block('S4 S5', async () => {
+  const o = await listingScenarios2(readFileSync(join(HERE, 'listing.js'), 'utf8'));
+  eq('"Package: 1 x Mouse" then "Product size:" then the size: product', o.nearest, [['12 x 6 x 4 cm'], []]);
+  eq('"Package includes: 1 x grater" then "Size" then the size: product', o.afterValue, [['22 x 12 x 28 cm'], []]);
+  eq('the original carton case still is the carton', o.carton, [[], ['12×7×4 סמ']]);
+  eq('a <br> spec block: the size line alone, as product', o.block, [['Size: 22*12*28cm'], []]);
+  eq('<p>Size …<br>Package size …</p>: one product, one carton', o.two, [['Size: 22 x 12 x 28 cm'], ['Package size: 30 x 20 x 10 cm']]);
+  eq('spans split by <br>: no spurious carton entry', o.spans, [['Size: 22x12x28cm'], ['Package size: 30x20x10cm']]);
+  const d = await listingScenarios2(readFileSync(join(HERE, 'dist', 'listing.min.js'), 'utf8'));
+  eq('dist/listing.min.js gives the same', JSON.stringify(d), JSON.stringify(o));
+});
+
+console.log('\nS6 — spec text rows: a value that is a name, a Hebrew table, a Hebrew end heading');
+await block('S6', async () => {
+  const src = RUN('listing.js');
+  const run = (bodyText) => {
+    const document = { body: { scrollHeight: 5000, innerText: bodyText + '\n' + 'x'.repeat(2500) }, documentElement: { outerHTML: '' },
+      querySelectorAll: () => [] };
+    return new Function('window', 'document', 'location', `${src}; return window.__aeListing;`)({ scrollTo() {}, document }, document,
+      { href: 'https://he.aliexpress.com/item/1.html' }).read({ description: false });
+  };
+  const a = await run('Specifications\nFeature\nWaterproof\nType\nWired\nDescription');
+  eq('a value that is itself a spec name stays a value', a.specs, { Feature: 'Waterproof', Type: 'Wired' });
+  ok('a text-path read carries the confirm warning', a.warnings.some((w) => /^specs-from-text/.test(w)), JSON.stringify(a.warnings));
+  const b = await run('מפרטים\nשם המותג\nNONE\nסוג\nחוטי\nתיאור\nטקסט');
+  eq('a Hebrew table is text-raw with its lines, not silently empty', [b.specsSource, /שם המותג \| NONE \| סוג \| חוטי/.test(b.specsText || '')],
+    ['text-raw', true]);
+  ok('the Hebrew end heading stops the raw lines', !/טקסט/.test(b.specsText || ''), b.specsText);
+  ok('and the read says the rows are unknown', b.warnings.some((w) => /^specs-not-found: .*specsText/.test(w)), JSON.stringify(b.warnings));
+  const c = await run('Specifications\nModel Number\nGender\nMen\nType\nWired\nDescription');
+  eq('a missing value next to a known name does not shift the rows', c.specs, { 'Model Number': '', Gender: 'Men', Type: 'Wired' });
+});
+
+console.log('\nS7 — decode.mjs joins pages only within one search stream (query AND filters)');
+await block('S7', async () => {
+  const { mergePayloads } = await import('./decode.mjs');
+  const mkH = async (opts, pages) => {
+    const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+      return reply(makePage({ items: (pages[p] || []).map((i) => makeItem(i)), page: p })); });
+    H.start({ query: 'wire brush set', ...opts });
+    await H.step(6);
+    return JSON.parse(H.payload());
+  };
+  const fa = await mkH({ extra: '&shpf_co=CN', maxRequests: 3 }, { 1: ['a1'], 2: ['a2'], 3: ['a3'], 4: ['a4'] });
+  const fb = await mkH({ startPage: 4 }, { 4: ['b4'], 5: ['b5'], 6: [] });
+  ok('payloads name their filters without echoing them', fa.filterKey && fa.filterKey !== fb.filterKey && !JSON.stringify(fa).includes('shpf'));
+  const m = mergePayloads([fa, fb]);
+  eq('a recovery run with other filters does not complete the first', m.coverage.verdict, 'truncated');
+  ok('and the merge says the filters differ', m.warnings.some((w) => /^merged-filters/.test(w)), JSON.stringify(m.warnings));
+  const fc = await mkH({ extra: '&shpf_co=CN', startPage: 4 }, { 4: ['c4'], 5: [] });
+  eq('the same filters do join', mergePayloads([fa, fc]).coverage.verdict, 'exhausted-all-results');
+  ok('SKILL.md tells the recovery start() to keep fourStar and extra', /plus the SAME `fourStar` and `extra` as the first run/.test(skillSrc));
+});
+
+console.log('\nS8 — doc text matches the code');
+await block('S8', async () => {
+  ok('SKILL.md states the any-keyword rule', /holding at least one query keyword as a whole word/.test(skillSrc));
+  ok('SKILL.md no longer states "at least two of its keywords"', !/at least two of its keywords/.test(skillSrc));
+});
+
+// ============================================================================
+// 2026-10-18, fourth pass — six reviewers at higher effort (harvest state,
+// export, relevance + rank, decode, listing in real Chromium, docs + build +
+// tests). Each block below fails on the code they reviewed (pass3).
+// ============================================================================
+const realTitles = JSON.parse(SRC('fixtures/real-titles-2026-10-17.json'));
+
+console.log('\nW1 — harvest.js: rows without ids, HTTP errors, "?" in lastErr, carry-over start time');
+await block('W1', async () => {
+  const noId = (i) => { const it = makeItem('x' + i); delete it.productId; return it; };
+  const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p === 1 ? [makeItem('a1'), makeItem('a2')] : p === 2 ? [noId(1), noId(2), noId(3)] : [], page: p })); });
+  H.start({ query: 'wire brush set' });
+  const st = await H.step(6);
+  eq('a page of rows with no productId is a parse-error, not the end', [st.stop, st.pagesRead], ['parse-error', 1]);
+  ok('lastErr names the shape', /no productId/.test(st.lastErr || ''), st.lastErr);
+  ok('the verdict is not "all results"', JSON.parse(H.payload()).coverage.verdict !== 'exhausted-all-results');
+  for (const [name, rep] of [['503', { url: 'https://he.aliexpress.com/w/x.html', status: 503, text: async () => '<html>busy</html>' }],
+    ['login redirect', { url: 'https://login.aliexpress.com/signin.html?return=x', status: 200, text: async () => '<html>sign in</html>' }]]) {
+    const G = loadHarvest(async () => rep);
+    G.start({ query: 'wire brush set' });
+    const g = await G.step(2);
+    ok(`${name}: a fetch-error naming the cause, not parse-error`, g.stop === 'fetch-error' && /http 503|login\.aliexpress\.com\/signin/.test(g.lastErr || ''), JSON.stringify([g.stop, g.lastErr]));
+    ok(`${name}: no "?" in status()`, !JSON.stringify(G.status()).includes('?'));
+  }
+  const J = loadHarvest(async () => reply('<html>/*init-data-start*/ x = { data: {"u":"/a?x=1","n":NaN} };</html>'));
+  J.start({ query: 'wire brush set' });
+  const j = await J.step(1);
+  ok('a JSON error quoting a URL leaves no "?" in status()', j.stop === 'parse-error' && !JSON.stringify(j).includes('?'), JSON.stringify(j.lastErr));
+  // Carry-over of a state from an older install: it gets a start time.
+  const ls = fakeStorage();
+  const win = { localStorage: ls };
+  new Function('window', 'fetch', harvestSrc)(win, pageFetch({ 1: ['c1'], 2: [] }));
+  win.__aeHarvest.start({ query: 'cheese grater' });
+  await win.__aeHarvest.step(3);
+  delete win.__aeHarvest.st.startedAt; // as an older install left it
+  new Function('window', 'fetch', 'return (' + harvestSrc + '\n)')(win, pageFetch({}));
+  ok('a carried-over state gets a start time', win.__aeHarvest.st.startedAt > 0);
+  ok('and is saved under a real key, not stamp 0', [...ls._m.keys()].some((k) => k.startsWith('__aeHarvest:cheese-grater:') && !k.endsWith(':0')));
+});
+
+console.log('\nW2 — persist(): only a FULL store prunes, oldest first; a failed save leaves no stale copy');
+await block('W2', async () => {
+  const mk = (failWith) => {
+    const st = fakeStorage();
+    const set = st.setItem;
+    st.setItem = (k, v) => { if (failWith && k.includes('wire-brush-set')) { const e = new Error(failWith); e.name = failWith; throw e; } set(k, v); };
+    return st;
+  };
+  const other = mk(null);
+  other.setItem('__aeHarvest:keep-me:1', JSON.stringify({ query: 'keep me', items: [], savedAt: 1 }));
+  const st2 = mk('SecurityError');
+  st2._m.set('__aeHarvest:keep-me:1', other._m.get('__aeHarvest:keep-me:1'));
+  const w = { localStorage: st2 };
+  new Function('window', 'fetch', harvestSrc)(w, pageFetch({ 1: ['k1'], 2: [] }));
+  w.__aeHarvest.start({ query: 'wire brush set' });
+  const s = await w.__aeHarvest.step(3);
+  eq('a non-quota error is reported', s.backup && s.backup.saved, false);
+  ok('and deletes no other backup', st2._m.has('__aeHarvest:keep-me:1'));
+  // Quota: older runs go one at a time, oldest first.
+  const q = fakeStorage();
+  const qset = q.setItem;
+  let cap = 2400;
+  q.setItem = (k, v) => { const used = [...q._m.entries()].reduce((a, [kk, vv]) => a + (kk === k ? 0 : vv.length), 0);
+    if (used + String(v).length > cap) { const e = new Error('QuotaExceededError'); e.name = 'QuotaExceededError'; throw e; } qset(k, v); };
+  q._m.set('__aeHarvest:old-a:' + (1).toString(36), 'x'.repeat(900));
+  q._m.set('__aeHarvest:old-b:' + (2).toString(36), 'x'.repeat(900));
+  const wq = { localStorage: q };
+  new Function('window', 'fetch', harvestSrc)(wq, pageFetch({ 1: ['q1'], 2: [] }));
+  wq.__aeHarvest.start({ query: 'wire brush set' });
+  const sq = await wq.__aeHarvest.step(3);
+  eq('a full store drops the OLDEST run first and keeps the newer one', [sq.backup.saved, q._m.has('__aeHarvest:old-a:1'), q._m.has('__aeHarvest:old-b:2')], [true, false, true]);
+});
+
+console.log('\nW3 — send(): in-app hint, held fetch with no backup, longer receiver reply');
+await block('W3', async () => {
+  const forms = [];
+  const H = await harvestWith({ document: formDoc(forms) }, (url) => url.startsWith('http://127.0.0.1:')
+    ? Promise.reject(new TypeError('Failed to fetch')) : Promise.resolve(reply(makePage({ items: [makeItem('s1')], finished: true }))));
+  const m = await H.send(9999);
+  ok('a refused fetch names the in-app browser and {via:"form"}', /in-app browser always does/.test(m) && /via:"form"/.test(m) && m.length < 1000, m);
+  const H2 = await harvestWith({ document: formDoc([]) }, (url) => url.startsWith('http://127.0.0.1:')
+    ? new Promise(() => {}) : Promise.resolve(reply(makePage({ items: [makeItem('s2')], finished: true }))));
+  const m2 = await H2.send(9999, { timeoutMs: 20 });
+  ok('a held fetch with no backup is UNCONFIRMED (it may still land)', /^UNCONFIRMED: the fetch is held/.test(m2), m2);
+  const longPath = 'saved /private/tmp/' + 'd'.repeat(180) + '/harvest-wire-brush-set-2026-10-18T10-00-00-000Z.json (1234 chars, 3 items)';
+  const H3 = await harvestWith({ document: formDoc([]) }, (url) => url.startsWith('http://127.0.0.1:')
+    ? Promise.resolve({ status: 200, text: async () => longPath }) : Promise.resolve(reply(makePage({ items: [makeItem('s3')], finished: true }))));
+  const m3 = await H3.send(9999);
+  ok('a long saved path comes back whole', m3.includes('(1234 chars, 3 items)'), m3);
+  ok('SKILL.md tells the in-app operator to use {via: \'form\'}', /In the in-app browser use `send\(8765, \{via: 'form'\}\)`/.test(skillSrc));
+});
+
+console.log('\nW4 — receiver.mjs: write errors, same-millisecond names, flag forms');
+await block('W4', async () => {
+  const dir = tmp('ae-rx-w4-');
+  const rx = await startRx({ dir, port: 0 });
+  const body = JSON.stringify({ query: 'same', items: [] });
+  const rs = await Promise.all(Array.from({ length: 8 }, () => fetch('http://127.0.0.1:' + rx.port + '/harvest', { method: 'POST', body })));
+  eq('eight posts at once are all saved', rs.map((r) => r.status), Array(8).fill(200));
+  eq('as eight files (none overwritten)', fsx.readdirSync(dir).filter((f) => f.startsWith('harvest-same-')).length, 8);
+  fsx.rmSync(dir, { recursive: true, force: true });
+  const bad = await fetch('http://127.0.0.1:' + rx.port + '/harvest', { method: 'POST', body });
+  eq('a write error answers 500', bad.status, 500);
+  const alive = await fetch('http://127.0.0.1:' + rx.port + '/');
+  eq('and the receiver stays up', alive.status, 200);
+  await rx.close();
+  const { spawn } = await import('node:child_process');
+  const fp = String(await freePort());
+  const cp = spawn('node', [join(HERE, 'receiver.mjs'), '--dir=' + tmp('ae-rx-w4b-'), '--port=' + fp, '--idle=5']);
+  const line = await new Promise((res) => { let b = ''; cp.stdout.on('data', (d) => { b += d; if (b.includes('\n')) res(b); }); });
+  ok('--name=value is read', line.includes(':' + fp + ' ') && /5 s idle/.test(line), line);
+  cp.kill();
+  const cp2 = spawn('node', [join(HERE, 'receiver.mjs'), '--dir', tmp('ae-rx-w4c-'), '--idel', '5']);
+  const code = await new Promise((res) => cp2.on('exit', res));
+  eq('an unknown flag exits 2', code, 2);
+});
+
+console.log('\nW5 — decode.mjs: CRLF and cut dumps, old off-query parts, changed streams, re-merge, cases');
+await block('W5', async () => {
+  const { assemble, mergePayloads, textsOf } = await import('./decode.mjs');
+  const P = (q, ids, pages, verdict, extra = {}) => ({ query: q, source: 'harvest-paged', coverage: { verdict }, fourStar: true,
+    pages: pages.map(([page, n]) => ({ page, n })), items: ids.map((id) => ({ id, title: 'wire brush ' + id, rating: 4.8, sold: 500 })), ...extra });
+  const dump = (text) => 'Title\n' + text + '\nfooter';
+  const payload = JSON.stringify(P('wire brush set', ['a'], [[1, 1], [2, 0]], 'exhausted-all-results'));
+  const lf = dump('AEPAYLOAD 0/1 abc START\n' + payload + '\nAEPAYLOAD END');
+  const crlf = lf.split('\n').join(String.fromCharCode(13) + '\n');
+  eq('a CRLF dump decodes', assemble([crlf]).payload.items.length, 1);
+  let err = '';
+  try { assemble([JSON.stringify(P('other', ['z'], [[1, 1]], 'truncated')), lf.slice(0, lf.length - 30)]); } catch (e) { err = String(e); }
+  ok('a cut dump next to another payload is an error, not a silent drop', /no matching "AEPAYLOAD END"/.test(err), err);
+  const old = { query: 'wired usb mouse', source: 'harvest-paged', coverage: { verdict: 'exhausted-all-results' }, fourStar: true,
+    pages: [{ page: 1, n: 282 }, { page: 2, n: 0 }], items: realTitles.craftWire.titles.map((t, i) => ({ id: 'w' + i, title: t, rating: 4.8, sold: 500 })) };
+  const good = { query: 'usb mouse', source: 'harvest-paged', coverage: { verdict: 'truncated' }, fourStar: true,
+    pages: [{ page: 1, n: 326 }], items: realTitles.mice.titles.map((t, i) => ({ id: 'm' + i, title: t, rating: 4.8, sold: 500 })) };
+  const m = mergePayloads([old, good]);
+  eq('an old off-query part (no verdict of its own) makes the merge off-query', m.coverage.verdict, 'off-query');
+  const early = P('wire brush set', ['a1', 'a2', 'a3'], [[1, 1], [2, 1], [3, 1], [4, 0]], 'exhausted-all-results');
+  const later = P('wire brush set', ['b1', 'b2', 'b3', 'b4', 'b5', 'b6'], [[1, 1], [2, 1], [3, 1], [4, 1], [5, 1], [6, 1]], 'truncated');
+  const ch = mergePayloads([early, later]);
+  eq('a part that read past the dry page: the stream changed, truncated', ch.coverage.verdict, 'truncated');
+  ok('named stream-changed', ch.warnings.some((w) => /^stream-changed/.test(w)));
+  const a = P('wire brush set', ['a'], [[1, 1], [2, 1]], 'truncated', { filterKey: 'k1' });
+  const b = P('wire brush set', ['b'], [[3, 1], [4, 1]], 'truncated', { filterKey: 'k1' });
+  const c = P('wire brush set', ['c'], [[5, 1], [6, 0]], 'exhausted-from-start-page', { filterKey: 'k1' });
+  const ab = mergePayloads([a, b]);
+  eq('a merged file merged again gives the same verdict as one merge', mergePayloads([ab, c]).coverage.verdict, mergePayloads([a, b, c]).coverage.verdict);
+  eq('which is complete', mergePayloads([ab, c]).coverage.verdict, 'exhausted-all-results');
+  const upper = { ...b, query: 'Wire Brush Set' };
+  eq('a query differing only in case is the same stream', mergePayloads([a, upper, c]).coverage.verdict, 'exhausted-all-results');
+  const o1 = P('wire brush set', ['x'], [[1, 1], [2, 1]], 'truncated', { extraApplied: true });
+  const o2 = P('wire brush set', ['y'], [[1, 1], [2, 1], [3, 1], [4, 0]], 'exhausted-all-results', { extraApplied: true });
+  eq('two OLD payloads with unknown extras never join', mergePayloads([o1, o2]).coverage.byQuery.length, 2);
+  const bl = { ...P('wire brush set', ['a'], [[1, 1], [2, 1]], 'truncated', { filterKey: 'k1' }), blocked: true };
+  const done = P('wire brush set', ['b'], [[3, 1], [4, 0]], 'exhausted-from-start-page', { filterKey: 'k1' });
+  const mb = mergePayloads([bl, done]);
+  eq('a wall cleared by a later part: not blocked', [mb.blocked, mb.coverage.verdict], [false, 'exhausted-all-results']);
+  ok('but named', mb.warnings.some((w) => /^wall-cleared/.test(w)));
+  let e6 = '';
+  try { assemble([dump('AEPAYLOAD 0/1 q1 START\n{"err":"not started"}\nAEPAYLOAD END')]); } catch (e) { e6 = String(e); }
+  ok('a chunk set that is not a payload is refused', /not a harvest payload/.test(e6), e6);
+  const inApp = JSON.stringify([{ type: 'text', text: JSON.stringify(JSON.stringify(P('q', ['a'], [[1, 1]], 'truncated'))).slice(0, 200) }]);
+  const t0 = Date.now();
+  let e9 = '';
+  try { assemble(textsOf(inApp)); } catch (e) { e9 = String(e); }
+  void t0;
+  ok('a cut in-app result is named as cut', /is cut: its JSON string never closes/.test(e9), e9);
+  ok('SKILL.md: only decode.mjs gives a merged verdict', /Only `decode.mjs`\s+gives a merged verdict/.test(skillSrc));
+});
+
+console.log('\nW6 — relevance: no prefix matches, irregular plurals, one count per keyword, other languages');
+await block('W6', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  const water = Array.from({ length: 10 }, (_, i) => 'Waterproof Garden Furniture Cover ' + i);
+  ok('"water bottle" over waterproof covers is off-query ("water" is not "waterproof")', qr('water bottle', water).warning !== null);
+  ok('"tablet holder" over tables is off-query', qr('tablet holder', Array(8).fill('Folding Table Outdoor')).warning !== null);
+  eq('"mice" on the real mouse stream raises nothing', qr('mice', realTitles.mice.titles).warning, null);
+  eq('"pc mice" too', qr('pc mice', realTitles.mice.titles).warning, null);
+  ok('the real craft-wire stream is still off-query for "wired usb mouse"', qr('wired usb mouse', realTitles.craftWire.titles).warning !== null);
+  eq('"kitchen knife" over knives raises nothing', qr('kitchen knife', ['Knives Set 5pcs', 'Chef Knives', 'Steak Knives', 'Paring Knives', 'Bread Knives']).warning, null);
+  eq('"magnifying glass" over magnifiers raises nothing', qr('magnifying glass', ['Magnifier 10X', 'Reading Magnifier', 'LED Magnifier', 'Loupe Magnifier', 'Magnifying Glass']).warning, null);
+  eq('a repeated keyword is counted once', qr('usb c to usb c cable', ['USB C Cable', 'USB Hub']).keywords, ['usb', 'cable']);
+  eq('Spanish titles are unmeasured, not off-query', qr('wireless mouse', ['Ratón inalámbrico para PC', 'Ratón con USB', 'Ratón para portátil',
+    'Ratón ergonómico para oficina', 'Ratón silencioso con receptor']).reason, 'titles-not-english');
+});
+
+console.log('\nW7 — rank.mjs: why the ranking is empty, flags, pipes, ties in a tier, numbers');
+await block('W7', async () => {
+  const unk = Array.from({ length: 4 }, (_, i) => ({ id: 'u' + i, title: 'x', rating: 4.8, ownRating: 4.8, reviews: 300, sold: 5000, constraints: { wired: 'unknown' } }));
+  const r1 = rank(unk, ['--mode', 'final', '--constraint', 'wired']);
+  ok('all unknown: the note says unverified, not "no candidate satisfies"', /VERIFIED/.test(r1.note) && !r1.warnings.some((w) => /^no candidate satisfies/.test(w)), r1.note);
+  const noOwn = unk.map((x) => ({ ...x, reviews: null, ownRating: null, constraints: { wired: 'pass' } }));
+  const r1b = rank(noOwn, ['--mode', 'final', '--constraint', 'wired']);
+  ok('all dropped for no own count: not "no candidate satisfies"', !/no candidate satisfies/.test(r1b.note), r1b.note);
+  const fail = unk.map((x) => ({ ...x, constraints: { wired: 'fail' } }));
+  const r1c = rank(fail, ['--mode', 'final', '--constraint', 'wired']);
+  eq('all failing: that IS "no candidate satisfies", with the count', [r1c.note, r1c.constraintViolations], ['no candidate satisfies the stated constraints', 4]);
+  const runRaw = (input, args) => execFileSync('node', [RANK, ...args], { input: JSON.stringify(input), encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+  let code = 0;
+  try { runRaw(fail, ['--mode', 'final', '--constriant', 'wired']); } catch (e) { code = e.status; }
+  eq('an unknown flag exits 2', code, 2);
+  const eqForm = JSON.parse(runRaw(unk, ['--mode=final', '--top=2']));
+  eq('--name=value is read', [eqForm.mode, eqForm.ranked.length], ['final', 2]);
+  code = 0;
+  try { runRaw(unk, ['--mode', 'final', '--min-evidence', '']); } catch (e) { code = e.status; }
+  eq('a blank value exits 2', code, 2);
+  code = 0;
+  try { runRaw(unk, ['--mode', 'final', '--w-quality', '0', '--w-volume', '0']); } catch (e) { code = e.status; }
+  eq('weights adding up to 0 exit 2 (they made every score NaN)', code, 2);
+  // Piped output of an empty ranking past 64 KiB comes back whole.
+  const big = Array.from({ length: 400 }, (_, i) => ({ id: 'b' + i, title: 'item ' + 'z'.repeat(150), rating: 4.8, sold: 500 }));
+  const outText = runRaw(big, ['--mode', 'shortlist', '--require', 'nothing-matches-this']);
+  ok('an empty ranking over 64 KiB is complete on a pipe', outText.length > 65536 && !!JSON.parse(outText), String(outText.length));
+  const tier = [...Array.from({ length: 6 }, (_, i) => ({ id: 'h' + i, title: 'x', rating: 4.9, sold: 10000, soldBucketed: true })),
+    ...Array.from({ length: 4 }, (_, i) => ({ id: 'lo' + i, title: 'x', rating: 4.8, sold: 600 }))];
+  const r6 = rank(tier, ['--mode', 'shortlist', '--top', '4', '--spread', '1']);
+  ok('a tie inside a spread tier is named', r6.warnings.some((w) => /^tie-in-spread/.test(w)), JSON.stringify(r6.warnings));
+  const r9 = rank([{ id: 'p', title: 'x', rating: 3.9, reviews: null, pooledReviews: 5000, sold: 5000 }], ['--mode', 'final']);
+  eq('no own count: own-reviews-unknown, not judged on the pooled rating', r9.droppedReasons, { 'own-reviews-unknown': 1 });
+  const r10 = rank([{ id: 'f', title: 'x', rating: 4.9, ownRating: 4.9, reviews: 2500, sold: 10000, brandScore: 0 },
+    { id: 'g', title: 'y', rating: 4.8, ownRating: 4.8, reviews: 900, sold: 5000 }], ['--mode', 'final']);
+  ok('a brandScore under 0.2 is flagged brand-implausible', r10.ranked.find((x) => x.id === 'f').flags.includes('brand-implausible'));
+  const r11 = rank([], ['--mode', 'shortlist']);
+  ok('an empty input says so', r11.warnings.some((w) => /^empty-input/.test(w)), JSON.stringify(r11.warnings));
+  const r12 = rank([{ id: 'o', title: 'x', rating: 4.9, reviews: { own: 300 }, sold: 5000 }, { id: 'n', title: 'y', rating: 4.8, reviews: 300, sold: 5000 }], ['--mode', 'final']);
+  ok('a reviews OBJECT is set aside by name', r12.droppedReasons['not-a-number:reviews'] === 1 && r12.warnings.some((w) => /^not-a-number/.test(w)), JSON.stringify(r12.droppedReasons));
+  ok('and the others score normally', r12.ranked[0].volume === 1, JSON.stringify(r12.ranked[0]));
+});
+
+console.log('\nW8 — listing.js and the step-5 reader (stub DOM; the real-Chromium cases are in the review notes)');
+await block('W8', async () => {
+  const src = RUN('listing.js');
+  const el = (tag, p = {}) => {
+    const e = { tagName: tag, children: p.children || [], textContent: p.text || '', className: p.cls || '', naturalWidth: 0, naturalHeight: 0,
+      currentSrc: '', src: '', shadowRoot: null, parentElement: p.parent || null, getAttribute: (k) => (p.attrs || {})[k] || null,
+      querySelector: () => null, querySelectorAll: () => p.qsa || [], closest: () => null, click() {}, id: '', nodeType: 1,
+      previousElementSibling: p.prev || null,
+      childNodes: p.nodes || (p.text ? [{ nodeType: 3, nodeValue: p.text }] : []) };
+    return e;
+  };
+  const run = async (els, bodyText = 'x'.repeat(2500), opts = { description: false }, ld = 0, win = {}) => {
+    const document = { body: { scrollHeight: 5000, innerText: bodyText }, documentElement: { outerHTML: '' },
+      querySelectorAll: (sel) => (/ld\+json/.test(sel || '') ? new Array(ld) : els) };
+    return new Function('window', 'document', 'location', `${src}; return window.__aeListing;`)({ scrollTo() {}, document, ...win }, document,
+      { href: 'https://he.aliexpress.com/item/1.html' }).read(opts);
+  };
+  const sz = (r) => [r.productSizeLines, r.packageSizeLines];
+  eq('"Packaging size" is the carton', sz(await run([el('P', { text: 'Packaging size: 30 x 20 x 10 cm' })])), [[], ['Packaging size: 30 x 20 x 10 cm']]);
+  eq('"Box size" is the carton', sz(await run([el('P', { text: 'Box size: 30 x 20 x 10 cm' })])), [[], ['Box size: 30 x 20 x 10 cm']]);
+  eq('two sizes on one line are judged one by one', sz(await run([el('P', { text: 'Product size: 12 x 6 x 4 cm / Package size: 20 x 10 x 6 cm' })])),
+    [['Product size: 12 x 6 x 4 cm'], ['Package size: 20 x 10 x 6 cm']]);
+  eq('"Package: 1 x Mouse. Size: 12 x 6 x 4 cm." is a product size', sz(await run([el('P', { text: 'Package: 1 x Mouse. Size: 12 x 6 x 4 cm. Color: Black' })])),
+    [['Size: 12 x 6 x 4 cm'], []]);
+  eq('an inch-mark size is read', sz(await run([el('P', { text: 'Size: 7.9" x 3.1" x 1.2"' })]))[0], ['Size: 7.9" x 3.1" x 1.2"']);
+  eq('"22cm (L) x 12cm (W) x 28cm (H)" is read', sz(await run([el('P', { text: 'Size: 22cm (L) x 12cm (W) x 28cm (H)' })]))[0], ['Size: 22cm (L) x 12cm (W) x 28cm (H)']);
+  const strong = el('STRONG', { text: 'Size:', children: [el('SPAN', { text: 'Size:' })] });
+  const p5 = el('P', { text: 'Size: 22 x 12 x 28 cm', children: [strong], nodes: [strong, { nodeType: 3, nodeValue: ' 22 x 12 x 28 cm' }] });
+  eq('<p><strong><span>Size:</span></strong> 22 x 12 x 28 cm</p> is one line', sz(await run([p5, strong]))[0], ['Size: 22 x 12 x 28 cm']);
+  const lab = el('TD', { text: 'Size' });
+  const val = el('TD', { text: '12 x 6 x 4 cm', prev: lab, parent: { textContent: 'Package1 pcSize12 x 6 x 4 cm' } });
+  eq('a bare value takes the label of the cell before it', sz(await run([lab, val])), [['12 x 6 x 4 cm'], []]);
+  const pl = el('SPAN', { text: 'גודל החבילה:' });
+  const pv = el('SPAN', { text: '12x7x4 סמ', prev: pl });
+  eq('in a shadow root (no parent element) too', sz(await run([pl, pv])), [[], ['12x7x4 סמ']]);
+  const spans = [el('SPAN', { text: 'Package' }), el('SPAN', { text: '1 pc' })];
+  const div = el('DIV', { text: 'Package1 pc', children: spans, nodes: spans });
+  const r7 = await run([div, ...spans]);
+  ok('a <div> of <span>s with no text of its own is not one glued line', !r7.sizeLines.some((l) => /Package1 pc/.test(l.text)));
+  const slide = el('DIV', { cls: 'slick-slide' });
+  const reco = el('DIV', { text: 'Gaming Mouse Pad Size 80x30cm', parent: slide });
+  eq('a carousel title is never this product\'s size', sz(await run([reco, el('P', { text: 'Size: 12 x 6 x 4 cm' })]))[0], ['Size: 12 x 6 x 4 cm']);
+  const rv = await run([], 'Great grater. Please slide the drum in until it clicks before use. ' + 'x'.repeat(2500), { description: false }, 1);
+  eq('a review saying "please slide" on a page with JSON-LD is not a wall', rv.blocked, false);
+  const DESC = 'https://pdp.aliexpress-media.com/product/description/pc/v2/he_IL/desc.htm?productId=1';
+  const dwin = (body) => ({ performance: { getEntriesByType: () => [{ name: DESC }] },
+    fetch: async () => ({ url: DESC, status: 200, text: async () => '<html>' + body + '</html>' }),
+    DOMParser: class { parseFromString() { const p = el('P', { text: body }); return { body: el('BODY', { qsa: [p], nodes: [p] }), querySelectorAll: () => [p] }; } } });
+  const he = await run([], 'x'.repeat(2500), {}, 0, dwin('אנא החלק את המחוון ימינה כדי לאמת שאתה לא רובוט. תודה על הסבלנות שלך.'));
+  eq('the Hebrew imperative wall is a wall', [he.description.source, he.blocked], ['blocked', true]);
+  const js = await run([], 'x'.repeat(2500), {}, 0, dwin('{"success":false,"code":"TOKEN_EXPIRED"}'));
+  eq('a JSON error answer is fetch-failed', js.description.source, 'fetch-failed');
+  const short = await run([], 'x'.repeat(2500), {}, 0, dwin('Size: 12 x 6 x 4 cm'));
+  eq('a short real description is still fetched', short.description.source, 'fetched');
+  const st = await run([], 'Specifications\nDescription\nx\nSpecifications\nApplication\nStore display\nType\nWired\nStore\n' + 'y'.repeat(2500));
+  eq('spec rows: a value "Store display" is not the "Store" heading; a tab label is skipped', st.specs, { Application: 'Store display', Type: 'Wired' });
+  const raw = await run([], 'מפרטים\nתיאור\nx\nמפרטים\nשם המותג\nNONE\nתיאור\n' + 'y'.repeat(2500));
+  eq('text-raw keeps the block with lines, not the tab label', [raw.specsSource, raw.specsText], ['text-raw', 'שם המותג | NONE']);
+  const longName = 'X7 Wireless Rechargeable Silent Mouse 2.4G Bluetooth Dual Mode Black';
+  const r9 = await run([el('DIV', { cls: 'sku-item--text--Q sku-item--selected--I', text: longName })]);
+  eq('a long selected option is kept, not dropped', r9.selectedVariants, [longName]);
+  // Step-5 reader
+  const optEl = (name, sel) => ({ className: 'sku-item--text--Qa1' + (sel ? ' sku-item--selected--I' : ''), querySelector: () => null, textContent: name, shadowRoot: null });
+  const ldj = [{ textContent: JSON.stringify({ '@type': 'Product', aggregateRating: { ratingValue: '4.9', reviewCount: '5479' }, offers: { price: '3.1', priceCurrency: 'USD' } }) }];
+  const s5 = (els, text) => JSON.parse(new Function('document', 'location', 'return (' + step5 + '\n)')(
+    { title: 'Mouse', body: { innerText: text || RV.gyro }, querySelectorAll: (sel) => (/ld\+json/.test(sel) ? ldj : els) }, { pathname: '/item/1.html' }));
+  const g = s5(['Black', 'White', 'Grey'].map((c, i) => optEl('Bluetooth Rechargeable ' + c, i === 2)));
+  eq('options are deduped on the whole name and keep both ends', [g.optionCount, g.options.length, g.options.some((o) => /Grey\*$/.test(o))], [3, 3, true]);
+  const g2 = s5([], 'x\nSpecifications\nType\nInterface Type\nUSB\nPower Type\nBattery\nDescription\n' + RV.gyro);
+  eq('step 5: an empty value does not take the next name', g2.spec, { Type: '', 'Interface Type': 'USB', 'Power Type': 'Battery' });
+  const g3 = s5([], 'Customer Reviews\nSpecifications\nDescription\n' + 'r\n'.repeat(5) + 'Specifications\nPower Type\nUSB\nDescription\nType\nMouse for gaming');
+  eq('step 5: the scan stops at a heading and skips a tab label', g3.spec, { 'Power Type': 'USB' });
+  const many = Array.from({ length: 30 }, (_, i) => optEl('Option ' + i + ' ' + 'n'.repeat(30), i % 3 === 0));
+  const longSpec = '<div>';
+  void longSpec;
+  const raw5 = new Function('document', 'location', 'return (' + step5.replace(/const WANT = \[[^\]]*\];/, "const WANT = ['Type','Interface Type','Power Type','Battery Included','Connection','Cable Length','Material','Model Number'];") + '\n)')(
+    { title: 'Mouse', body: { innerText: RV.gyro }, querySelectorAll: (sel) => (/ld\+json/.test(sel) ? ldj : many.concat(['Type', 'Interface Type', 'Power Type', 'Battery Included', 'Connection', 'Cable Length', 'Material', 'Model Number']
+      .map((k) => ({ className: 'specification--prop--J', shadowRoot: null, textContent: k, querySelector: (q) => (/title/.test(q) ? { textContent: k } : { textContent: 'v'.repeat(60) }) })))) },
+    { pathname: '/item/1.html' });
+  ok('step 5 never passes 1,000 characters, and says when options were cut', raw5.length <= 1000 && JSON.parse(raw5).optionsCut === true, String(raw5.length));
+});
+
+console.log('\nW9 — extract.js: a short card does not take its neighbour\'s data');
+await block('W9', async () => {
+  const exSrc = RUN('extract.js');
+  const grid = { textContent: '', parentElement: null };
+  const mkCard = (id, text) => {
+    const card = { textContent: text, parentElement: grid, querySelectorAll: () => [{ href: 'https://he.aliexpress.com/item/' + id + '.html' }] };
+    return { href: 'https://he.aliexpress.com/item/' + id + '.html', parentElement: card };
+  };
+  const a = mkCard('1007', 'Wireless Mouse 2.4G Silent Rechargeable Ergonomic Office Mouse 4.95,000+ נמכרו ₪22.30');
+  const b = mkCard('1008', 'Mouse pad small cheap one ₪9.90 משלוח חינם');
+  grid.textContent = a.parentElement.textContent + b.parentElement.textContent;
+  grid.querySelectorAll = () => [a, b];
+  const out = JSON.parse(new Function('window', 'document', 'location', 'return (' + exSrc + '\n)')({},
+    { querySelectorAll: (sel) => (/ld\+json/.test(sel) ? [] : [a, b]), body: { innerText: 'x'.repeat(3000) }, documentElement: { outerHTML: '' }, title: 't' },
+    { href: 'https://he.aliexpress.com/w/x.html', origin: 'https://he.aliexpress.com', pathname: '/w/x.html', search: '' }));
+  const card = out.items.find((i) => i.id === '1008');
+  ok('the short card keeps its own price and no borrowed rating', card && card.price === 9.9 && card.rating === null, JSON.stringify(card));
+});
+
+console.log('\nW10 — build.mjs: postfix ++ / 2, o.return / 2, multi-line templates, and the same-program check');
+await block('W10', async () => {
+  const { strip, sameProgram, buildSource } = await import('./build.mjs');
+  const t = "var i = 3; const avg = i++ / 2, label = 'a/b', open = '/*'; var tail = 'changed'; const close = '*/';";
+  eq('"i++ / 2" is a division: nothing after it is lost', new Function(strip(t) + ' return [avg, label, open, tail, close];')(), [1.5, 'a/b', '/*', 'changed', '*/']);
+  const o = 'var o = { return: 4 }; var x = o.return / 2 / 1;';
+  eq('"o.return / 2" is a division', new Function(strip(o) + ' return x;')(), 2);
+  let e = '';
+  try { buildSource('x.js', 'var s = `a\nb`;'); } catch (er) { e = String(er); }
+  ok('a template literal across lines is refused', /spans lines/.test(e), e);
+  eq('the same-program check sees a dropped statement', sameProgram('var a = 1; var b = 2;', 'var a = 1;'), false);
+  eq('and passes the real sources against their dist copies', ['harvest.js', 'listing.js', 'extract.js']
+    .map((n) => sameProgram(SRC(n), readFileSync(join(HERE, 'dist', n.replace(/\.js$/, '.min.js')), 'utf8'))), [true, true, true]);
+});
+
+console.log('\nW11 — the shared blocks are the same CODE as lib.mjs, not only the same answers');
+await block('W11', async () => {
+  const { strip } = await import('./build.mjs');
+  const norm = (code) => strip(code).replace(/\s+/g, ' ').trim();
+  const libText = SRC('lib.mjs');
+  const blockOf = (text, name) => (text.match(new RegExp('/\\* @shared:' + name + ':start \\*/([\\s\\S]*?)/\\* @shared:' + name + ':end \\*/')) || [])[1];
+  const pairs = [['parseSold', ['harvest.js', 'extract.js']], ['soldRe', ['harvest.js', 'extract.js']], ['wallVerdict', ['harvest.js', 'extract.js', 'listing.js']],
+    ['queryRelevance', ['harvest.js']], ['reviewBlock', ['listing.js']]];
+  for (const [name, files] of pairs) {
+    const want = norm(blockOf(libText, name) || '');
+    for (const f of files) {
+      const got = norm(blockOf(SRC(f), name) || '');
+      let at = 0;
+      while (at < got.length && got[at] === want[at]) at++;
+      ok(`${f} @shared:${name} is lib.mjs's code`, got === want,
+        `first difference at char ${at}: copy "${got.slice(Math.max(0, at - 30), at + 30)}" vs lib "${want.slice(Math.max(0, at - 30), at + 30)}"`);
+    }
+  }
+  const s5blk = (name) => norm(blockOf(step5 || '', name) || '');
+  eq('SKILL.md step 5 @shared:reviewBlock is lib.mjs\'s code', s5blk('reviewBlock'), norm(blockOf(libText, 'reviewBlock')));
+  eq('SKILL.md step 5 @shared:soldRe is lib.mjs\'s code', s5blk('soldRe'), norm(blockOf(libText, 'soldRe')));
+});
+
+console.log('\nW12 — doc numbers match the files');
+await block('W12', async () => {
+  const kb = (f) => Math.round(readFileSync(join(HERE, f), 'utf8').length / 1000);
+  const m = skillSrc.match(/\(about (\d+) KB instead of (\d+) KB\)/);
+  ok('SKILL.md states the install sizes', !!m);
+  ok('and they are the harvest.js sizes (within 3 KB)', m && Math.abs(Number(m[1]) - kb('dist/harvest.min.js')) <= 3 && Math.abs(Number(m[2]) - kb('harvest.js')) <= 3,
+    JSON.stringify([m && m.slice(1), kb('dist/harvest.min.js'), kb('harvest.js')]));
+  ok('SKILL.md says ~200 KB per 400 items (about 500 chars per item, measured)', /~200 KB per 400 items/.test(skillSrc));
+  ok('a page-cap is lifted with resume({ maxPages })', /`resume\(\{ maxPages \}\)`/.test(skillSrc));
+  ok('the listing.js read order says blocked first', /read `blocked` \/ `suspectedWall` first/.test(skillSrc));
+});
+
+// ---------------------------------------------- the whole suite on dist/
+/* The operator pastes dist/*.min.js, so the suite runs again on them: every
+ * scenario above, not a handful (review, 2026-10-18: only 4 assertions
+ * touched dist, so a dist copy could change behaviour with a green suite). */
+if (!DIST) {
+  console.log('\nthe whole suite again, on the dist/*.min.js copies');
+  const { spawnSync } = await import('node:child_process');
+  const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], { env: { ...process.env, AEF_DIST: '1' }, encoding: 'utf8', maxBuffer: 1 << 26 });
+  const last = (child.stdout || '').trim().split('\n').pop();
+  ok('every assertion passes on dist/ too', child.status === 0 && /^PASSED/.test(last), last + ' ' + (child.stderr || '').slice(0, 200));
+  // The README states the exact count (this check included).
+  const readmeN = Number((SRC('../README.md').match(/Test suite — (\d+) assertions/) || [])[1]);
+  const total = pass + fails.length + 1;
+  ok(`README.md states the real number of assertions (${total})`, readmeN === total, `README says ${readmeN}`);
 }
 
 // -------------------------------------------------------------------------

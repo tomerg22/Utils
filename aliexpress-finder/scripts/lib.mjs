@@ -9,7 +9,7 @@
  * drift apart.
  */
 
-export const BIDI_RE = /[‎‏‪-‮⁦-⁩]/g;
+export const BIDI_RE = /[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 
 /** Strip RTL bidi control marks and collapse whitespace. */
 export function clean(s) {
@@ -37,7 +37,7 @@ export function clean(s) {
 function parseSold(raw) {
   if (raw == null) return null;
   const s = String(raw)
-    .replace(/[‎‏‪-‮⁦-⁩]/g, '')
+    .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '')
     .replace(/\s+/g, '')
     .replace(/\+/g, '');
   if (!s) return null;
@@ -184,7 +184,109 @@ function wallVerdict(sig) {
 }
 /* @shared:wallVerdict:end */
 
-export { parseSold, SOLD_RE, parseReviewBlock, wallVerdict };
+/* @shared:queryRelevance:start */
+/* Do the result titles belong to the query at all?
+ *
+ * WHY (measured 2026-10-17, the wired-USB-mouse session): the slug
+ * `wholesale-wired-usb-mouse` was served as craft wire. 281 of 282 items
+ * were copper or aluminium wire, the stream ran dry, and the harvest said
+ * `exhausted-all-results` with no warning. rank.mjs then ranked
+ * "Aluminum Craft Wire 20 Gauge" first. Nothing compared a title with the
+ * query, so a whole off-category stream looked like a complete harvest.
+ *
+ * THE RULE: a title is on-query when it holds AT LEAST ONE query keyword as
+ * a whole word or a simple inflection of it (see `stemWord`: plurals,
+ * -er/-ing/-ed, mice/mouse; "wire" is not "wired"). The craft wire holds
+ * none of "wired", "usb", "mouse", so the live case is caught.
+ *
+ * WHY SO LOOSE (review of the fix, 2026-10-18): a stricter "head word"
+ * rule needs to know which keyword is the noun. Taking the last word failed
+ * on "mouse wired" and "mouse for computer"; a list of qualifier words
+ * failed on "rc car", "coil spring" and "faux leather", whose last word is
+ * the noun but was on the list. A false alarm makes the operator throw a
+ * good harvest away, so the check must never fire on a correct stream. The
+ * cost: an off stream that shares one keyword passes (craft wire for
+ * "wire brush set"). `keywordShare` gives the share per keyword, so a low
+ * share on the noun can still be seen by eye.
+ *
+ * A title holding a Hebrew, Arabic or Cyrillic word cannot be compared with
+ * English keywords: on the Hebrew storefront "כבל USB Type C Samsung" is a
+ * cable whose noun is Hebrew. Such titles are not counted; when they are
+ * half or more, the stream is unmeasured, never off-query.
+ */
+function queryRelevance(query, titles) {
+  var STOP = /^(and|for|the|with|set|sets|pcs|pc|new|of|in|on|to|a|an|kit|lot)$/;
+  var words = function (s) { return String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean); };
+  // Each keyword once: "usb c to usb c cable" counted usb twice.
+  var toks = words(query).filter(function (t, i, a) { return t.length >= 2 && !STOP.test(t) && a.indexOf(t) === i; });
+  var list = (titles || []).map(function (t) { return String(t || ''); }).filter(Boolean);
+  if (!toks.length) return { measured: false, reason: 'no-query-keywords', checked: 0 };
+  var latin = list.filter(function (t) {
+    return (t.match(/[a-z]/gi) || []).length >= 3 && !/[\u0590-\u05ff\u0600-\u06ff\u0400-\u04ff]{2}/.test(t);
+  });
+  if (!list.length || latin.length * 2 < list.length) {
+    return { measured: false, reason: list.length ? 'titles-not-latin' : 'no-titles', checked: 0, keywords: toks };
+  }
+  /* Latin script is not English: a Spanish or German account's titles
+   * ("Ratón inalámbrico para PC", "Kabellose Maus mit USB") cannot match
+   * English keywords either. Their function words give them away. */
+  var FOREIGN = /(^|[^a-z])(para|con|und|mit|für|pour|avec|sans|sin|por|les|des|une|della|voor|och)([^a-z]|$)/i;
+  var foreign = latin.filter(function (t) { return FOREIGN.test(t); }).length;
+  if (foreign * 10 >= latin.length * 3) {
+    return { measured: false, reason: 'titles-not-english', checked: 0, keywords: toks };
+  }
+  /* One word for its simple forms: plurals (boxes, cables, knives, mice),
+   * -er/-ing/-ed (charger, charging), -ier/-ying (magnifier, magnifying).
+   * A base must keep 4+ letters, so "wired" stays "wired", never "wire".
+   * A shared PREFIX is not a shared word: "water" and "waterproof",
+   * "table" and "tablet" used to match (review, 2026-10-18). */
+  var IRREGULAR = { mice: 'mouse', men: 'man', women: 'woman', feet: 'foot', teeth: 'tooth', children: 'child', geese: 'goose' };
+  var stemWord = function (w) {
+    if (IRREGULAR[w]) return IRREGULAR[w];
+    if (w.length > 5 && /ives$/.test(w)) return w.slice(0, -4) + 'ife';
+    if (w.length > 5 && /ves$/.test(w)) return w.slice(0, -3) + 'f';
+    if (w.length > 4 && /ies$/.test(w)) return w.slice(0, -3) + 'y';
+    if (w.length > 5 && /ying$/.test(w)) return w.slice(0, -4) + 'y';
+    if (/(s|x|z|ch|sh)es$/.test(w) && w.length > 5) return w.slice(0, -2);
+    var m = w.match(/^(.{4,}?)(ings|ing|ers|er|ed|s)$/);
+    var b = m ? m[1] : w;
+    return b.replace(/i$/, 'y');
+  };
+  var has = function (ws, t) {
+    var st = stemWord(t);
+    return ws.some(function (w) { return w === t || stemWord(w) === st; });
+  };
+  var per = {};
+  toks.forEach(function (k) { per[k] = 0; });
+  var on = 0;
+  var off = [];
+  latin.forEach(function (t) {
+    var ws = words(t);
+    var hit = false;
+    toks.forEach(function (k) { if (has(ws, k)) { per[k]++; hit = true; } });
+    if (hit) on++;
+    else if (off.length < 3) off.push(t.slice(0, 60));
+  });
+  var r3 = function (x) { return Math.round(x * 1000) / 1000; };
+  var keywordShare = {};
+  toks.forEach(function (k) { keywordShare[k] = r3(per[k] / latin.length); });
+  var share = on / latin.length;
+  var warn = latin.length >= 5 && share < 0.5;
+  return {
+    measured: true, keywords: toks, keywordShare: keywordShare,
+    checked: latin.length, onQuery: on, share: r3(share),
+    offSample: off,
+    warning: warn
+      ? 'off-query-results: only ' + on + ' of ' + latin.length + ' titles hold any of the keywords [' +
+        toks.join(', ') + ']. The site served another category (e.g. ' + JSON.stringify(off[0] || '') +
+        '). This is NOT a complete harvest of the product: do not report it as exhausted-all-results. ' +
+        'Re-word the query and say so to the user.'
+      : null,
+  };
+}
+/* @shared:queryRelevance:end */
+
+export { parseSold, SOLD_RE, parseReviewBlock, wallVerdict, queryRelevance };
 
 /** Median of a numeric array, or null when empty. */
 export function median(xs) {

@@ -850,7 +850,13 @@ here, between the markers, and run the tests after any change.
   // The header may hold one separator mark between "Reviews" and the count,
   // never a digit: "\S?" took the first digit ("10,000+" read as "0,000+").
   // A comma or a dot may be that mark ("Reviews, 10,000+ sold").
-  const sold = tx.match(new RegExp('Reviews\\s*(?:[^\\s\\d]\\s*)?' + SOLD_RE.source, 'i')) || tx.match(SOLD_RE);
+  // Live 2026-10-19 the header also said "Reviews ౹ 10,000+ sales ౹ 10,000+
+  // cross-platform sales". Only the header counts: the page also holds
+  // other products' cards ("4.9202 sold" is a 4.9 rating next to 202 sold),
+  // so there is no page-wide fallback. No header count: soldRaw is null.
+  const HEAD = new RegExp('(?:Reviews|חוות דעת)\\s*(?:[^\\s\\d]\\s*)?' +
+    SOLD_RE.source.replace('(?:נמכר|sold)', '(?:נמכר|sold|sales)'), 'i');
+  const sold = tx.match(HEAD);
   // Spec rows a hard requirement is decided on. Edit WANT per requirement.
   const WANT = ['Type', 'Interface Type', 'Power Type', 'Power Source', 'Battery Included'];
   // A trailing colon ("Type:") is not part of the name, as in listing.js.
@@ -912,7 +918,7 @@ here, between the markers, and run the tests after any change.
     reviews: rv.own, ownRating: rv.ownRating,
     pooledReviews: ar.reviewCount != null ? Number(ar.reviewCount) : null, pooledNote: rv.pooledNote,
     price: o.price != null ? Number(o.price) : null, currency: o.priceCurrency || null,
-    soldRaw: sold ? sold[1].replace(/\s/g, '') : null, spec, specFrom, specMore, optionCount: uo.length, options: shown.map(short) };
+    soldRaw: sold ? sold[1].replace(/\s/g, '') : null, soldFrom: sold ? 'header' : 'none', spec, specFrom, specMore, optionCount: uo.length, options: shown.map(short) };
   // Never past the connector's 1,000 characters: options go first, named.
   let s = JSON.stringify(out);
   // Unselected ones are cut first, from the end: the selected ones name the
@@ -952,8 +958,15 @@ What comes back, and why each field is there (all measured 2026-09-25):
   wording of the review block has not been observed yet. Never put the pooled
   number in its place. `rank.mjs` sets such a finalist aside as
   `own-reviews-unknown`, also when it carries no pooled count either.
-- **`soldRaw`** comes from the header ("... Reviews 100K+ sold"), with the first
-  sold text on the page as the fallback. From 100,000 up it carries a K.
+- **`soldRaw`** comes from the header only ("... Reviews 100K+ sold" or
+  "... Reviews ౹ 10,000+ sales"), and `soldFrom` says `header` or `none`.
+  From 100,000 up it carries a K. "Cross-platform sales" is not this
+  listing's count and is never read. With no header count, `soldRaw` is
+  `null`: then use the search grid's `soldRaw` for that item. Until
+  2026-10-19 the reader fell back to the first "sold" on the page. On a
+  live page whose header said "sales", that was a related item's card,
+  "4.9202 sold" (a 4.9 rating next to 202 sold), and it was returned as
+  this listing's count.
 - **`options`** are the listing's own options, read from the option selector;
   `*` marks the selected one, one per option property (Color AND Type). The
   first 10 come back, plus every selected one past them; `optionCount` is the

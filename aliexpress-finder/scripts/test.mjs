@@ -4023,7 +4023,10 @@ await block('R-F17-2', async () => {
   eq('R-F17-2: "Reviews10,000+ sold" gives 10,000+', leStep5([], '4.9 5479 Reviews10,000+ sold').out.soldRaw, '10,000+');
   // What must not change.
   eq('R-F17-2: the live separator still works', leStep5([], RV.gyro).out.soldRaw, '50,000+');
-  eq('R-F17-2: "Reviews (5479) 300 sold" falls back to the first sold text', leStep5([], 'Reviews (5479) 300 sold').out.soldRaw, '300');
+  // Reversed on 2026-10-19 (R-SALES): this pinned the page-wide fallback,
+  // and live that fallback returned a related item's card ("4.9202 sold")
+  // as the listing's count. Text that is not the header is never read.
+  eq('R-F17-2: "Reviews (5479) 300 sold" is not a header count: soldRaw null', leStep5([], 'Reviews (5479) 300 sold').out.soldRaw, null);
 });
 
 console.log('\nR-F09: rank.mjs refuses one-hyphen, upper-case and em-dash flags and stray words (exit 2)');
@@ -4178,6 +4181,31 @@ await block('R-SPEC-MORE', async () => {
   const r3 = await l3.L.read({ description: false, expand: false });
   eq('R-SPEC-MORE: read({ expand: false }) clicks nothing', [l3.clicks(), r3.specExpanded, r3.specs.Type], [0, 0, undefined]);
   ok('R-SPEC-MORE: SKILL.md says the reader clicks the spec "View more" first', /clicks the Specifications table's\s+"View more" button first/.test(skillSrc));
+});
+
+console.log('\nR-SALES: step 5 reads "sales" in the header and never another product\'s "sold" (live 2026-10-19)');
+await block('R-SALES', async () => {
+  /* Live, signed-in Chrome, 2026-10-19, item 1005007386086113 (AJAZZ AJ179):
+   * the header said "4.8 2571 Reviews ౹ 10,000+ sales ౹ 10,000+
+   * cross-platform sales". The reader matched only "sold", so it fell back
+   * to the first "sold" on the page: a related item's card, "Cover
+   * Universal Cover Cheap Replacement 4.9202 sold" (a 4.9 rating next to
+   * 202 sold), and returned soldRaw "4.9202" as this listing's count. */
+  const card = 'Outdoor Garden Furniture Cover Universal Cover Cheap Replacement 4.9202 sold US $11.36 ';
+  const live = card + 'AJAZZ AJ179 Lightweight Wired And Wireless Mouse 4.8 2571 Reviews ౹ 10,000+ sales ౹ 10,000+ cross-platform sales US $30.59';
+  const a = leStep5([], live).out;
+  eq('R-SALES: the live header "10,000+ sales" gives 10,000+ from the header', [a.soldRaw, a.soldFrom], ['10,000+', 'header']);
+  const b = leStep5([], card + '4.8 2571 Reviews ౹ 10,000+ cross-platform sales').out;
+  eq('R-SALES: "cross-platform sales" alone is not this listing\'s count, and the card is never read', [b.soldRaw, b.soldFrom], [null, 'none']);
+  const c = leStep5([], 'More to love ' + card + 'nothing else').out;
+  eq('R-SALES: with no header count, soldRaw is null, never a card\'s "4.9202"', [c.soldRaw, c.soldFrom], [null, 'none']);
+  eq('R-SALES: "Reviews ౹ 455 sales" gives 455', leStep5([], '4.8 37 Reviews ౹ 455 sales').out.soldRaw, '455');
+  eq('R-SALES: "Reviews ౹ 100K+ sales" gives 100K+', leStep5([], '4.9 4779 Reviews ౹ 100K+ sales').out.soldRaw, '100K+');
+  const d = leStep5([], RV.gyro).out;
+  eq('R-SALES: the "sold" header still works and says header', [d.soldRaw, d.soldFrom], ['50,000+', 'header']);
+  eq('R-SALES: the Hebrew header still works', leStep5([], RV.hebrew).out.soldRaw, '50,000+');
+  ok('R-SALES: SKILL.md says only the header counts and names "sales"', /`soldRaw`\*\* comes from the header only/.test(skillSrc) &&
+    /Reviews ౹ 10,000\+ sales/.test(skillSrc) && /use the search grid's `soldRaw`/.test(skillSrc));
 });
 
 // ---------------------------------------------- the whole suite on dist/

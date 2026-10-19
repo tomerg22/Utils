@@ -2,7 +2,9 @@
  *
  * Pass the WHOLE contents of this file (or of dist/extract.min.js, the same
  * code without comments) as the `text` argument of javascript_tool. It
- * evaluates to a JSON string.
+ * evaluates to a JSON string. The Chrome connector cuts that string at 1,000
+ * characters, so the result also stays on `window.__aeExtract` (`.result`,
+ * and `.send(port)` to post it to receiver.mjs); see the end of this file.
  *
  * TWO SOURCES, tried in order:
  *
@@ -334,15 +336,26 @@ function wallVerdict(sig) {
   // decides — see wallVerdict above.
   let _html = '';
   try { _html = (document.documentElement && document.documentElement.outerHTML) || ''; } catch (e) {}
+  /* A page that returned items served content. Its text counts only for the
+   * wall's own sentences, as in listing.js, and never through the items'
+   * titles: one title "Sliding door lock, please slide to lock" made a page
+   * of 3 items a CONFIRMED wall, and the note said STOP (recheck,
+   * 2026-10-18). The URL and the captcha HTML always count. */
+  const STRONG_WALL = /unusual traffic|slide to verify|(להחליק|החלק|גרור|המחוון)[^.]{0,40}(לאמת|אימות)/i;
+  let _text = ((document.body && document.body.innerText) || '') + ' ' + (document.title || '');
+  if (items.length) {
+    for (const it of items) if (it.title && it.title.length >= 8) _text = _text.split(it.title).join(' ');
+    if (!STRONG_WALL.test(_text)) _text = '';
+  }
   const verdict = wallVerdict({
     url: location.href,
-    text: ((document.body && document.body.innerText) || '') + ' ' + (document.title || ''),
+    text: _text,
     html: _html,
     dataNodes: items.length,
   });
   const blocked = verdict.state === 'blocked';
 
-  return JSON.stringify({
+  const out = {
     // Path only: the Chrome connector blocks a result that carries a query
     // string, and a search URL always has one.
     url: location.origin + location.pathname,
@@ -357,5 +370,34 @@ function wallVerdict(sig) {
     cardCount: items.length,
     withRating: items.filter((i) => i.rating !== null).length,
     items,
-  }, null, 0);
+  };
+  const json = JSON.stringify(out, null, 0);
+  /* The Chrome connector cuts a tool result at 1,000 characters, and this
+   * one is about 20,000 for 60 items, so the fallback could not be read
+   * there (recheck 2026-10-18, F23). The result also stays on the window:
+   * return pieces of __aeExtract.result, or post it all to receiver.mjs
+   * with __aeExtract.send(port) after the curl check. send() is the same
+   * top-level text/plain form POST as harvest.js send(port, {via: 'form'}),
+   * so it navigates, to a dead port too. Nothing is lost then: the items are
+   * on the search page, so navigate back and run this file again. The
+   * in-app browser reads the whole return value, as before. */
+  try {
+    window.__aeExtract = {
+      result: out,
+      send(port) {
+        const url = 'http://127.0.0.1:' + (port || 8765) + '/harvest';
+        const f = document.createElement('form');
+        f.method = 'POST'; f.action = url; f.enctype = 'text/plain';
+        const ta = document.createElement('textarea');
+        ta.name = 'payload'; ta.value = json;
+        f.appendChild(ta);
+        document.body.appendChild(f);
+        f.submit();
+        return 'UNCONFIRMED: form-posted ' + json.length + ' chars (' + items.length + ' items) to ' + url +
+               ' - delivered only if the receiver prints "saved <path>" in its own output. If it printed nothing, ' +
+               'navigate back to the search page and run extract.js again';
+      },
+    };
+  } catch (e) {}
+  return json;
 })()

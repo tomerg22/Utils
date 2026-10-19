@@ -445,10 +445,66 @@ function wallVerdict(sig) {
 
   /* A "package" size is the shipping box, not the product. Callers must not
    * confuse the two — this cost a wrong report once already. */
-  // "packag" covers package and packaging; box and carton sizes are cartons
-  // too (review, 2026-10-18: "Packaging size", "Box size" read as product).
-  const PACKAGE_RE = /(חבילה|אריזה|קופסה|קופסא|קרטון|packag|packing|packed|shipping|carton|(^|[^a-z])box([^a-z]|$))/i;
+  // "packag" covers package and packaging; carton sizes are cartons too
+  // (review, 2026-10-18: "Packaging size", "Box size" read as product).
+  const PACKAGE_RE = /(חבילה|אריזה|קרטון|packag|packing|packed|shipping|carton)/i;
+  /* "box" is the carton only when it is said as packaging: "Box size",
+   * "Size (box)", "Gift box", "Outer box". When a product noun comes right
+   * before it ("Lunch Box Size", "Storage box dimensions"), the product IS a
+   * box and the size is its own. Every "box" used to mark the line as the
+   * carton, so a lunch box had no product size (recheck, 2026-10-18).
+   * Three guards keep a carton from being read as the product (recheck,
+   * 2026-10-19: "White box size" on a mouse page was the product size):
+   *   1. The product title decides first. When read() knows the title and
+   *      it holds no "box" (or קופס), every box is the carton.
+   *   2. More packaging words: white, brown, single, display, master, ...
+   *   3. A word glued after another label's value is not a qualifier:
+   *      in "Material: ABS Box size: 12x7x4cm", "ABS" is the material.
+   * Hebrew puts the word AFTER the noun: "קופסה לאוכל" (a box for food) is
+   * the product when the title holds קופס; "גודל קופסה:" and "קופסת מתנה"
+   * (a gift box) are the carton.
+   * Known limits: a bare "Box size:" on a box product is still the carton.
+   * With no title, the word before "box" decides alone. */
+  const BOX_QUAL = /^(gift|outer|inner|retail|colou?r|mail|mailing|mailer|cardboard|paper|kraft|original|express|delivery|the|per|with|each|and|incl|including|size|sizes|dimension|dimensions|white|brown|single|unit|individual|neutral|plain|blank|display|master|product|opp|printed|custom|logo)$/i;
+  const BOX_QUAL_HE = /^(מתנה|מקורית|מקורי|צבעונית|חיצונית|פנימית|לבנה|חומה|משלוח|קמעונאית|ה?אריזה)$/;
+  // null: no title known; set by read() from document.title and the <h1>.
+  let titleSaysBox = null;
+  function isPackageText(s) {
+    s = String(s || '');
+    if (PACKAGE_RE.test(s)) return true;
+    const he = /קופס[\u05d0-\u05ea]*/g;
+    let h;
+    while ((h = he.exec(s))) {
+      const next = (s.slice(h.index + h[0].length).match(/^\s+([\u05d0-\u05ea]+)/) || [])[1];
+      if (next && BOX_QUAL_HE.test(next)) return true; // a gift box is a carton on any page
+      if (titleSaysBox === false) return true;
+      // With no title, as before: קופסה and קופסא are the carton.
+      if (titleSaysBox === null) { if (/^קופס[הא]/.test(h[0])) return true; continue; }
+      if (!next) return true;
+    }
+    const re = /(^|[^a-z])box(?![a-z])/gi;
+    let m;
+    while ((m = re.exec(s))) {
+      if (titleSaysBox === false) return true;
+      const before = s.slice(0, m.index + m[1].length);
+      const w = (before.match(/([a-z]+)[\s-]*$/i) || [])[1];
+      // No word before it, a short word ("x", "in", "of"), or a packaging word.
+      if (!w || w.length < 3 || BOX_QUAL.test(w)) return true;
+      // "Material: ABS Box size:": the word is the value of the label before it.
+      if (/[:：]\s*[a-z0-9]+[\s-]*$/i.test(before) && /^box\s*(size|dimension)/i.test(s.slice(m.index + m[1].length))) return true;
+    }
+    return false;
+  }
   const LABEL_RE = /(גודל|מידות|מימדים|size|dimension)/i;
+  /* Where one line splits into size pieces: at ; | " / " ", " and a ". "
+   * that ends a sentence, and also where a new size label ("Package size:",
+   * "Size:", "גודל") starts right after a measurement. "Size: 10 x 5 x 3 cm
+   * Package size: 12 x 7 x 4 cm" stayed one piece, the package word made
+   * all of it the carton, and the product size was lost (recheck,
+   * 2026-10-18). A label after a word ("Lunch Box Size:") does not split. */
+  const PIECE_SPLIT = new RegExp('\\s*(?:;|\\||\\s\\/\\s|,\\s|(?<!\\d)\\.\\s)\\s*|' +
+    '(?<=\\d\\s*(?:[a-z]{1,5}|ס"מ|ס״מ|סמ|מ"מ|מ״מ|ק"ג|קג|גרם|"|”|\'\')?(?:\\s*\\([a-z]\\))?)\\s+' +
+    '(?=(?:(?!(?:cm|mm|inch|inches|in|kg|g|m)\\s)[a-z]+\\s+){0,2}(?:size|dimensions?)\\s*[:：]|(?:גודל|מידות|מימדים))', 'i');
 
   /* Is a size line the carton? The leaf's own words decide when it has a
    * label ("Package size: …", "Size: …"). A BARE leaf ("12×7×4 סמ") takes
@@ -472,10 +528,10 @@ function wallVerdict(sig) {
    * called the carton because "Package" sat within 60 characters (review of
    * the fix, 2026-10-18). */
   function isPackageLine(text, context, prev) {
-    if (PACKAGE_RE.test(text)) return true;
+    if (isPackageText(text)) return true;
     if (LABEL_RE.test(text)) return false;
     // A bare value whose own label sits in the element before it.
-    if (prev && (PACKAGE_RE.test(prev) || LABEL_RE.test(prev) || /[:：]\s*$/.test(prev))) return PACKAGE_RE.test(prev);
+    if (prev && (isPackageText(prev) || LABEL_RE.test(prev) || /[:：]\s*$/.test(prev))) return isPackageText(prev);
     if (!context) return false;
     const at = context.indexOf(text);
     if (at < 0) return false;
@@ -494,7 +550,7 @@ function wallVerdict(sig) {
     MEASURE_RE.lastIndex = 0;
     while ((m = MEASURE_RE.exec(region))) last = m.index + m[0].length;
     if (last >= 0) region = region.slice(last);
-    return PACKAGE_RE.test(region);
+    return isPackageText(region);
   }
 
   /* The description's own URL, from the requests the page already made.
@@ -514,10 +570,13 @@ function wallVerdict(sig) {
    * 2026-10-18: neither reader returned them, so a constraint was set from
    * the title or by an ad-hoc read). Two sources, in order:
    *   dom   element pairs whose class stems are specification--title /
-   *         specification--desc (the live class names are recalled, NOT yet
-   *         measured on a page: if this comes back empty, the text path runs)
+   *         specification--desc inside specification--prop (measured live
+   *         on 2026-10-18 in signed-in Chrome: the step-5 reader read the
+   *         rows with these classes; if this comes back empty, the text
+   *         path runs)
    *   text  body.innerText lines after a line "Specifications": name line,
-   *         value line, until the next section heading */
+   *         value line, until the next section heading (this line layout
+   *         is not measured on a live page yet) */
   // (?![a-z]) and not \b: \b never matches after a Hebrew letter.
   // A WHOLE line: "Store display" is a spec value, "Store" a section heading.
   const SPEC_END = /^(description|report item|more to love|store|reviews?|customer reviews|you may also like|תיאור|ביקורות|חנות)\s*(\(\d[\d,.]*\))?$/i;
@@ -698,11 +757,20 @@ function wallVerdict(sig) {
         }
         /* Nothing usable (an empty 200, a JSON error such as TOKEN_EXPIRED)
          * is not a description: it was reported as 'fetched' with no text. */
-        // Empty, or a short JSON error: not a description. A short real
-        // description ("Size: 12 x 6 x 4 cm") still is one.
-        if ((!text.trim() && !images.length) || (/^\s*[{[]/.test(text) && text.length < 500)) {
+        // Empty, or a JSON reply with no images: not a description. A short
+        // real description ("Size: 12 x 6 x 4 cm") still is one, and so is
+        // one whose text starts with a bracket ("[Size]: 22 x 12 x 28 cm"):
+        // the old "starts with [ or {" rule threw those away with their
+        // images (recheck, 2026-10-18). JSON means it parses, or it opens
+        // like an object key ({"code": ...).
+        const t0 = text.trim();
+        const isJson = /^[{[]/.test(t0) && (() => {
+          try { JSON.parse(t0); return true; } catch (e) { return /^\{\s*"[^"\n]{1,60}"\s*:/.test(t0); }
+        })();
+        if ((!t0 && !images.length) || (isJson && !images.length)) {
           return { source: 'fetch-failed', text: '', leaves: [], images: [],
-                   error: 'no description in the reply (' + text.length + ' chars of text, no images)' };
+                   error: (isJson ? 'a JSON reply, not a description (' : 'no description in the reply (') +
+                          text.length + ' chars of text, no images)' };
         }
         const leaves = leavesOf(doc, new Set(), []);
         return { source: 'fetched', text, leaves, images };
@@ -731,6 +799,11 @@ function wallVerdict(sig) {
     async read(opts) {
       opts = opts || {};
       const url = location.href;
+      // Is the product itself a box? The size rules read this (isPackageText).
+      let ownTitle = '';
+      try { ownTitle = String(document.title || ''); } catch (e) {}
+      try { const h1 = document.querySelector && document.querySelector('h1'); if (h1) ownTitle += ' ' + clean(h1.textContent); } catch (e) {}
+      titleSaysBox = ownTitle.trim() ? /box(es)?(?![a-z])|קופס/i.test(ownTitle) : null;
       const bodyText = (document.body && document.body.innerText) || '';
       let pageHtml = '', ldCount = 0;
       try { pageHtml = (document.documentElement && document.documentElement.outerHTML) || ''; } catch (e) {}
@@ -859,13 +932,16 @@ function wallVerdict(sig) {
         const sizeLines = [];
         for (const l of leaves) {
           if (!isSize(l.text)) continue;
-          const pieces = l.text.split(/\s*(?:;|\||\s\/\s|,\s|(?<!\d)\.\s)\s*/).filter(Boolean);
+          const pieces = l.text.split(PIECE_SPLIT).filter(Boolean);
           const parts = pieces.length > 1 ? pieces.filter(isSize) : [l.text];
           for (const t of (parts.length ? parts : [l.text])) {
+            // The qualifier may live in the piece OR just before it in the parent.
+            const isPackage = t === l.text ? isPackageLine(t, l.context, l.prev) : isPackageLine(t, l.text);
+            // A piece split out of a <p> can repeat its own <span>: once is enough.
+            if (sizeLines.some((s) => s.text === t && s.isPackage === isPackage)) continue;
             sizeLines.push({
               text: t,
-              // The qualifier may live in the piece OR just before it in the parent.
-              isPackage: t === l.text ? isPackageLine(t, l.context, l.prev) : isPackageLine(t, l.text),
+              isPackage,
               context: l.context && l.context !== l.text ? l.context.slice(0, 120) : undefined,
             });
           }

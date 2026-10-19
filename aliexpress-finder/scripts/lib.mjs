@@ -195,19 +195,30 @@ function wallVerdict(sig) {
  * query, so a whole off-category stream looked like a complete harvest.
  *
  * THE RULE: a title is on-query when it holds AT LEAST ONE query keyword as
- * a whole word or a simple inflection of it (see `stemWord`: plurals,
- * -er/-ing/-ed, mice/mouse; "wire" is not "wired"). The craft wire holds
- * none of "wired", "usb", "mouse", so the live case is caught.
+ * a whole word or a simple inflection of it (see `bases`: plurals,
+ * -er/-ing/-ed, mice/mouse; "wire" is not "wired"), or as two words written
+ * apart ("Screw Driver" holds "screwdriver"). The craft wire holds none of
+ * "wired", "usb", "mouse", so the live case is caught.
  *
  * WHY SO LOOSE (review of the fix, 2026-10-18): a stricter "head word"
  * rule needs to know which keyword is the noun. Taking the last word failed
  * on "mouse wired" and "mouse for computer"; a list of qualifier words
  * failed on "rc car", "coil spring" and "faux leather", whose last word is
  * the noun but was on the list. A false alarm makes the operator throw a
- * good harvest away, so the check must never fire on a correct stream. The
- * cost: an off stream that shares one keyword passes (craft wire for
- * "wire brush set"). `keywordShare` gives the share per keyword, so a low
- * share on the noun can still be seen by eye.
+ * good harvest away, so the rule must not fire on a correct stream that
+ * uses the query's words. The cost: an off stream that shares one keyword
+ * passes (craft wire for "wire brush set"), and so does one whose title
+ * words join into a keyword ("Car Pet Seat Cover" for "carpet").
+ * `keywordShare` gives the share per keyword, so a low share on the noun
+ * can still be seen by eye.
+ *
+ * WHAT IT CANNOT SEE: a synonym. "Earbuds" for "earphones" or "Cam" for
+ * "camera" count as off, so on such a correct stream the check DOES fire
+ * (review, 2026-10-18). Words alone cannot tell it from craft wire for
+ * "wired usb mouse". So the warning quotes the titles that hold no keyword
+ * (`offSample`), the payload keeps the stream's own verdict
+ * (`coverage.streamVerdict`, also in a decode.mjs merge), and the operator
+ * reads the titles before re-wording the query.
  *
  * A title holding a Hebrew, Arabic or Cyrillic word cannot be compared with
  * English keywords: on the Hebrew storefront "כבל USB Type C Samsung" is a
@@ -217,8 +228,9 @@ function wallVerdict(sig) {
 function queryRelevance(query, titles) {
   var STOP = /^(and|for|the|with|set|sets|pcs|pc|new|of|in|on|to|a|an|kit|lot)$/;
   var words = function (s) { return String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean); };
+  var qwords = words(query);
   // Each keyword once: "usb c to usb c cable" counted usb twice.
-  var toks = words(query).filter(function (t, i, a) { return t.length >= 2 && !STOP.test(t) && a.indexOf(t) === i; });
+  var toks = qwords.filter(function (t, i, a) { return t.length >= 2 && !STOP.test(t) && a.indexOf(t) === i; });
   var list = (titles || []).map(function (t) { return String(t || ''); }).filter(Boolean);
   if (!toks.length) return { measured: false, reason: 'no-query-keywords', checked: 0 };
   var latin = list.filter(function (t) {
@@ -229,41 +241,93 @@ function queryRelevance(query, titles) {
   }
   /* Latin script is not English: a Spanish or German account's titles
    * ("Ratón inalámbrico para PC", "Kabellose Maus mit USB") cannot match
-   * English keywords either. Their function words give them away. */
-  var FOREIGN = /(^|[^a-z])(para|con|und|mit|für|pour|avec|sans|sin|por|les|des|une|della|voor|och)([^a-z]|$)/i;
-  var foreign = latin.filter(function (t) { return FOREIGN.test(t); }).length;
+   * English keywords either. Their function words give them away. Six of
+   * them are English words too ("Pour Over Kettle", "Les Paul", "Con Rod"),
+   * so one of those counts only beside a second one or a letter with an
+   * accent. Alone, "pour" used to turn the whole check off (review,
+   * 2026-10-18). */
+  var FOREIGN = /(^|[^a-z])(und|mit|für|avec|sans|por|une|della|voor|och)([^a-z]|$)/i;
+  var FOREIGN_TOO = /(^|[^a-z])(para|con|pour|les|des|sin)(?=[^a-z]|$)/gi;
+  var ACCENT = /[\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u017f]/;
+  var isForeign = function (t) {
+    if (FOREIGN.test(t)) return true;
+    var seen = [];
+    (t.match(FOREIGN_TOO) || []).forEach(function (m) {
+      var w = m.toLowerCase().replace(/[^a-z]/g, '');
+      if (seen.indexOf(w) < 0) seen.push(w);
+    });
+    return seen.length >= 2 || (seen.length === 1 && ACCENT.test(t));
+  };
+  var foreign = latin.filter(isForeign).length;
   if (foreign * 10 >= latin.length * 3) {
     return { measured: false, reason: 'titles-not-english', checked: 0, keywords: toks };
   }
-  /* One word for its simple forms: plurals (boxes, cables, knives, mice),
-   * -er/-ing/-ed (charger, charging), -ier/-ying (magnifier, magnifying).
-   * A base must keep 4+ letters, so "wired" stays "wired", never "wire".
+  /* One word for its simple forms. Each word gives a few bases, and two
+   * words match when they share one. One stem per word missed "toy" and
+   * "toys", "box" and "boxes", "dress" and "dresses" (review, 2026-10-18).
+   *   plurals: toys, cars, ties, boxes, buses, dresses, cables, knives, mice
+   *   -er/-ing/-ed: charger, charging. That base keeps 4+ letters, so
+   *     "wired" is never "wire".
+   *   -ier/-ying: magnifier, magnifying
+   * A word ending in -ss keeps its last s: "dress" is not "dres".
+   * "-es" comes off only after s, x, z, ch, sh or o (boxes, dresses,
+   * watches, heroes). After any other letter only the "s" comes off:
+   * "tubes" is "tube", never "tub", and "tapes" is never "tap". A plain
+   * "-s" comes off only when 3 letters stay: "ups" is not "up" (recheck,
+   * 2026-10-19: the -es rule had been widened to every word).
    * A shared PREFIX is not a shared word: "water" and "waterproof",
    * "table" and "tablet" used to match (review, 2026-10-18). */
   var IRREGULAR = { mice: 'mouse', men: 'man', women: 'woman', feet: 'foot', teeth: 'tooth', children: 'child', geese: 'goose' };
-  var stemWord = function (w) {
-    if (IRREGULAR[w]) return IRREGULAR[w];
-    if (w.length > 5 && /ives$/.test(w)) return w.slice(0, -4) + 'ife';
-    if (w.length > 5 && /ves$/.test(w)) return w.slice(0, -3) + 'f';
-    if (w.length > 4 && /ies$/.test(w)) return w.slice(0, -3) + 'y';
-    if (w.length > 5 && /ying$/.test(w)) return w.slice(0, -4) + 'y';
-    if (/(s|x|z|ch|sh)es$/.test(w) && w.length > 5) return w.slice(0, -2);
-    var m = w.match(/^(.{4,}?)(ings|ing|ers|er|ed|s)$/);
-    var b = m ? m[1] : w;
-    return b.replace(/i$/, 'y');
+  var bases = function (w) {
+    var out = [];
+    var add = function (b) {
+      if (b.length < 2) return;
+      b = b.replace(/i$/, 'y');
+      if (out.indexOf(b) < 0) out.push(b);
+    };
+    add(w);
+    if (IRREGULAR[w]) add(IRREGULAR[w]);
+    if (w.length > 5 && /ives$/.test(w)) add(w.slice(0, -4) + 'ife');
+    if (w.length > 5 && /ves$/.test(w)) add(w.slice(0, -3) + 'f');
+    if (w.length > 4 && /ies$/.test(w)) add(w.slice(0, -3) + 'y');
+    if (w.length > 5 && /ying$/.test(w)) add(w.slice(0, -4) + 'y');
+    if (w.length > 4 && /(s|x|z|ch|sh|o)es$/.test(w)) add(w.slice(0, -2));
+    if (w.length > 3 && /[^s]s$/.test(w)) add(w.slice(0, -1));
+    var m = w.match(/^(.{4,}?)(ings|ing|ers|er|ed)$/);
+    if (m) add(m[1]);
+    return out;
   };
-  var has = function (ws, t) {
-    var st = stemWord(t);
-    return ws.some(function (w) { return w === t || stemWord(w) === st; });
-  };
+  var meets = function (xs, ys) { return xs.some(function (x) { return ys.indexOf(x) >= 0; }); };
+  var kb = {};
+  toks.forEach(function (k) { kb[k] = bases(k); });
+  // Two query keywords side by side are one word too: "screw driver" is
+  // held by a title that says "Screwdriver".
+  var pairs = [];
+  for (var qi = 0; qi + 1 < qwords.length; qi++) {
+    if (toks.indexOf(qwords[qi]) >= 0 && toks.indexOf(qwords[qi + 1]) >= 0) {
+      pairs.push({ a: qwords[qi], b: qwords[qi + 1], bs: bases(qwords[qi] + qwords[qi + 1]) });
+    }
+  }
   var per = {};
   toks.forEach(function (k) { per[k] = 0; });
   var on = 0;
   var off = [];
   latin.forEach(function (t) {
     var ws = words(t);
+    // ... and two title words side by side: "Screw Driver" is "screwdriver".
+    // Not a one-letter word or a bare ending: "Copper Wire D Ring" does not
+    // hold "wired", and "Car T Shirt" does not hold "cart" (recheck,
+    // 2026-10-19). A join must never undo the "wire is not wired" rule.
+    var all = ws.slice();
+    for (var wi = 0; wi + 1 < ws.length; wi++) {
+      if (ws[wi].length >= 2 && ws[wi + 1].length >= 2 && !/^(ed|er|es|ers|ing|ings)$/.test(ws[wi + 1])) all.push(ws[wi] + ws[wi + 1]);
+    }
+    var wb = all.map(bases);
+    var got = {};
+    toks.forEach(function (k) { if (wb.some(function (b) { return meets(b, kb[k]); })) got[k] = true; });
+    pairs.forEach(function (p) { if (wb.some(function (b) { return meets(b, p.bs); })) { got[p.a] = true; got[p.b] = true; } });
     var hit = false;
-    toks.forEach(function (k) { if (has(ws, k)) { per[k]++; hit = true; } });
+    toks.forEach(function (k) { if (got[k]) { per[k]++; hit = true; } });
     if (hit) on++;
     else if (off.length < 3) off.push(t.slice(0, 60));
   });
@@ -278,9 +342,11 @@ function queryRelevance(query, titles) {
     offSample: off,
     warning: warn
       ? 'off-query-results: only ' + on + ' of ' + latin.length + ' titles hold any of the keywords [' +
-        toks.join(', ') + ']. The site served another category (e.g. ' + JSON.stringify(off[0] || '') +
-        '). This is NOT a complete harvest of the product: do not report it as exhausted-all-results. ' +
-        'Re-word the query and say so to the user.'
+        toks.join(', ') + ']. Titles that hold none: ' + JSON.stringify(off) + '. Read them first: this ' +
+        'check cannot see a synonym ("earbuds" for "earphones"). If they are the product, the stream is ' +
+        'fine (coverage.streamVerdict). If the site served another category, this is NOT a complete ' +
+        'harvest of the product: do not report it as exhausted-all-results. Re-word the query and say so ' +
+        'to the user.'
       : null,
   };
 }

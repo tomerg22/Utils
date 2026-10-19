@@ -36,7 +36,10 @@
  *
  * THE MERGED VERDICT is worked out per search STREAM (the query's slug,
  * fourStar and the extra filters as `filterKey`), because page numbers mean
- * nothing across streams. A stream is 'exhausted-all-results' only when a
+ * nothing across streams. An old payload that used an extra filter but has
+ * no filterKey is a stream of its own, keyed by its content (see
+ * oldExtraKey), so it never joins another part's stream, at any merge
+ * depth. A stream is 'exhausted-all-results' only when a
  * part ran dry at page P, the pages read cover 1..P with no gap, and no part
  * read items past P (the stream changed between runs: 'truncated', with a
  * `stream-changed` warning). Every stream must be complete for the merge to
@@ -117,19 +120,46 @@ const filterKeyOf = (fourStar, extra) => {
   return h.toString(36);
 };
 
+/* AN OLD PAYLOAD WITH AN EXTRA FILTER (harvest.js before filterKey, e.g. all
+ * of September) says only `extraApplied: true`, never which extra. So its
+ * stream key is made from its own content: query, fourStar, pages, verdict
+ * flags and its item ids. It joins only an identical copy of itself, in one
+ * merge or in a merge of merged files. Until 2026-10-19 the key was
+ * 'unknown-extra-<position in this merge call>'. A merged file kept
+ * 'unknown-extra-1', so a new old part at position 1 of the next merge got
+ * the same key and joined a stream that was not its own: a false
+ * 'exhausted-all-results' (review 2026-10-18, finding F04). */
+const OLD_INDEX_KEY = /^unknown-extra-\d+$/;
+const oldExtraKey = (part, ids) => {
+  const t = JSON.stringify([slugOf(part.query), part.fourStar !== false,
+    (part.pages || []).map((pg) => [pg.page, pg.n]), part.streamVerdict || null, !!part.blocked, !!part.suspectedWall,
+    !!part.offQuery, part.cardCount || 0, ids ? ids.map(String).sort() : null]);
+  let a = 5381;
+  let b = 2166136261;
+  for (let k = 0; k < t.length; k++) {
+    const c = t.charCodeAt(k);
+    a = ((a * 33) ^ c) >>> 0;
+    b = Math.imul(b ^ c, 16777619) >>> 0;
+  }
+  // Two hashes, and always a second '-': never the old index form.
+  return 'unknown-extra-' + a.toString(36) + '-' + b.toString(36);
+};
+
 /** One input payload as a stream part: what the verdict needs, no items. */
-function partOf(p, idx) {
+function partOf(p) {
   const verdict = (p.coverage && p.coverage.verdict) || null;
   const rel = p.query ? queryRelevance(p.query, (p.items || []).map((i) => i && i.title)) : { warning: null };
-  return {
+  const part = {
     query: p.query || null,
     fourStar: p.fourStar !== false,
-    // An old payload with an unknown extra never joins another stream.
-    filterKey: p.filterKey || (p.extraApplied ? 'unknown-extra-' + idx : filterKeyOf(p.fourStar, '')),
+    // Set below: an old payload with an unknown extra needs the rest first.
+    filterKey: null,
     source: p.source || null,
     coverage: p.coverage || null,
     streamVerdict: (p.coverage && (p.coverage.streamVerdict || p.coverage.verdict)) || null,
     offQuery: verdict === 'off-query' || !!rel.warning,
+    // Up to 3 titles that hold no query keyword, for the off-query check.
+    offSample: Array.isArray(rel.offSample) ? rel.offSample.slice(0, 3) : [],
     pages: (Array.isArray(p.pages) ? p.pages : []).filter((pg) => pg && pg.page != null)
       .map((pg) => ({ page: Number(pg.page), n: pg.n == null ? null : Number(pg.n) })),
     blocked: p.blocked === true,
@@ -137,13 +167,22 @@ function partOf(p, idx) {
     cardCount: Array.isArray(p.items) ? p.items.length : 0,
     warnings: [...(Array.isArray(p.warnings) ? p.warnings : []), ...(rel.warning && verdict !== 'off-query' ? [rel.warning] : [])],
   };
+  part.filterKey = p.filterKey ||
+    (p.extraApplied ? oldExtraKey(part, (p.items || []).map((i) => (i && i.id != null ? i.id : ''))) : filterKeyOf(p.fourStar, ''));
+  return part;
 }
 
-/** The parts a payload stands for: a merged payload carries its own. */
-function partsOf(p, idx) {
+/** The parts a payload stands for: a merged payload carries its own, keys
+ * and all, so merging it again gives the same streams. A part that a
+ * decode.mjs older than 2026-10-19 keyed by position ('unknown-extra-0') is
+ * re-keyed from what it stored (it kept no item ids), so it never joins
+ * another stream by position either. */
+function partsOf(p) {
   if (p && p.source === 'merged' && Array.isArray(p.parts) && p.parts.length &&
-      p.parts.every((x) => x && Array.isArray(x.pages) && 'filterKey' in x)) return p.parts;
-  return [partOf(p, idx)];
+      p.parts.every((x) => x && Array.isArray(x.pages) && 'filterKey' in x)) {
+    return p.parts.map((x) => (OLD_INDEX_KEY.test(String(x.filterKey)) ? { ...x, filterKey: oldExtraKey(x, null) } : x));
+  }
+  return [partOf(p)];
 }
 
 /** Merge several payloads into one. See the header. */
@@ -157,7 +196,7 @@ export function mergePayloads(list) {
       if (!prev || richness(it) > richness(prev)) byId.set(it.id, prev ? { ...prev, ...it } : it);
     }
   }
-  const parts = list.flatMap((p, i) => partsOf(p, i));
+  const parts = list.flatMap((p) => partsOf(p));
   const keyOf = (x) => [slugOf(x.query), x.fourStar ? '4star' : 'all', x.filterKey].join('|');
   const streams = new Map();
   for (const x of parts) {
@@ -188,9 +227,17 @@ export function mergePayloads(list) {
     }
     // Blocked only when the last page of the stream hit the wall.
     const lastPart = ps.reduce((a, b) => (Math.max(0, ...b.pages.map((pg) => pg.page)) >= Math.max(0, ...a.pages.map((pg) => pg.page)) ? b : a));
-    const verdict = off ? 'off-query' : dryPage != null && !changed && contiguous ? 'exhausted-all-results' : 'truncated';
+    /* The stream's own verdict is kept beside an off-query one, as in a
+     * harvest.js payload. The off-query check cannot see a synonym
+     * ("Earbuds" for "earphones"), and its warning sends the operator to
+     * coverage.streamVerdict and the off titles. A merge used to drop both,
+     * so a correct stream read in two runs had no verdict of its own left
+     * (recheck, 2026-10-19). */
+    const streamVerdict = dryPage != null && !changed && contiguous ? 'exhausted-all-results' : 'truncated';
+    const verdict = off ? 'off-query' : streamVerdict;
+    const offSample = [...new Set(ps.filter((x) => x.offQuery).flatMap((x) => x.offSample || []))].slice(0, 3);
     return { query: q, stream: key, pagesRead: [...pages.keys()].sort((a, b) => a - b), pagesContiguousFrom1: contiguous,
-      verdict, blocked: verdict !== 'exhausted-all-results' && lastPart.blocked,
+      verdict, streamVerdict, offSample, blocked: verdict !== 'exhausted-all-results' && lastPart.blocked,
       suspectedWall: verdict !== 'exhausted-all-results' && lastPart.suspectedWall };
   });
   const slugs = [...new Set(parts.map((x) => slugOf(x.query)))];
@@ -213,11 +260,14 @@ export function mergePayloads(list) {
     suspectedWall: byQuery.some((s) => s.suspectedWall),
     coverage: {
       verdict: offQuery ? 'off-query' : allDone ? 'exhausted-all-results' : 'truncated',
+      streamVerdict: byQuery.every((x) => x.streamVerdict === 'exhausted-all-results') ? 'exhausted-all-results' : 'truncated',
       byQuery,
       pagesRead: byQuery.length === 1 ? byQuery[0].pagesRead : undefined,
       pagesContiguousFrom1: byQuery.length === 1 ? byQuery[0].pagesContiguousFrom1 : undefined,
       claimedTotalIsUnreliable: true,
     },
+    // Short on purpose: per stream, see coverage.byQuery[].offSample.
+    relevance: { offQuery, offSample: [...new Set(byQuery.flatMap((x) => x.offSample))].slice(0, 3) },
     parts,
     warnings,
     cardCount: items.length,

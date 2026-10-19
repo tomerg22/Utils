@@ -284,7 +284,15 @@ console.log('\nrank — filters');
     { id: 'thinev', title: 'מקציף חלב', rating: 4.9, reviews: 2, sold: 10 },
   ], ['--mode', 'final', '--top', '9']);
   eq('only the good item survives', r.ranked.map((x) => x.id), ['keep']);
-  eq('drop reasons tallied', r.droppedReasons, { 'no rating': 1, 'rating<4': 1, 'evidence<10': 1 });
+  // In final mode a record with no rating and no own count is set aside out
+  // loud as own-reviews-unknown (recheck, 2026-10-19, R-F11); "no rating"
+  // (the SEO-junk filter) is a shortlist matter, checked just below.
+  eq('drop reasons tallied', r.droppedReasons, { 'own-reviews-unknown': 1, 'rating<4': 1, 'evidence<10': 1 });
+  const s = rank([
+    { id: 'keep', title: 'מקציף חלב', rating: 4.8, sold: 5000 },
+    { id: 'norating', title: 'seo junk', rating: null, reviews: null, sold: null },
+  ], ['--mode', 'shortlist']);
+  eq('shortlist: SEO junk with all fields null is dropped as "no rating"', s.droppedReasons, { 'no rating': 1 });
 }
 {
   // Off-category guard: page 2 of a real search returned eye cream + makeup brushes.
@@ -3006,6 +3014,1099 @@ await block('W12', async () => {
   ok('SKILL.md says ~200 KB per 400 items (about 500 chars per item, measured)', /~200 KB per 400 items/.test(skillSrc));
   ok('a page-cap is lifted with resume({ maxPages })', /`resume\(\{ maxPages \}\)`/.test(skillSrc));
   ok('the listing.js read order says blocked first', /read `blocked` \/ `suspectedWall` first/.test(skillSrc));
+});
+
+// ============================================================================
+// 2026-10-18, recheck: three skeptics each confirmed these on the code of
+// the fourth pass (harvest relevance, backups, the page-60 cap, the export
+// wording). Each block below fails on that code.
+// ============================================================================
+const recheckRep = (t, n = 10) => Array.from({ length: n }, (_, i) => t + ' ' + i);
+const recheckInstall = () => new Function('window', 'fetch', 'return (' + harvestSrc + '\n)')({}, async () => reply(''));
+
+console.log('\nR-F00: relevance: a noun ending in -ss and its plural are one word');
+await block('R-F00', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  for (const [q, t] of [['dresses', 'Women Summer Floral Dress'], ['dress', 'Women Summer Floral Dresses'],
+    ['glass', 'Wine Glasses Crystal'], ['glasses', 'Wine Glass Crystal'], ['mattresses', 'Memory Foam Mattress'],
+    ['compass', 'Hiking Compasses'], ['neck ties', 'Mens Silk Tie Necktie']]) {
+    eq(`R-F00: "${q}" over "${t}" titles raises nothing`, qr(q, recheckRep(t)).warning, null);
+  }
+  eq('R-F00: "wine glasses" over "Wine Glass" gives the noun its share', qr('wine glasses', recheckRep('Wine Glass')).keywordShare,
+    { wine: 1, glasses: 1 });
+  // The same through the harvester, so the inlined copy is exercised too.
+  const items = Array.from({ length: 6 }, (_, i) => makeItem('g' + i, { title: 'Crystal Wine Glasses ' + i }));
+  const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p === 1 ? items: [], page: p })); });
+  H.start({ query: 'wine glass' });
+  await H.step(3);
+  const pl = JSON.parse(H.payload());
+  eq('R-F00: harvest.js gives "glass" its share on "Glasses" titles', pl.relevance.keywordShare, { wine: 1, glass: 1 });
+  // What must not change: a word that only starts the same is another word.
+  ok('R-F00: "dress" is still not "address"', qr('dress', recheckRep('Address Label Sticker')).warning !== null);
+});
+
+console.log('\nR-F20: relevance: short plurals (toys, cars, boxes, buses, ties) match');
+await block('R-F20', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  for (const [q, t] of [['toy car', 'Kids Toys Cars'], ['box', 'Storage Boxes'], ['cup', 'Coffee Cups'], ['bags', 'Shopping Bag'],
+    ['bag', 'Shopping Bags'], ['pen', 'Gel Pens'], ['hat', 'Sun Hats'], ['tie', 'Silk Ties'], ['bus', 'Model Buses'], ['buses', 'Toy Bus']]) {
+    eq(`R-F20: "${q}" over "${t}" titles raises nothing`, qr(q, recheckRep(t)).warning, null);
+  }
+  // The finding's end-to-end case: start({query:'dress'}) on a stream of Dresses.
+  const items = Array.from({ length: 6 }, (_, i) => makeItem('d' + i, { title: 'Women Summer Floral Dresses ' + i, soldRaw: '1,000+' }));
+  const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p === 1 ? items: [], page: p })); });
+  H.start({ query: 'dress' });
+  const st = await H.step(3);
+  eq('R-F20: status().relevance is on-query', [st.relevance.share, st.relevance.offQuery], [1, false]);
+  const pl = JSON.parse(H.payload());
+  eq('R-F20: the verdict is exhausted-all-results, not off-query', pl.coverage.verdict, 'exhausted-all-results');
+  const r = rank(pl, ['--mode', 'shortlist']);
+  ok('R-F20: rank.mjs raises no off-query warning', !r.warnings.some((w) => /^off-query-results/.test(w)), JSON.stringify(r.warnings));
+  // What must not change.
+  ok('R-F20: "wire" is still not "wired"', qr('wired usb mouse', recheckRep('Aluminum Craft Wire 20 Gauge')).warning !== null);
+  ok('R-F20: "car" is still not "card"', qr('car', recheckRep('Gift Card Holder')).warning !== null);
+  ok('R-F20: "pen" is still not "pendant"', qr('pen', recheckRep('Silver Pendant Necklace')).warning !== null);
+});
+
+console.log('\nR-F25: relevance: "pour", "les", "con" alone do not make an English title foreign');
+await block('R-F25', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  const kettles = qr('wired usb mouse', recheckRep('Pour Over Coffee Kettle Gooseneck', 20));
+  eq('R-F25: English titles with "pour" are measured', [kettles.measured, kettles.checked], [true, 20]);
+  ok('R-F25: so an off stream of pour-over kettles is flagged', kettles.warning !== null, JSON.stringify(kettles).slice(0, 200));
+  for (const [q, t] of [['electric guitar', 'Les Paul Electric Guitar'], ['con rod', 'Con Rod Bearing Set'],
+    ['paracord', 'Para Cord 550 Paracord'], ['calculator', 'Sin Cos Scientific Calculator']]) {
+    eq(`R-F25: "${t}" titles are measured and on-query`, [qr(q, recheckRep(t)).measured, qr(q, recheckRep(t)).warning], [true, null]);
+  }
+  // Other languages stay unmeasured.
+  eq('R-F25: German titles with "mit" stay unmeasured', qr('wireless mouse', recheckRep('Kabellose Maus mit USB')).reason, 'titles-not-english');
+  eq('R-F25: French titles with "sans" stay unmeasured', qr('wireless mouse', recheckRep('Souris sans fil pour PC')).reason, 'titles-not-english');
+  eq('R-F25: Spanish titles with two such words stay unmeasured', qr('wireless mouse', recheckRep('Mouse inalambrico para PC con cable')).reason,
+    'titles-not-english');
+  eq('R-F25: one such word beside an accented letter is foreign', qr('wireless mouse', recheckRep('Ratón inalámbrico para PC')).reason,
+    'titles-not-english');
+  ok('R-F25: SKILL.md says one of those words counts only beside a second one or an accent',
+    /so one of them counts only beside a second one\s+or a letter with an accent/.test(skillSrc));
+});
+
+console.log('\nR-F32: relevance: split compounds match; a synonym is named as the limit');
+await block('R-F32', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  const sd = [...recheckRep('Screw Driver Kit Magnetic', 40), ...recheckRep('Torx Bit Holder', 20)];
+  const r1 = qr('screwdriver set', sd);
+  eq('R-F32: "screwdriver set" over "Screw Driver" titles raises nothing', r1.warning, null);
+  eq('R-F32: and "screwdriver" gets its share', r1.keywordShare.screwdriver, 0.667);
+  eq('R-F32: "screw driver" over "Screwdriver" titles raises nothing', qr('screw driver', recheckRep('Precision Screwdriver Set')).warning, null);
+  const eb = qr('earphones', recheckRep('Wireless Earbuds Bluetooth 5.3 TWS', 60));
+  ok('R-F32: a synonym stream still warns (the documented limit)', eb.warning !== null);
+  ok('R-F32: the warning quotes the titles that hold no keyword', eb.offSample.length === 3 && eb.offSample.every((t) => eb.warning.includes(t)),
+    eb.warning);
+  ok('R-F32: and says the check cannot see a synonym, and where the stream verdict is',
+    /cannot see a synonym/.test(eb.warning) && /coverage\.streamVerdict/.test(eb.warning), eb.warning);
+  ok('R-F32: SKILL.md says to read relevance.offSample before acting on off-query',
+    /\*\*Read the off titles before you act on `off-query`\.\*\*/.test(skillSrc) && /first read `relevance\.offSample`/.test(skillSrc));
+  ok('R-F32: SKILL.md names the synonym limit', /The check cannot see\s+a synonym/.test(skillSrc));
+});
+
+console.log('\nR-F02: backups are ranked by the time they were SAVED, not started');
+await block('R-F02', async () => {
+  const ls = fakeStorage();
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const site = (q) => async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p <= 8 ? [makeItem(q + p)]: [], page: p })); };
+  const tab = (f) => { const w = { localStorage: ls }; new Function('window', 'fetch', harvestSrc)(w, f); return w.__aeHarvest; };
+  const A = tab(site('db'));
+  A.start({ query: 'drill bits', maxRequests: 2 });
+  await A.step(6); // request-budget after 2 pages
+  await wait(4);
+  const B = tab(site('hk'));
+  B.start({ query: 'hex keys' });
+  await B.step(3);
+  await wait(4);
+  // A fresh tab restores the older run and reads on: it is saved last now.
+  const C = tab(site('db'));
+  C.restore('drill bits');
+  C.resume({ maxRequests: 5 });
+  await C.step(3);
+  await wait(4);
+  const D = tab(site('x'));
+  const r = D.restore();
+  eq('R-F02: restore() with no query takes the run saved last, not the one started last', [r.query, r.pagesRead], ['drill bits', 5]);
+  eq('R-F02: backups() lists the run saved last first', D.backups().map((b) => b.query), ['drill bits', 'hex keys']);
+  for (const q of ['q3', 'q4']) { await wait(4); tab(site(q)).start({ query: q }); }
+  eq('R-F02: two newer starts drop the run saved longest ago, not the one worked on', D.backups().map((b) => b.query),
+    ['q4', 'q3', 'drill bits']);
+  // A full store: the quota loop drops the run saved longest ago first.
+  const dry = fakeStorage();
+  const wd = { localStorage: dry };
+  new Function('window', 'fetch', harvestSrc)(wd, pageFetch({ 1: ['q1'], 2: [] }));
+  wd.__aeHarvest.start({ query: 'wire brush set' });
+  await wd.__aeHarvest.step(3);
+  const saveLen = [...dry._m.values()][0].length;
+  const filler = 'x'.repeat(800);
+  const old1 = JSON.stringify({ v: 2, savedAt: Date.now() - 1000, query: 'worked on', items: [], pad: filler });
+  const old2 = JSON.stringify({ v: 2, savedAt: 5, query: 'left alone', items: [], pad: filler });
+  const cap = old1.length + old2.length + saveLen - 100;
+  const q = fakeStorage();
+  const qset = q.setItem;
+  q.setItem = (k, v) => { const used = [...q._m.entries()].reduce((a, [kk, vv]) => a + (kk === k ? 0: vv.length), 0);
+    if (used + String(v).length > cap) { const e = new Error('QuotaExceededError'); e.name = 'QuotaExceededError'; throw e; } qset(k, v); };
+  q._m.set('__aeHarvest:worked-on:' + (1).toString(36), old1); // started first, saved a second ago
+  q._m.set('__aeHarvest:left-alone:' + (2).toString(36), old2); // started later, saved long ago
+  const wq = { localStorage: q };
+  new Function('window', 'fetch', harvestSrc)(wq, pageFetch({ 1: ['q1'], 2: [] }));
+  wq.__aeHarvest.start({ query: 'wire brush set' });
+  const sq = await wq.__aeHarvest.step(3);
+  eq('R-F02: a full store drops the run saved longest ago, and keeps the one saved a second ago',
+    [sq.backup && sq.backup.saved, q._m.has('__aeHarvest:left-alone:2'), q._m.has('__aeHarvest:worked-on:1')], [true, false, true]);
+  ok('R-F02: SKILL.md says the 3 runs saved last are kept', /the 3 runs\s+saved last are kept/.test(skillSrc) && !/the 3 newest\s+runs are kept/.test(skillSrc));
+});
+
+console.log('\nR-F03: maxPages stops at the site\'s page 60; an empty page 61 is never "all results"');
+await block('R-F03', async () => {
+  const fetched = [];
+  const site = async (url) => { const p = Number(new URL(url).searchParams.get('page')); fetched.push(p);
+    return reply(makePage({ items: p <= 60 ? [makeItem('wb' + p)]: [], page: p })); };
+  const H = loadHarvest(site);
+  const plan = H.start({ query: 'wire brush', maxPages: 70, maxRequests: 70 });
+  eq('R-F03: maxPages above 60 is cut to 60', plan.maxPages, 60);
+  ok('R-F03: and the plan says so', /cut to 60/.test(plan.note || ''), JSON.stringify(plan));
+  let st = null;
+  for (let k = 0; k < 20 && !(st && st.done); k++) st = await H.step(6);
+  eq('R-F03: the run stops at page 60 as page-cap', [st.stop, st.pagesRead], ['page-cap', 60]);
+  ok('R-F03: page 61 is never fetched', !fetched.includes(61), JSON.stringify(fetched.slice(-3)));
+  const pl = JSON.parse(H.payload());
+  eq('R-F03: the verdict is truncated, never exhausted-all-results', [pl.coverage.verdict, pl.coverage.streamVerdict], ['truncated', 'truncated']);
+  const rs = H.resume({ maxPages: 80 });
+  ok('R-F03: resume() cannot read past page 60', /serves no page past it/.test(rs.err || '') && rs.stop === 'page-cap', JSON.stringify(rs));
+  // A backup written by older code: maxPages 70, read up to page 59.
+  const ls = fakeStorage();
+  ls.setItem('__aeHarvest:wire-brush:1', JSON.stringify({ v: 2, savedAt: Date.now(), query: 'wire brush', slug: 'wire-brush',
+    base: 'https://he.aliexpress.com/w/wholesale-wire-brush.html?SortType=total_tranpro_desc', fourStar: true, extra: null, startPage: 1, maxPages: 70, maxRequests: 70,
+    page: 59, requests: 59, items: [], pages: [], claimedTotal: null, stop: 'request-budget', endSignal: null, lastErr: null, wall: null, startedAt: 1 }));
+  const w = { localStorage: ls };
+  fetched.length = 0;
+  new Function('window', 'fetch', harvestSrc)(w, site);
+  w.__aeHarvest.restore();
+  w.__aeHarvest.resume();
+  const s2 = await w.__aeHarvest.step(6);
+  eq('R-F03: a restored maxPages 70 still stops at page 60', [s2.stop, s2.pagesRead, fetched], ['page-cap', 60, [60]]);
+  const r2 = H.resume({ maxRequests: 99 });
+  ok('R-F03: a raised budget cannot lift the page-60 stop either', /serves no page past it/.test(r2.err || ''), JSON.stringify(r2));
+  let threw = '';
+  try { H.start({ query: 'x', startPage: 61 }); } catch (e) { threw = String(e); }
+  ok('R-F03: a startPage past 60 is refused', /past page 60/.test(threw), threw);
+  ok('R-F03: SKILL.md says a maxPages above 60 is cut to 60', /a `maxPages` above 60 is\s+cut to 60/.test(skillSrc));
+});
+
+console.log('\nR-F07: the install reply and the receiver header name send(8765, {via:\'form\'})');
+await block('R-F07', async () => {
+  const msg = recheckInstall();
+  ok('R-F07: the install reply names send(8765, {via:\'form\'})', /await __aeHarvest\.send\(8765, \{via:'form'\}\)/.test(msg), msg);
+  ok('R-F07: after the curl check', /curl -s http:\/\/127\.0\.0\.1:8765\/ answers ok\), then await __aeHarvest\.send\(8765, \{via/.test(msg), msg);
+  ok('R-F07: and never a plain __aeHarvest.send(8765)', !/__aeHarvest\.send\(8765\)/.test(msg), msg);
+  ok('R-F07: the install reply fits the Chrome cap and has no "?"', msg.length < 1000 && !msg.includes('?'), String(msg.length));
+  const rx = SRC('receiver.mjs');
+  ok('R-F07: the receiver.mjs header names {via: \'form\'} and the curl check',
+    /`await __aeHarvest\.send\(<port>, \{via: 'form'\}\)`\s+\* after `curl -s http:\/\/127\.0\.0\.1:<port>\/` answers ok/.test(rx) &&
+    !/__aeHarvest\.send\(<port>\)/.test(rx));
+});
+
+console.log('\nR-F22: no file tells the operator to call a plain send(8765)');
+await block('R-F22', async () => {
+  const bare = /__aeHarvest\.send\((8765|<port>|port)\)/;
+  const files = [['harvest.js', harvestText], ['dist/harvest.min.js', readFileSync(join(HERE, 'dist', 'harvest.min.js'), 'utf8')],
+    ['receiver.mjs', SRC('receiver.mjs')], ['README.md', SRC('../README.md')], ['SKILL.md', skillSrc]];
+  for (const [name, text] of files) {
+    ok(`R-F22: ${name} never tells the operator to call a plain send()`, !bare.test(text),
+      (text.match(new RegExp(bare.source + '[^\\n]*', 'g')) || []).join(' | '));
+  }
+  ok('R-F22: the README receiver row names {via: \'form\'} after a curl check',
+    /\| `scripts\/receiver\.mjs` \| Loopback HTTP receiver: after a `curl` check, `__aeHarvest\.send\(port, \{via: 'form'\}\)`/.test(SRC('../README.md')));
+  ok('R-F22: the SKILL.md Files table names {via: \'form\'} after a curl check',
+    /\| `scripts\/receiver\.mjs` \| \*\*Primary export\.\*\* Loopback HTTP receiver; after a `curl` check, `__aeHarvest\.send\(port, \{via: 'form'\}\)`/.test(skillSrc));
+});
+
+console.log('\nR-F31: the harvest.js usage header and install reply match SKILL.md');
+await block('R-F31', async () => {
+  const head = harvestText.split('\n').slice(0, 16).join('\n');
+  ok('R-F31: the usage header shows send(8765, {via: \'form\'}) after the curl check',
+    /await __aeHarvest\.send\(8765, \{via: 'form'\}\)\s+\/\/ payload -> receiver\.mjs, after\s+\*\s+\/\/ curl -s http:\/\/127\.0\.0\.1:8765\/ answers ok/.test(head), head);
+  const msg = recheckInstall();
+  ok('R-F31: the install reply no longer says "send(8765) to export"', !/send\(8765\) to export/.test(msg), msg);
+  ok('R-F31: the install reply carries no em dash', !msg.includes(String.fromCharCode(0x2014)), msg);
+});
+
+// ============================================================================
+// 2026-10-18, recheck (listing and extract readers): three skeptics each
+// confirmed these on the code of the fourth pass. Each block fails on it.
+// ============================================================================
+const leEl = (tag, p = {}) => ({ tagName: tag, children: p.children || [], textContent: p.text || '', className: p.cls || '',
+  naturalWidth: 0, naturalHeight: 0, currentSrc: '', src: '', shadowRoot: null, parentElement: p.parent || null,
+  getAttribute: (k) => (p.attrs || {})[k] || null, querySelector: () => null, querySelectorAll: () => p.qsa || [],
+  closest: () => null, click() {}, id: '', nodeType: 1, previousElementSibling: p.prev || null,
+  childNodes: p.nodes || (p.text ? [{ nodeType: 3, nodeValue: p.text }] : []) });
+// listing.js on a stub page; `desc` is the description reply ({ body, images }) or null.
+const leListing = async (els, { desc = null, bodyText = 'x'.repeat(2500), ld = 0, title } = {}) => {
+  const src = RUN('listing.js');
+  const DESC = 'https://pdp.aliexpress-media.com/product/description/pc/v2/en_US/desc.htm?productId=1';
+  const win = desc ? {
+    performance: { getEntriesByType: () => [{ name: DESC }] },
+    fetch: async () => ({ url: DESC, status: 200, ok: true, text: async () => '<html>' + desc.body + '</html>' }),
+    DOMParser: class { parseFromString() {
+      const p = leEl('P', { text: desc.body });
+      const imgs = (desc.images || []).map((u) => leEl('IMG', { attrs: { src: u } }));
+      return { body: leEl('BODY', { qsa: [p, ...imgs], nodes: [p] }), querySelectorAll: () => [p, ...imgs] };
+    } },
+  } : {};
+  const document = { title, body: { scrollHeight: 5000, innerText: bodyText }, documentElement: { outerHTML: '' },
+    querySelectorAll: (sel) => (/ld\+json/.test(sel || '') ? new Array(ld) : els) };
+  return new Function('window', 'document', 'location', `${src}; return window.__aeListing;`)({ scrollTo() {}, document, ...win }, document,
+    { href: 'https://he.aliexpress.com/item/1.html' }).read(desc ? {} : { description: false });
+};
+const leSizes = (r) => [r.productSizeLines, r.packageSizeLines];
+// The SKILL.md step-5 reader on a stub page; `want` replaces its WANT list.
+const leLd = [{ textContent: JSON.stringify({ '@type': 'Product', aggregateRating: { ratingValue: '4.9', reviewCount: '5479' },
+  offers: { price: '3.1', priceCurrency: 'USD' } }) }];
+const leStep5 = (els, text, want = null) => {
+  const code = want ? step5.replace(/const WANT = \[[^\]]*\];/, 'const WANT = ' + JSON.stringify(want) + ';') : step5;
+  const raw = new Function('document', 'location', 'return (' + code + '\n)')(
+    { title: 'Mouse', body: { innerText: text }, querySelectorAll: (sel) => (/ld\+json/.test(sel) ? leLd : els) }, { pathname: '/item/1.html' });
+  return { raw, out: JSON.parse(raw) };
+};
+const leOpt = (name, sel) => ({ className: 'sku-item--text--Qa1' + (sel ? ' sku-item--selected--I' : ''), querySelector: () => null,
+  textContent: name, shadowRoot: null });
+const leSpec = (k, val) => ({ className: 'specification--prop--J', textContent: k + val, shadowRoot: null,
+  querySelector: (sel) => (/title/.test(sel) ? { textContent: k } : /desc/.test(sel) ? { textContent: val } : null) });
+
+console.log('\nR-F13: step 5: the 1,000-character cut never drops a selected option first');
+await block('R-F13', async () => {
+  const WANT10 = ['Type', 'Interface Type', 'Power Type', 'Power Source', 'Battery Included', 'Cable Length', 'Max. DPI',
+    'Number of Buttons', 'Operation Mode', 'Material'];
+  const specs = WANT10.map((k) => leSpec(k, 'v'.repeat(40)));
+  const page = (selAt) => [...Array.from({ length: 12 }, (_, i) => leOpt('Option ' + String(i).padStart(2, '0') + ' ' + 'n'.repeat(14), i === selAt)), ...specs];
+  for (const selAt of [11, 3]) {
+    const { raw, out } = leStep5(page(selAt), RV.gyro, WANT10);
+    ok(`R-F13: selected at ${selAt + 1} of 12: the cut fires and the result fits`, out.optionsCut === true && raw.length <= 1000, String(raw.length));
+    ok(`R-F13: selected at ${selAt + 1} of 12: the selected option is kept`, out.options.some((o) => /\*$/.test(o)), JSON.stringify(out.options));
+    ok(`R-F13: selected at ${selAt + 1} of 12: only unselected options were cut`, out.options.length < 11 &&
+      out.options.filter((o) => /\*$/.test(o)).length === 1, JSON.stringify(out.options));
+  }
+  // Two selected ones (Color AND Type) past the first 10: both stay.
+  const two = [...Array.from({ length: 14 }, (_, i) => leOpt('Option ' + String(i).padStart(2, '0') + ' ' + 'n'.repeat(14), i === 12 || i === 13)), ...specs];
+  const t = leStep5(two, RV.gyro, WANT10).out;
+  eq('R-F13: two selected options past the first 10 both survive the cut', [t.optionsCut, t.options.filter((o) => /\*$/.test(o)).length], [true, 2]);
+  // With the default WANT nothing is cut, as before.
+  const d = leStep5(page(11), RV.gyro).out;
+  eq('R-F13: the default WANT still cuts nothing', [d.optionsCut, d.options.length], [undefined, 11]);
+  ok('R-F13: SKILL.md says unselected options are cut first', /Unselected ones go first\. A selected one is cut\s+only when no unselected one is left\./.test(skillSrc));
+});
+
+console.log('\nR-F14: extract.js and harvest.js: a title with a wall phrase does not make a served page a wall');
+await block('R-F14', async () => {
+  const exSrc = RUN('extract.js');
+  const titles = ['Sliding door lock, please slide to lock child safety', 'Cabinet lock for kids', 'Drawer latch strong'];
+  const win = { _dida_config_: { _init_data_: { data: { data: { root: { fields: { mods: { itemList: { content: titles.map((t, i) => (
+    { productId: 'w' + i, title: { displayTitle: t }, prices: { salePrice: { minPrice: 3, currencyCode: 'USD' } },
+      evaluation: { starRating: 4.8 }, trade: { tradeDesc: '1,000+ sold' } })) } } } } } } } } };
+  const loc = { href: 'https://www.aliexpress.com/w/wholesale-door-lock.html?page=1', origin: 'https://www.aliexpress.com',
+    pathname: '/w/wholesale-door-lock.html', search: '?page=1' };
+  const doc = (body) => ({ querySelectorAll: () => [], body: { innerText: body }, documentElement: { outerHTML: '<html>grid</html>' }, title: 'door lock' });
+  const run = (w, body) => JSON.parse(new Function('window', 'document', 'location', 'return (' + exSrc + '\n)')(w, doc(body), loc));
+  const r = run(win, 'Results ' + titles.join(' US $3.00 ') + ' US $3.00 ' + 'x'.repeat(3000));
+  eq('R-F14: a page of 3 items with "please slide" in a title is not blocked', [r.cardCount, r.blocked, r.wall.state], [3, false, 'clear']);
+  // What must not change: a real wall still stops.
+  eq('R-F14: a wall page with no items is still blocked', run({}, 'Please slide to verify').blocked, true);
+  eq('R-F14: the wall\'s own sentence outside the titles still counts', run(win, 'Sorry, we have detected unusual traffic from your network. ' +
+    titles.join(' ')).blocked, true);
+  ok('R-F14: extract.js uses the same strong-wall sentences as listing.js', (() => {
+    const pick = (s) => (s.match(/const STRONG_WALL = (\/.*\/i);/) || [])[1];
+    return !!pick(SRC('extract.js')) && pick(SRC('extract.js')) === pick(SRC('listing.js')) && pick(harvestText) === pick(SRC('listing.js'));
+  })());
+  // harvest.js: the same title in a served page must not stop the run as 'blocked'.
+  const items = titles.map((t, i) => makeItem('h' + i, { title: t }));
+  const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p === 1 ? items : [], page: p })); });
+  H.start({ query: 'door lock' });
+  const st = await H.step(3);
+  ok('R-F14: harvest.js keeps going past a title with "please slide"', st.stop !== 'blocked' && JSON.parse(H.payload()).items.length === 3,
+    JSON.stringify({ stop: st.stop, wall: st.wall }));
+  const W = loadHarvest(async () => reply('<html><body>Sorry, we have detected unusual traffic. Please slide to verify.</body></html>'));
+  W.start({ query: 'door lock' });
+  eq('R-F14: harvest.js still stops on a wall page', (await W.step(1)).stop, 'blocked');
+});
+
+console.log('\nR-F15: listing.js: a product that IS a box keeps its own size; packaging boxes stay cartons');
+await block('R-F15', async () => {
+  eq('R-F15: "Lunch Box Size: 20 x 15 x 6 cm" in a fetched description is the product size',
+    leSizes(await leListing([], { desc: { body: 'Lunch Box Size: 20 x 15 x 6 cm' } })), [['Lunch Box Size: 20 x 15 x 6 cm'], []]);
+  eq('R-F15: "Storage box dimensions: 30x20x10cm" is the product size',
+    leSizes(await leListing([leEl('P', { text: 'Storage box dimensions: 30x20x10cm' })])), [['Storage box dimensions: 30x20x10cm'], []]);
+  eq('R-F15: a bare size under "Lunch box size:" is the product size',
+    leSizes(await leListing([leEl('SPAN', { text: '20 x 15 x 6 cm', parent: { textContent: 'Lunch box size: 20 x 15 x 6 cm' } })])), [['20 x 15 x 6 cm'], []]);
+  // Packaging phrasing is still the carton.
+  for (const t of ['Box size: 30 x 20 x 10 cm', 'Gift box size: 20 x 10 x 5 cm', 'Size (box): 20 x 10 x 5 cm', 'Outer box: 40 x 30 x 20 cm',
+    'Size of the box: 20 x 10 x 5 cm', 'Shipping box size: 20 x 10 x 5 cm']) {
+    eq(`R-F15: "${t}" is still the carton`, leSizes(await leListing([leEl('P', { text: t })])), [[], [t]]);
+  }
+  eq('R-F15: a bare size under "Box size:" is still the carton',
+    leSizes(await leListing([leEl('SPAN', { text: '20 x 15 x 6 cm', parent: { textContent: 'Box size: 20 x 15 x 6 cm' } })])), [[], ['20 x 15 x 6 cm']]);
+  ok('R-F15: SKILL.md says a lunch box size is the product\'s own', /`Lunch Box Size: 20 x 15 x 6 cm` is the product's own\s+size/.test(skillSrc));
+});
+
+console.log('\nR-F16: listing.js: one line with the product size and the package size yields both');
+await block('R-F16', async () => {
+  eq('R-F16: "Size: 10 x 5 x 3 cm Package size: 12 x 7 x 4 cm" splits in two',
+    leSizes(await leListing([leEl('P', { text: 'Size: 10 x 5 x 3 cm Package size: 12 x 7 x 4 cm' })])),
+    [['Size: 10 x 5 x 3 cm'], ['Package size: 12 x 7 x 4 cm']]);
+  eq('R-F16: the same in a fetched description',
+    leSizes(await leListing([], { desc: { body: 'Size: 10 x 5 x 3 cm Package size: 12 x 7 x 4 cm' } })),
+    [['Size: 10 x 5 x 3 cm'], ['Package size: 12 x 7 x 4 cm']]);
+  const span = leEl('SPAN', { text: 'Package size: 12x7x4cm' });
+  const p = leEl('P', { text: 'Package size: 12x7x4cm Size: 10x5x3cm', children: [span], nodes: [span, { nodeType: 3, nodeValue: ' Size: 10x5x3cm' }] });
+  span.parentElement = p;
+  eq('R-F16: <p><span>Package size: …</span> Size: …</p> keeps the product size, the carton once',
+    leSizes(await leListing([p, span])), [['Size: 10x5x3cm'], ['Package size: 12x7x4cm']]);
+  eq('R-F16: the Hebrew labels split the same way',
+    leSizes(await leListing([leEl('P', { text: 'גודל: 10x5x3 ס"מ גודל החבילה: 12x7x4 ס"מ' })])), [['גודל: 10x5x3 ס"מ'], ['גודל החבילה: 12x7x4 ס"מ']]);
+  // What must not change: a label after a word is not a second size.
+  eq('R-F16: "Lunch Box Size: …" is not split', leSizes(await leListing([leEl('P', { text: 'Lunch Box Size: 20 x 15 x 6 cm' })])),
+    [['Lunch Box Size: 20 x 15 x 6 cm'], []]);
+  ok('R-F16: SKILL.md says a line with two sizes splits', /A line that\s+holds two sizes splits where the second label starts/.test(skillSrc));
+});
+
+console.log('\nR-F17: step 5: soldRaw keeps its first digit when the header has no separator');
+await block('R-F17', async () => {
+  eq('R-F17: "5479 Reviews 10,000+ sold" gives 10,000+', leStep5([], '4.9 5479 Reviews 10,000+ sold US $1.58').out.soldRaw, '10,000+');
+  eq('R-F17: "5479 Reviews 100K+ sold" gives 100K+', leStep5([], '4.9 5479 Reviews 100K+ sold US $1.58').out.soldRaw, '100K+');
+  eq('R-F17: "37 Reviews 455 sold" gives 455', leStep5([], '4.8 37 Reviews 455 sold').out.soldRaw, '455');
+  // What must not change: the separator mark seen live.
+  eq('R-F17: the live separator still works', leStep5([], RV.gyro).out.soldRaw, '50,000+');
+  eq('R-F17: "Reviews | 10,000+ sold" works', leStep5([], '4.9 5479 Reviews | 10,000+ sold').out.soldRaw, '10,000+');
+});
+
+console.log('\nR-F18: step 5: the text fallback stops where listing.js stops, and reads "Name:"');
+await block('R-F18', async () => {
+  const listingEnd = (SRC('listing.js').match(/const SPEC_END = (\/.*\/i);/) || [])[1];
+  const step5End = ((step5 || '').match(/const END = (\/.*\/i);/) || [])[1];
+  ok('R-F18: the step-5 END is listing.js SPEC_END', !!listingEnd && step5End === listingEnd, `${step5End} vs ${listingEnd}`);
+  const WANT = ['Type', 'Interface Type', 'Power Type', 'Power Source', 'Battery Included'];
+  const pages = {
+    youMayAlsoLike: 'x\nSpecifications\nPower Source\nUSB\nYou may also like\nType\nWireless\n' + 'z'.repeat(2500),
+    colonNames: 'x\nSpecifications\nPower Source:\nUSB\nType:\nWired\nDescription\nmore\n' + 'z'.repeat(2500),
+    hebrewEnd: 'x\nSpecifications\nPower Source\nUSB\nתיאור\nType\nWireless\n' + 'z'.repeat(2500),
+  };
+  const want = { youMayAlsoLike: { 'Power Source': 'USB' }, colonNames: { 'Power Source': 'USB', Type: 'Wired' }, hebrewEnd: { 'Power Source': 'USB' } };
+  for (const k of Object.keys(pages)) {
+    const s5 = leStep5([], pages[k]).out;
+    eq(`R-F18: ${k}: step 5 reads only this product's rows`, [s5.specFrom, s5.spec], ['text', want[k]]);
+    const li = await leListing([], { bodyText: pages[k] });
+    const lspec = Object.fromEntries(Object.entries(li.specs).filter(([n]) => WANT.includes(n)));
+    eq(`R-F18: ${k}: listing.js gives the same rows`, lspec, want[k]);
+  }
+  // The DOM path takes "Type:" too.
+  eq('R-F18: a DOM title "Type:" is read', leStep5([leSpec('Type:', 'Wired')], RV.gyro).out.spec, { Type: 'Wired' });
+});
+
+console.log('\nR-F27: the step-5 docs say the spec class names were measured live on 2026-10-18');
+await block('R-F27', async () => {
+  ok('R-F27: SKILL.md no longer calls the class names recalled', !/recalled, not yet measured/.test(skillSrc));
+  ok('R-F27: SKILL.md says they were measured on a live page on 2026-10-18',
+    /were measured on a live page\s+on 2026-10-18 in signed-in Chrome: the `dom` path read the rows/.test(skillSrc));
+  ok('R-F27: SKILL.md still says the text layout is not measured', /The `text` line layout is not measured live yet\./.test(skillSrc));
+  const lj = SRC('listing.js');
+  ok('R-F27: listing.js no longer calls them recalled', !/recalled, NOT yet/.test(lj));
+  ok('R-F27: listing.js says they were measured live on 2026-10-18', /\(measured live\s+\*\s+on 2026-10-18 in signed-in Chrome/.test(lj));
+});
+
+console.log('\nR-F29: listing.js keeps a real description that starts with "[" (text and images)');
+await block('R-F29', async () => {
+  const r1 = await leListing([], { desc: { body: '[Size]: 22 x 12 x 28 cm' } });
+  eq('R-F29: "[Size]: 22 x 12 x 28 cm" is fetched and its size kept', [r1.description.source, r1.productSizeLines], ['fetched', ['[Size]: 22 x 12 x 28 cm']]);
+  ok('R-F29: and raises no description-fetch-failed warning', !r1.warnings.some((w) => /^description-fetch-failed/.test(w)), JSON.stringify(r1.warnings));
+  const imgs = Array.from({ length: 6 }, (_, i) => 'https://ae-pic-a1.aliexpress-media.com/kf/S' + i + 'desc' + 'q'.repeat(24) + '.jpg');
+  const r2 = await leListing([], { desc: { body: '[Note] Please check the size chart in the pictures before buying.', images: imgs } });
+  eq('R-F29: "[Note] ..." with 6 images keeps the text and the images', [r2.description.source, r2.descriptionImages.length], ['fetched', 6]);
+  const r3 = await leListing([], { desc: { body: '[Product size] 12 x 6 x 4 cm. Weight: 80 g' } });
+  eq('R-F29: "[Product size] 12 x 6 x 4 cm" is fetched', r3.description.source, 'fetched');
+  // What must not change: a JSON reply is not a description.
+  for (const body of ['{"success":false,"code":"TOKEN_EXPIRED"}', '[{"code":"x"}]', '{"code":"TOKEN_EXPI']) {
+    eq(`R-F29: the JSON reply ${body} is still fetch-failed`, (await leListing([], { desc: { body } })).description.source, 'fetch-failed');
+  }
+  eq('R-F29: an empty reply is still fetch-failed', (await leListing([], { desc: { body: '' } })).description.source, 'fetch-failed');
+});
+
+console.log('\nR-F04: decode.mjs: an old part with an unknown extra joins no other stream, at any merge depth');
+await block('R-F04', async () => {
+  const { mergePayloads } = await import('./decode.mjs');
+  const P = (q, ids, pages, verdict, extra = {}) => ({ query: q, source: 'harvest-paged', coverage: { verdict }, fourStar: true,
+    pages: pages.map(([page, n]) => ({ page, n })), items: ids.map((id) => ({ id, title: q + ' ' + id, rating: 4.8, sold: 500 })), ...extra });
+  // The finding's scenario: OLD payloads (extraApplied: true, no filterKey), as every September harvest.js wrote them.
+  const o1 = P('usb mouse', ['m1'], [[1, 1], [2, 0]], 'exhausted-all-results');
+  const o2 = P('wire brush set', ['a1', 'a2', 'a3'], [[1, 1], [2, 1], [3, 1]], 'truncated', { extraApplied: true });
+  const o3 = P('wire brush set', ['b4'], [[4, 0]], 'exhausted-from-start-page', { extraApplied: true });
+  const o4 = P('wire brush set', ['c5'], [[5, 0]], 'exhausted-from-start-page', { extraApplied: true });
+  const view = (m) => m.coverage.byQuery.map((s) => [s.stream, s.pagesRead.join(','), s.verdict]);
+  const disk = (m) => JSON.parse(JSON.stringify(m)); // a merged file as it is saved and read back
+  const one = mergePayloads([o1, o2, o3]);
+  const m12 = disk(mergePayloads([o1, o2]));
+  const again = mergePayloads([m12, o3]);
+  eq('R-F04: one merge of the three old payloads is truncated', one.coverage.verdict, 'truncated');
+  eq('R-F04: a merged file merged again with the third is truncated, not exhausted-all-results', again.coverage.verdict, 'truncated');
+  eq('R-F04: and it has the same streams, pages and verdicts as one merge', view(again), view(one));
+  const deep = mergePayloads([disk(again), o4]);
+  eq('R-F04: three levels deep, still the same streams as one merge of all four', view(deep), view(mergePayloads([o1, o2, o3, o4])));
+  ok('R-F04: no part key is a position in the call (unknown-extra-<n>)', ![...one.parts, ...deep.parts].some((x) => /^unknown-extra-\d+$/.test(x.filterKey)),
+    JSON.stringify(deep.parts.map((x) => x.filterKey)));
+  const keyOfO2 = (m) => m.parts.find((x) => x.cardCount === 3).filterKey;
+  eq('R-F04: an old part has one key wherever it sits in the call', keyOfO2(mergePayloads([o2, o1])), keyOfO2(mergePayloads([o1, o2])));
+  // A merged file written by the decode.mjs before this fix keyed old parts by position.
+  const legacy = (m) => ({ ...m, parts: m.parts.map((x) => (/^unknown-extra-/.test(x.filterKey) ? { ...x, filterKey: 'unknown-extra-0' } : x)) });
+  const L1 = legacy(disk(mergePayloads([o2, o1])));
+  const L2 = legacy(disk(mergePayloads([o3, P('usb mouse', ['m2'], [[1, 1], [2, 0]], 'exhausted-all-results')])));
+  eq('R-F04: two old-format merged files that both say "unknown-extra-0" do not join', mergePayloads([L1, L2]).coverage.verdict, 'truncated');
+  // The documented path: the decode.mjs CLI on saved files.
+  const dir = tmp('ae-f04-');
+  [o1, o2, o3].forEach((p, i) => fsx.writeFileSync(join(dir, 'o' + (i + 1) + '.json'), JSON.stringify(p)));
+  const DECODE = join(HERE, 'decode.mjs');
+  const merged = execFileSync('node', [DECODE, join(dir, 'o1.json'), join(dir, 'o2.json')], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+  fsx.writeFileSync(join(dir, 'm12.json'), merged);
+  const check = JSON.parse(execFileSync('node', [DECODE, '--check', join(dir, 'm12.json'), join(dir, 'o3.json')], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }));
+  eq('R-F04: decode.mjs --check on a merged file plus the third file says truncated', check.coverage.verdict, 'truncated');
+  // What must not change.
+  eq('R-F04: re-adding a part the merged file already holds changes no stream', view(mergePayloads([m12, o2])), view(m12));
+  eq('R-F04: the merged file second in the call gives the same streams', view(mergePayloads([o3, m12])).sort(), view(one).sort());
+  eq('R-F04: two different old payloads in one call are still two streams', mergePayloads([o2, o3]).coverage.byQuery.length, 2);
+  ok('R-F04: SKILL.md says such a part joins no other part, in a re-merge too',
+    /Its key comes from its content, so it joins no\s+other part, in a merge or in a merge of merged files/.test(skillSrc));
+});
+
+console.log('\nR-F08: receiver.mjs: a flag with no value or a stray word exits 2, and nothing starts');
+await block('R-F08', async () => {
+  const { spawn } = await import('node:child_process');
+  const run = (args, cwd) => new Promise((res) => {
+    const cp = spawn('node', [join(HERE, 'receiver.mjs'), ...args], { cwd });
+    let out = '';
+    let err = '';
+    cp.stdout.on('data', (d) => { out += d; });
+    cp.stderr.on('data', (d) => { err += d; });
+    // The old code waited for --idle (or 3600 s): stop it, it counts as a failure.
+    const t = setTimeout(() => cp.kill(), 4000);
+    cp.on('exit', (code) => { clearTimeout(t); res({ code, out, err, say: `exit ${code} ${err.trim()} ${out.trim()}` }); });
+  });
+  const cwd = tmp('ae-rx-f08-');
+  const port = async () => String(await freePort());
+  // `--dir $OUT --port N` with OUT unset: the shell drops the empty word.
+  const r1 = await run(['--dir', '--port', await port(), '--idle', '1'], cwd);
+  ok('R-F08: --dir followed by --port exits 2 and names the missing value', r1.code === 2 && /--dir needs a value/.test(r1.err), r1.say);
+  ok('R-F08: and no directory named "--port" is made', !fsx.existsSync(join(cwd, '--port')));
+  const r2 = await run([join(cwd, 'r_pos'), '--port', await port(), '--idle', '1'], cwd);
+  ok('R-F08: a stray positional directory exits 2 and is named', r2.code === 2 && /stray argument/.test(r2.err) && r2.err.includes('r_pos'), r2.say);
+  ok('R-F08: and the receiver never listened in the cwd', !/listening/.test(r2.out), r2.say);
+  const r3 = await run(['--dir', '', '--port', await port(), '--idle', '1'], cwd);
+  ok('R-F08: an empty --dir (a quoted unset variable) exits 2', r3.code === 2 && /--dir is empty/.test(r3.err), r3.say);
+  const r4 = await run(['--dir=', '--port', await port(), '--idle', '1'], cwd);
+  ok('R-F08: --dir= with nothing after it exits 2', r4.code === 2 && /--dir is empty/.test(r4.err), r4.say);
+  const r5 = await run(['--dir', join(cwd, 'd5'), '--port', await port(), '--idle'], cwd);
+  ok('R-F08: a last flag with no value exits 2 (it used to take the default)', r5.code === 2 && /--idle needs a value/.test(r5.err), r5.say);
+  // What must not change.
+  const r6 = await run(['--dir=' + join(cwd, 'd6'), '--port=' + await port(), '--idle=1'], cwd);
+  ok('R-F08: --name=value still starts and exits 0 after --idle', r6.code === 0 && /listening http:\/\/127\.0\.0\.1:\d+ dir .*d6 /.test(r6.out), r6.say);
+  const r7 = await run(['--dir', join(cwd, 'd7'), '--port', await port(), '--idle', '1'], cwd);
+  ok('R-F08: --name value still starts and exits 0 after --idle', r7.code === 0 && /dir .*d7 /.test(r7.out) && fsx.existsSync(join(cwd, 'd7')), r7.say);
+  const r8 = await run(['--dir', join(cwd, 'd8'), '--idel', '5'], cwd);
+  ok('R-F08: an unknown flag still exits 2 and is named', r8.code === 2 && /unknown flag --idel/.test(r8.err), r8.say);
+  ok('R-F08: SKILL.md says a flag with no value or a stray word exits 2',
+    /A flag with no value,\s+an empty `--dir`, an unknown flag or a stray word exits 2/.test(skillSrc));
+  // Last: the old receiver.mjs has no parseArgs, so these throw there.
+  const { parseArgs } = await import('./receiver.mjs');
+  eq('R-F08: parseArgs reads both flag forms', parseArgs(['--dir', '/a', '--port=1']), { opts: { dir: '/a', port: '1' }, error: null });
+  eq('R-F08: a value that starts with "--" is taken only after "="', [parseArgs(['--dir=--x']).opts.dir, /needs a value/.test(parseArgs(['--dir', '--x']).error)], ['--x', true]);
+  eq('R-F08: the first of a repeated flag counts, as before', parseArgs(['--port', '1', '--port', '2']).opts.port, '1');
+});
+
+// ============================================================================
+// 2026-10-19, recheck (docs): three skeptics each confirmed these on the code
+// and the docs of 2026-10-18. Each block fails on that copy.
+// ============================================================================
+/* A harvest of 4 items in a fake tab whose loopback fetch is refused, as
+ * both browsers refused it on 2026-10-18. `lb.n` counts loopback fetches,
+ * `forms` the forms posted (each one is a navigation). */
+const docsTab = async ({ hidden = false, storage = true } = {}) => {
+  const forms = [];
+  const lb = { n: 0 };
+  const win = { document: formDoc(forms, { doc: { visibilityState: hidden ? 'hidden' : 'visible' } }) };
+  if (storage) win.localStorage = fakeStorage();
+  const H = await harvestWith(win, async (url) => {
+    if (url.startsWith('http://127.0.0.1:')) { lb.n++; throw new TypeError('Failed to fetch'); }
+    return reply(makePage({ items: [makeItem('d1'), makeItem('d2'), makeItem('d3'), makeItem('d4')] }));
+  });
+  return { H, forms, lb };
+};
+/* What a submitted text/plain form sends: "<name>=<value>". */
+const formBody = (f) => (f.children || []).map((c) => c.name + '=' + c.value).join('\r\n') + '\r\n';
+
+console.log('\nR-F01: the replies under send(8765, {via: \'form\'}) are the form-path replies');
+await block('R-F01', async () => {
+  const fence = (skillSrc.match(/```js\nawait __aeHarvest\.send\(8765, \{via: 'form'\}\)[^\n]*\n([\s\S]*?)```/) || [])[1] || '';
+  ok('R-F01: SKILL.md lists replies under the via:form call', fence.length > 0);
+  ok('R-F01: the list shows no fetch-path reply (DELIVERED: sent, FETCH-ERROR, did NOT navigate, fetch held)',
+    fence.length > 0 && !/DELIVERED: sent|FETCH-ERROR|did NOT navigate|fetch held/.test(fence), fence);
+  // The real replies of send(port, {via: 'form'}), visible and hidden.
+  const v = await docsTab();
+  const mv = await v.H.send(8765, { via: 'form' });
+  ok('R-F01: real code, visible tab: UNCONFIRMED: form-posted ...; backup saved (n items)',
+    /^UNCONFIRMED: form-posted \d+ chars to http:\/\/127\.0\.0\.1:8765\/harvest; backup saved \(4 items\) - delivered only if the receiver prints "saved <path>" in its own output: read it there/.test(mv), mv);
+  ok('R-F01: the documented visible-tab reply has that shape',
+    /visible tab: "UNCONFIRMED: form-posted \d+ chars to http:\/\/127\.0\.0\.1:8765\/harvest; backup saved \(\d+ items\)\s*\n\/\/\s+- delivered only if the receiver prints "saved <path>" in its own output: read it there/.test(fence), fence);
+  const h = await docsTab({ hidden: true });
+  const mh = await h.H.send(8765, { via: 'form' });
+  ok('R-F01: real code, hidden tab: (tab hidden: fetch skipped); backup saved', /^UNCONFIRMED: form-posted \d+ chars to \S+ \(tab hidden: fetch skipped\); backup saved \(4 items\)/.test(mh), mh);
+  ok('R-F01: the documented hidden-tab reply has that shape', /hidden tab:\s+"UNCONFIRMED: form-posted … \(tab hidden: fetch skipped\); backup saved \(\d+ items\)/.test(fence), fence);
+  const n = await docsTab({ storage: false });
+  const mn = await n.H.send(8765, { via: 'form' });
+  ok('R-F01: real code, no backup: NOT DELIVERED: no form posted', /^NOT DELIVERED: no form posted, because the localStorage backup failed/.test(mn) && n.forms.length === 0, mn);
+  ok('R-F01: the documented no-backup reply has that shape', /no backup:\s+"NOT DELIVERED: no form posted, because the localStorage backup failed/.test(fence), fence);
+  // The receiver's own output is where "saved <path>" shows: post the real form body to a real receiver.
+  const dir = tmp('ae-f01-');
+  const logs = [];
+  const rx = await startRx({ dir, port: 0, log: (m) => logs.push(m) });
+  try {
+    const res = await fetch('http://127.0.0.1:' + rx.port + '/harvest', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: formBody(v.forms[0]) });
+    eq('R-F01: the posted form body is saved by the receiver', res.status, 200);
+  } finally { await rx.close(); }
+  ok('R-F01: the receiver prints "saved <dir>/harvest-<query>-<stamp>.json"', logs.some((l) => /^saved .*\/harvest-wire-brush-set-[^/]+\.json$/.test(l)), JSON.stringify(logs));
+  ok('R-F01: the list shows that receiver line', /"saved <dir>\/harvest-<query>-<stamp>\.json"/.test(fence), fence);
+  ok('R-F01: SKILL.md gives the fetch-path replies only for a plain send(8765)',
+    /\*\*A plain `send\(8765\)`\*\* \(no `via`\) tries a `fetch\(\)` POST first/.test(skillSrc));
+  const rxText = SRC('receiver.mjs');
+  ok('R-F01: the receiver.mjs header says the receiver prints saved <path>, not that the tool result names the file',
+    /the receiver prints `saved <path>` in its own output/.test(rxText) && !/so the tool result names the file/.test(rxText));
+});
+
+console.log('\nR-F05: the hidden-tab recovery says a via:\'form\' send to a dead port navigates in a visible tab too');
+await block('R-F05', async () => {
+  const at = skillSrc.indexOf('### A hidden tab');
+  const rec = skillSrc.slice(at, skillSrc.indexOf('What to do:', at));
+  ok('R-F05: SKILL.md no longer says a visible-tab send() to a dead port does not navigate',
+    !/In a visible tab a `send\(\)` to a dead port returns `NOT DELIVERED`\s+and does not navigate/.test(skillSrc));
+  ok('R-F05: step 1 says the check is needed in a visible tab as well', /Do not skip this check in a hidden\s+tab, or in a visible one\./.test(rec), rec.slice(0, 200));
+  ok('R-F05: step 1 says via:form always posts the form, visible or hidden',
+    /`send\(<port>, \{via: 'form'\}\)` never tries a\s+fetch\. It always posts the form/.test(rec) && /navigates to an error page, visible or\s+hidden/.test(rec));
+  ok('R-F05: step 1 names the curl check as the only dead-port guard', /The curl check is the only guard against a dead port\./.test(rec));
+  // What the doc must match, on the real code: a visible tab, a dead port.
+  const p = await docsTab();
+  const plain = await p.H.send(8765);
+  ok('R-F05: real code: a plain send() to a dead port stays on the page', /^NOT DELIVERED: FETCH-ERROR/.test(plain) && p.forms.length === 0, plain);
+  const before = p.lb.n;
+  const viaForm = await p.H.send(8765, { via: 'form' });
+  ok('R-F05: real code: send(port, {via: \'form\'}) to a dead port in a VISIBLE tab posts the form (navigates)',
+    /^UNCONFIRMED: form-posted/.test(viaForm) && p.forms.length === 1, viaForm);
+  eq('R-F05: real code: and it never tried the fetch', p.lb.n, before);
+  ok('R-F05: the harvest.js send() comment says via:form navigates even to a dead port',
+    /It always posts the form, so it navigates even to a dead port,\s+\*\s+visible tab or hidden/.test(harvestText));
+});
+
+console.log('\nR-F06: restore() of a stopped harvest says resume() comes first, and SKILL.md step 4 says it');
+await block('R-F06', async () => {
+  const ls = fakeStorage();
+  const fetched = [];
+  let wallOn = true;
+  const f = async (url) => {
+    const p = Number(new URL(url).searchParams.get('page'));
+    fetched.push(p);
+    if (p === 3 && wallOn) return reply('<html>Please slide to verify</html>', 'https://he.aliexpress.com/w/x.html/_____tmd_____/punish?x5secdata=abc');
+    return reply(makePage({ items: p <= 4 ? [makeItem('w' + p + 'a'), makeItem('w' + p + 'b')] : [], page: p }));
+  };
+  const w1 = { localStorage: ls };
+  new Function('window', 'fetch', harvestSrc)(w1, f);
+  w1.__aeHarvest.start({ query: 'wire brush set' });
+  const s1 = await w1.__aeHarvest.step(6);
+  eq('R-F06: the first tab stops at the wall on page 3', [s1.stop, s1.pagesRead], ['blocked', 2]);
+  const w2 = { localStorage: ls };
+  new Function('window', 'fetch', harvestSrc)(w2, f);
+  const r = w2.__aeHarvest.restore();
+  eq('R-F06: restore() brings the stop back with the items', [r.restored, r.stop, r.unique], [true, 'blocked', 4]);
+  ok('R-F06: its note says step() reads nothing until resume(), and that it is a wall',
+    /step\(\) reads nothing until resume\(\)/.test(r.note || '') && /wall/.test(r.note || ''), JSON.stringify(r.note));
+  ok('R-F06: the restore() reply fits the Chrome cap and has no "?"', JSON.stringify(r).length < 1000 && !JSON.stringify(r).includes('?'), String(JSON.stringify(r).length));
+  fetched.length = 0;
+  const s2 = await w2.__aeHarvest.step(6);
+  eq('R-F06: step() right after restore() reads nothing (what step 4 hid)', [fetched.length, s2.stop, s2.pagesRead], [0, 'blocked', 2]);
+  wallOn = false;
+  w2.__aeHarvest.resume();
+  const s3 = await w2.__aeHarvest.step(6);
+  eq('R-F06: after resume(), step() reads on from page 3 to the empty page', [fetched, s3.stop, s3.pagesRead], [[3, 4, 5], 'exhausted', 5]);
+  // The other stops: the note names the call that lifts each one.
+  const restoredNote = async (startOpts, n, pages) => {
+    const l2 = fakeStorage();
+    const g = async (url) => { const p = Number(new URL(url).searchParams.get('page')); return reply(makePage({ items: (pages[p] || []).map((id) => makeItem(id)), page: p })); };
+    const a = { localStorage: l2 };
+    new Function('window', 'fetch', harvestSrc)(a, g);
+    a.__aeHarvest.start(Object.assign({ query: 'wire brush set' }, startOpts));
+    await a.__aeHarvest.step(n);
+    const b = { localStorage: l2 };
+    new Function('window', 'fetch', harvestSrc)(b, g);
+    return b.__aeHarvest.restore();
+  };
+  const pages = { 1: ['n1'], 2: ['n2'], 3: ['n3'] };
+  const rb = await restoredNote({ maxRequests: 1 }, 6, pages);
+  ok('R-F06: a request-budget stop: the note names resume({ maxRequests })', rb.stop === 'request-budget' && /resume\(\{ maxRequests \}\)/.test(rb.note || ''), JSON.stringify([rb.stop, rb.note]));
+  const rc = await restoredNote({ maxPages: 1 }, 6, pages);
+  ok('R-F06: a page-cap stop below page 60: the note names resume({ maxPages })', rc.stop === 'page-cap' && /resume\(\{ maxPages \}\)/.test(rc.note || ''), JSON.stringify([rc.stop, rc.note]));
+  const re = await restoredNote({}, 6, pages);
+  ok('R-F06: an exhausted stop: the note says nothing is left to read', re.stop === 'exhausted' && /nothing is left to read/.test(re.note || ''), JSON.stringify([re.stop, re.note]));
+  const rn = await restoredNote({}, 1, pages);
+  eq('R-F06: no stop, no note (what must not change)', [rn.stop, 'note' in rn], [null, false]);
+  ok('R-F06: SKILL.md step 4 says to call resume() before step() when the reply shows a stop',
+    /\*\*If the reply\s+shows a `stop`, call `__aeHarvest\.resume\(\)` before `step\(\)`\.\*\*/.test(skillSrc));
+  ok('R-F06: and that a wall stop goes to Step 2 first', /`suspect-wall` stop is a wall: go to Step 2 \(the wall\) before you\s+resume\./.test(skillSrc));
+});
+
+console.log('\nR-F19: no SKILL.md text tells the operator to doubt a specFrom: \'dom\' row');
+await block('R-F19', async () => {
+  ok('R-F19: SKILL.md never calls the spec class names recalled or not measured',
+    !/recalled/i.test(skillSrc) && !/class names[^.]{0,60}not (yet )?measured/i.test(skillSrc));
+  ok('R-F19: the spec bullet names the three measured classes and says to trust a dom row',
+    /\(`specification--prop`, `--title`, `--desc`\) were measured on a live page/.test(skillSrc) && /Trust a\s+`dom` row\./.test(skillSrc));
+  ok('R-F19: the step-5 reader reads exactly those three classes',
+    /specification--prop/.test(step5) && /\[class\*="specification--title"\]/.test(step5) && /\[class\*="specification--desc"\]/.test(step5));
+});
+
+console.log('\nR-F30: the listing.js readSpecs comment says the class names were measured live');
+await block('R-F30', async () => {
+  const lj = SRC('listing.js');
+  const doc = (lj.match(/\/\* The Specifications table\.[\s\S]*?\*\//) || [''])[0];
+  ok('R-F30: the readSpecs comment is there', doc.length > 0);
+  ok('R-F30: it no longer says the class names are recalled', doc.length > 0 && !/recalled/i.test(doc), doc);
+  ok('R-F30: it says the dom classes were measured live on 2026-10-18',
+    /specification--desc inside specification--prop \(measured live\s+\*\s+on 2026-10-18 in signed-in Chrome/.test(doc), doc);
+  const fn = (lj.match(/function readSpecs\(\) \{[\s\S]*?\n  \}/) || [''])[0];
+  ok('R-F30: readSpecs() reads those classes', /specification--prop/.test(fn) && /specification--title/.test(fn) && /specification--desc/.test(fn));
+});
+
+console.log('\nR-F23: extract.js and the refine-filter snippet can be read under the 1,000-character cut');
+await block('R-F23', async () => {
+  // The step-1 refine-filter snippet, run from SKILL.md on a big filter list.
+  const refine = (skillSrc.match(/<!-- @snippet:refine:start -->\s*```js\n([\s\S]*?)\n```\s*<!-- @snippet:refine:end -->/) || [])[1];
+  ok('R-F23: SKILL.md carries the refine-filter snippet between its markers', !!refine);
+  if (refine) {
+    const groups = Array.from({ length: 30 }, (_, g) => ({ title: 'Attribute group number ' + g, paramName: 'attr', attributeId: 1000 + g,
+      content: Array.from({ length: 40 }, (_, o) => ({ text: 'Option value ' + o + ' of group ' + g, selectedValue: (1000 + g) + '-' + (5000 + o) })) }));
+    const rw = { _dida_config_: { _init_data_: { data: { data: { root: { fields: { mods: { searchRefineFilters: { content: groups } } } } } } } } };
+    const line = new Function('window', 'return (' + refine + '\n)')(rw);
+    ok('R-F23: the refine snippet result fits the Chrome cap and has no "?"', typeof line === 'string' && line.length < 1000 && !line.includes('?'), String(line && line.length));
+    ok('R-F23: it says when it cut the group list', /cut: 30 groups$/.test(line), line.slice(-60));
+    ok('R-F23: the whole list stays on window.__aeRefine', Array.isArray(rw.__aeRefine) && rw.__aeRefine.length === 30 && rw.__aeRefine.every((x) => x.opts.length === 40));
+    const piece = JSON.stringify(rw.__aeRefine[3].opts.slice(0, 15));
+    ok('R-F23: the documented one-group piece fits the cap', /`JSON\.stringify\(__aeRefine\[3\]\.opts\.slice\(0, 15\)\)`/.test(skillSrc) && piece.length < 1000, String(piece.length));
+    const few = { _dida_config_: { _init_data_: { data: { data: { root: { fields: { mods: { searchRefineFilters: { content: groups.slice(0, 3) } } } } } } } } };
+    eq('R-F23: a short list comes back whole, one line per group', new Function('window', 'return (' + refine + '\n)')(few),
+      '0 Attribute group number 0 attr (40) | 1 Attribute group number 1 attr (40) | 2 Attribute group number 2 attr (40)');
+  }
+  const fb = skillSrc.slice(skillSrc.indexOf('### Single-page fallback'), skillSrc.indexOf('### Getting a large payload'));
+  ok('R-F23: SKILL.md says Chrome cuts the return value and names __aeExtract',
+    /\*\*The Chrome\s+connector cuts it at 1,000 characters\*\*, so the result also stays on\s+`window\.__aeExtract`/.test(fb));
+  const exSrc = RUN('extract.js');
+  const items = Array.from({ length: 60 }, (_, i) => makeItem('1005009' + String(i).padStart(6, '0'),
+    { title: 'Wired USB Mouse Optical Ergonomic Office Gaming Mouse 1600 DPI model ' + i, soldRaw: '1,000+' }));
+  const forms = [];
+  const win = { _dida_config_: { _init_data_: { data: { data: { root: { fields: { mods: { itemList: { content: items } } } } } } } } };
+  const doc = Object.assign(formDoc(forms), { querySelectorAll: () => [], title: 't', documentElement: { outerHTML: '<html>grid</html>' } });
+  doc.body = { innerText: 'grid page', appendChild() {} };
+  const loc = { href: 'https://he.aliexpress.com/w/wholesale-wired-usb-mouse.html?page=1', origin: 'https://he.aliexpress.com',
+    pathname: '/w/wholesale-wired-usb-mouse.html', search: '?page=1' };
+  const raw = new Function('window', 'document', 'location', 'return (' + exSrc + '\n)')(win, doc, loc);
+  ok('R-F23: the return value of 60 items is far over the cut (the finding)', raw.length > 10000, String(raw.length));
+  const X = win.__aeExtract;
+  ok('R-F23: the whole result stays on window.__aeExtract', !!X && !!X.result && X.result.items.length === 60, X ? '' : 'no __aeExtract');
+  if (!X || !X.result) return;
+  eq('R-F23: and it is the result the return value holds', JSON.stringify(X.result), raw);
+  const js = (fb.match(/```js\n([\s\S]*?)```/) || [])[1] || '';
+  const calls = js.split(/\n(?=\S)/).map((c) => c.trim().replace(/\s*\/\/[^\n]*$/, '').trim()).filter(Boolean);
+  ok('R-F23: SKILL.md gives the Chrome pieces: a summary, two items, and send()', calls.length === 3 && /^__aeExtract\.send\(8765\)$/.test(calls[2]), JSON.stringify(calls));
+  for (const c of calls.slice(0, 2)) {
+    const out = new Function('__aeExtract', 'return (' + c + ')')(X);
+    const s = typeof out === 'string' ? out : JSON.stringify(out);
+    ok(`R-F23: "${c.slice(0, 40)}…" fits the Chrome cap and has no "?"`, s.length < 1000 && !s.includes('?'), String(s.length));
+  }
+  // send(): one form to the receiver; the receiver saves it; rank.mjs takes the saved file.
+  const port = await freePort();
+  const msg = X.send(port);
+  ok('R-F23: __aeExtract.send(port) posts one text/plain form to the receiver',
+    forms.length === 1 && forms[0].method === 'POST' && forms[0].enctype === 'text/plain' && forms[0].action === 'http://127.0.0.1:' + port + '/harvest');
+  ok('R-F23: its reply is UNCONFIRMED, fits the cap and has no "?"', /^UNCONFIRMED: form-posted \d+ chars \(60 items\)/.test(msg) && msg.length < 1000 && !msg.includes('?'), msg);
+  const dir = tmp('ae-f23-');
+  const logs = [];
+  const rx = await startRx({ dir, port, log: (m) => logs.push(m) });
+  try {
+    const res = await fetch('http://127.0.0.1:' + port + '/harvest', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: formBody(forms[0]) });
+    eq('R-F23: the receiver saves the posted extract result', res.status, 200);
+  } finally { await rx.close(); }
+  const savedPath = ((logs.find((l) => /^saved /.test(l)) || '').match(/^saved (.+)$/) || [])[1];
+  ok('R-F23: the receiver prints saved <path>', !!savedPath, JSON.stringify(logs));
+  if (savedPath) {
+    const saved = JSON.parse(fsx.readFileSync(savedPath, 'utf8'));
+    eq('R-F23: the saved file holds all 60 items', saved.items.length, 60);
+    const rk = rank(saved, ['--mode', 'shortlist', '--top', '5']);
+    eq('R-F23: rank.mjs takes the saved file as it is', rk.ranked.length, 5);
+  }
+});
+
+console.log('\nR-F26: the ownRating example matches the review block it cites');
+await block('R-F26', async () => {
+  ok('R-F26: SKILL.md no longer claims a measured "own 4.1 from 1,090 ratings"', !/own 4\.1 from 1,090/.test(skillSrc));
+  const bullet = (skillSrc.match(/- \*\*`ownRating` is the listing's own rating\*\*[\s\S]*?(?=\n- \*\*)/) || [''])[0];
+  const blk = parseReviewBlock(RV.gyro);
+  ok('R-F26: the bullet cites "4.9 1090 ratings", and the shared parser reads 4.9 from 1,090 there',
+    /"4\.9 1090 ratings"/.test(bullet) && blk.ownRating === 4.9 && blk.own === 1090, bullet);
+  ok('R-F26: the bullet calls the 4.1 pair a made-up test case', /made-up one\s+\(pooled 4\.9, own 4\.1\)/.test(bullet), bullet);
+  const rk = SRC('rank.mjs');
+  ok('R-F26: rank.mjs no longer presents 4.1 from 1,090 as a measured listing',
+    !/a listing rated 4\.1 by its own 1,090\s+\* buyers was ranked/.test(rk) && /that pair is a test\s+\* case, not a measured page/.test(rk));
+});
+
+console.log('\nR-F28: every command in a SKILL.md bash block runs the skill scripts by their absolute path');
+await block('R-F28', async () => {
+  const lines = [...skillSrc.matchAll(/```bash\n([\s\S]*?)```/g)].flatMap((m) => m[1].split('\n'));
+  const rel = lines.filter((l) => /(labels\.sh|\.mjs)\b/.test(l) &&
+    !/~\/\.claude\/skills\/aliexpress-finder\/scripts\/(labels\.sh|[a-z]+\.mjs)\b/.test(l));
+  eq('R-F28: no bash line runs a skill script by a relative path', rel, []);
+  ok('R-F28: labels.sh fetch and crop use the absolute path',
+    /^~\/\.claude\/skills\/aliexpress-finder\/scripts\/labels\.sh fetch /m.test(skillSrc) &&
+    /^~\/\.claude\/skills\/aliexpress-finder\/scripts\/labels\.sh crop /m.test(skillSrc));
+  ok('R-F28: no SKILL.md line starts with the relative scripts/labels.sh', !/^scripts\/labels\.sh /m.test(skillSrc));
+  ok('R-F28: the path names the labels.sh beside this test', fsx.existsSync(join(HERE, 'labels.sh')));
+});
+
+console.log('\nR-F21: step 3, the Files table and the README say send(8765, {via: \'form\'}) navigates, to a dead port too');
+await block('R-F21', async () => {
+  const s3 = skillSrc.slice(skillSrc.indexOf('### Getting a large payload out of the browser'), skillSrc.indexOf('**Fallbacks**'));
+  ok('R-F21: step 3 no longer calls the export it recommends safe from navigation', !/It is safe \(the page does not\s+navigate\)/.test(s3));
+  ok('R-F21: step 3 says {via: \'form\'} never tries the fetch', /`\{via: 'form'\}` never tries the fetch\./.test(s3));
+  ok('R-F21: step 3 says a form POST always navigates, to a dead port too', /\*\*A\s+form\s+POST always navigates, to a dead port too\.\*\*/.test(s3));
+  ok('R-F21: step 3 names the curl check as the guard and restore() as the way back',
+    /the\s+curl check before `send\(\)` is the guard against a dead port, and\s+`restore\(\)` is the way back/.test(s3));
+  ok('R-F21: the Files table says send(port, {via: \'form\'}) navigates even to a dead port',
+    /`send\(port, \{via: 'form'\}\)` always posts the form, so it navigates even to a dead port: curl the receiver first/.test(skillSrc));
+  ok('R-F21: the README says it too',
+    /`send\(port, \{via: 'form'\}\)`, the export to use, always posts the form, so it navigates even to a dead port/.test(SRC('../README.md')));
+  // Every "does not / never navigates" claim names which send() it is about.
+  for (const [name, text] of [['SKILL.md', skillSrc], ['README.md', SRC('../README.md')]]) {
+    const bad = text.split(/\n\s*\n/).filter((p) => /(does not|did NOT|never) navigates?\b/i.test(p) && !/plain `send\(|\{via: 'form'\}|FETCH-ERROR/.test(p));
+    eq(`R-F21: every no-navigation claim in ${name} names the send() it is about`, bad.map((p) => p.slice(0, 80)), []);
+  }
+  // The code the doc describes: the same visible tab, the same dead port, both calls.
+  const t = await docsTab();
+  const a = await t.H.send(8765);
+  const b = await t.H.send(8765, { via: 'form' });
+  eq('R-F21: real code: plain send() stays, {via: \'form\'} navigates', [/^NOT DELIVERED/.test(a), /^UNCONFIRMED: form-posted/.test(b), t.forms.length], [true, true, 1]);
+});
+
+/* The documented safety and score constants (recheck, 2026-10-19). Each one
+ * could change in the code, or in the docs, with the suite green: a request
+ * budget of 40 went past nothing. The budget of 24 keeps one harvest and
+ * its detail pages under the wall, which tripped near 50-60 requests. A
+ * deliberate change edits this pin, the code and the docs together. */
+console.log('\nR-F24: the request budget, the page cap and the flag thresholds are pinned');
+await block('R-F24', async () => {
+  const PIN = { maxPages: 20, maxRequests: 24, fewShare: 0.02, fewMinSold: 1000, soldSaturated: 10000, brandImplausible: 0.2 };
+  const endless = async (url) => {
+    const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: [makeItem('pin' + p)], page: p }));
+  };
+  // harvest.js: the plan reports the defaults, and the run uses them.
+  const H = loadHarvest(endless);
+  const plan = H.start({ query: 'wire brush set' });
+  eq('R-F24: start() defaults are maxPages 20 and maxRequests 24', [plan.maxPages, plan.maxRequests], [PIN.maxPages, PIN.maxRequests]);
+  const s1 = await H.step(100);
+  eq('R-F24: with no options a run reads pages 1-20 and stops as page-cap', [s1.stop, s1.pagesRead, s1.requests], ['page-cap', PIN.maxPages, PIN.maxPages]);
+  const Hb = loadHarvest(endless);
+  Hb.start({ query: 'wire brush set', maxPages: 60 });
+  const s2 = await Hb.step(100);
+  eq('R-F24: the default budget stops a run after 24 requests', [s2.stop, s2.requests, s2.pagesRead], ['request-budget', PIN.maxRequests, PIN.maxRequests]);
+  const Hc = loadHarvest(endless);
+  Hc.start({ query: 'wire brush set', maxRequests: 60 });
+  const s3 = await Hc.step(100);
+  eq('R-F24: the default page cap stops a run at page 20', [s3.stop, s3.pagesRead], ['page-cap', PIN.maxPages]);
+  // The docs state the same numbers.
+  const numIn = (re, text) => { const m = text.match(re); return m ? Number(m[1].replace(/,/g, '')) : null; };
+  const readme = SRC('../README.md');
+  eq('R-F24: SKILL.md states the harvest defaults', [numIn(/Defaults are `maxPages: (\d+)`/, skillSrc),
+    numIn(/`maxRequests: (\d+)`,\s+`startPage: 1`/, skillSrc)], [PIN.maxPages, PIN.maxRequests]);
+  eq('R-F24: SKILL.md step 4 counts the recovery budget from 24', numIn(/maxRequests: <(\d+) minus the requests spent>/, skillSrc), PIN.maxRequests);
+  eq('R-F24: the harvest.js usage header states the defaults', [numIn(/maxPages\s+default (\d+)/, harvestText),
+    numIn(/maxRequests default (\d+)/, harvestText)], [PIN.maxPages, PIN.maxRequests]);
+  eq('R-F24: README.md states the budget default', numIn(/\(`maxRequests`, default (\d+)\)/, readme), PIN.maxRequests);
+  // rank.mjs: each flag fires on one side of its threshold and not on the other.
+  const flagsOf = (items, mode) => {
+    const r = rank(items, ['--mode', mode, '--top', '20', '--min-evidence', '1']);
+    return (id) => (r.ranked.find((x) => x.id === id) || { flags: ['not-ranked'] }).flags;
+  };
+  const FEW = 'few-reviews-for-sales';
+  const few = flagsOf([
+    { id: 'under', title: 'pin under', rating: 4.8, reviews: 99, sold: 5000 },  // 1.98%
+    { id: 'at', title: 'pin at', rating: 4.8, reviews: 100, sold: 5000 },       // 2.00%
+    { id: 'floor', title: 'pin floor', rating: 4.8, reviews: 19, sold: 1000 },  // 1.9% at the floor
+    { id: 'below', title: 'pin below', rating: 4.8, reviews: 15, sold: 999 },   // 1.5% under the floor
+  ], 'final');
+  eq('R-F24: few-reviews-for-sales fires under 2% of sold, not at 2%', [few('under').includes(FEW), few('at').includes(FEW)], [true, false]);
+  eq('R-F24: few-reviews-for-sales needs a sold of 1,000 or more', [few('floor').includes(FEW), few('below').includes(FEW)], [true, false]);
+  const sat = flagsOf([
+    { id: 'top', title: 'pin top', rating: 4.8, sold: 10000, soldBucketed: true },
+    { id: 'under', title: 'pin under', rating: 4.8, sold: 9999, soldBucketed: true },
+    { id: 'raw', title: 'pin raw', rating: 4.8, soldRaw: '10,000+' },
+    { id: 'exact', title: 'pin exact', rating: 4.8, sold: 12000, soldBucketed: false },
+  ], 'shortlist');
+  eq('R-F24: sold-saturated fires on a bucketed sold of 10,000 and up only', ['top', 'under', 'raw', 'exact'].map((id) => sat(id).includes('sold-saturated')),
+    [true, false, true, false]);
+  const br = flagsOf([
+    { id: 'low', title: 'pin low', rating: 4.8, reviews: 500, sold: 5000, brandScore: 0.19 },
+    { id: 'at', title: 'pin at', rating: 4.8, reviews: 500, sold: 5000, brandScore: 0.2 },
+  ], 'final');
+  eq('R-F24: brand-implausible fires under a brandScore of 0.2, not at 0.2', [br('low').includes('brand-implausible'), br('at').includes('brand-implausible')], [true, false]);
+  // The docs state the same thresholds.
+  eq('R-F24: SKILL.md step 5 says few-reviews-for-sales fires below 2%', numIn(/flags\s+`few-reviews-for-sales`\s+below\s+(\d+)%/, skillSrc), PIN.fewShare * 100);
+  eq('R-F24: the SKILL.md flags list names the few-reviews-for-sales rule',
+    [numIn(/`few-reviews-for-sales`\s+\(reviews\s+under\s+(\d+)%\s+of\s+a\s+sold\s+count/, skillSrc),
+      numIn(/`few-reviews-for-sales`\s+\(reviews\s+under\s+\d+%\s+of\s+a\s+sold\s+count\s+of\s+([\d,]+)\s+or\s+more\)/, skillSrc)],
+    [PIN.fewShare * 100, PIN.fewMinSold]);
+  eq('R-F24: the SKILL.md flags list says sold-saturated is a bucketed sold of 10,000+',
+    numIn(/`sold-saturated`\s+\(a\s+bucketed\s+sold\s+of\s+([\d,]+)\+\)/, skillSrc), PIN.soldSaturated);
+  eq('R-F24: the SKILL.md flags list says brand-implausible is a brandScore under 0.2',
+    (skillSrc.match(/`brand-implausible`\s+\(a\s+`brandScore`\s+under\s+(0\.\d+):/) || [])[1], String(PIN.brandImplausible));
+});
+
+// ============================================================================
+// 2026-10-19, recheck of the first fix pass: skeptics found the fixes for
+// F00, F20, F32, F15 and F17 too wide or too narrow, and F09-F12 not fixed.
+// Each block fails on the 2026-10-18c baseline; the guards against the
+// first pass's over-wide rules fail on that pass's code.
+// ============================================================================
+const { spawnSync: spawnSyncX } = await import('node:child_process');
+// rank.mjs with its exit code and stderr (rank() above throws on exit 2).
+const rankRun = (input, args) => {
+  const r = spawnSyncX(process.execPath, [RANK, ...args], { input: JSON.stringify(input), encoding: 'utf8' });
+  let out = null;
+  try { out = JSON.parse(r.stdout); } catch (e) { out = null; }
+  return { code: r.status, out, err: r.stderr || '' };
+};
+
+console.log('\nR-F00-2: relevance: "-es" comes off only after s, x, z, ch, sh or o');
+await block('R-F00-2', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  // Plurals the narrow rule still joins (the baseline missed all of them).
+  for (const [q, t] of [['boxes', 'Storage Box'], ['tax', 'Taxes Calculator'], ['hero', 'Super Heroes Figure'],
+    ['potato', 'Potatoes Peeler'], ['gas', 'Gases Detector'], ['lens', 'Camera Lenses'], ['dress', 'Party Dresses']]) {
+    eq(`R-F00-2: "${q}" over "${t}" titles raises nothing`, qr(q, recheckRep(t)).warning, null);
+  }
+  // Off streams the first fix let through ("tubes" gave "tub", "tapes" gave "tap").
+  for (const [q, t] of [['bath tub', 'Silicone Tubes Lab'], ['tap', 'Waterproof Duct Tapes'], ['cap', 'Halloween Superhero Capes'],
+    ['yoga mat', 'Best Mates Mug'], ['pin', 'Pines Wall Art'], ['tapes', 'Faucet Tap Kitchen'], ['led strip', 'Zebra Stripes Fabric'],
+    ['pan', 'Window Panes Film'], ['win', 'Red Wines Glass'], ['notes', 'Not Today Sign']]) {
+    ok(`R-F00-2: "${q}" over "${t}" titles still warns`, qr(q, recheckRep(t)).warning !== null, JSON.stringify(qr(q, recheckRep(t)).keywordShare));
+  }
+  // Through the harvester, so the inlined copy (and dist/) is exercised too.
+  const run = async (query, title) => {
+    const items = Array.from({ length: 6 }, (_, i) => makeItem('t' + i, { title: title + ' ' + i }));
+    const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+      return reply(makePage({ items: p === 1 ? items : [], page: p })); });
+    H.start({ query });
+    await H.step(3);
+    return JSON.parse(H.payload());
+  };
+  const tub = await run('bath tub', 'Silicone Tubes Lab');
+  eq('R-F00-2: harvest.js calls "bath tub" over "Tubes" titles off-query', [tub.coverage.verdict, tub.coverage.streamVerdict], ['off-query', 'exhausted-all-results']);
+  const box = await run('boxes', 'Storage Box Organizer');
+  eq('R-F00-2: harvest.js calls "boxes" over "Box" titles exhausted-all-results', box.coverage.verdict, 'exhausted-all-results');
+  ok('R-F00-2: SKILL.md says "tubes" is not "tub"', /`tubes` is not `tub`/.test(skillSrc));
+});
+
+console.log('\nR-F20-2: relevance: a plain "-s" comes off only when 3 letters stay');
+await block('R-F20-2', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  for (const [q, t] of [['mug', 'Coffee Mugs'], ['jar', 'Glass Jars'], ['fan', 'USB Fans'], ['mugs', 'Coffee Mug'], ['key', 'Car Keys']]) {
+    eq(`R-F20-2: "${q}" over "${t}" titles raises nothing`, qr(q, recheckRep(t)).warning, null);
+  }
+  for (const [q, t] of [['ups battery', 'Push Up Bra Lace'], ['car', 'Skin Cares Serum'], ['kites', 'Tool Kit Box'],
+    ['can', 'Walking Canes Wood'], ['hat', 'Hates Mug Funny'], ['cub', 'Ice Cubes Tray']]) {
+    ok(`R-F20-2: "${q}" over "${t}" titles still warns`, qr(q, recheckRep(t)).warning !== null, JSON.stringify(qr(q, recheckRep(t)).keywordShare));
+  }
+  const items = Array.from({ length: 6 }, (_, i) => makeItem('u' + i, { title: 'Push Up Bra Lace ' + i }));
+  const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p === 1 ? items : [], page: p })); });
+  H.start({ query: 'ups battery' });
+  const st = await H.step(3);
+  eq('R-F20-2: harvest.js: "ups battery" over "Push Up" titles is off-query', [st.relevance.share, st.relevance.offQuery], [0, true]);
+});
+
+console.log('\nR-F32-2: relevance: a decode.mjs merge keeps the stream verdict; a join never rebuilds an ending');
+await block('R-F32-2', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  const { mergePayloads } = await import('./decode.mjs');
+  // A correct synonym stream read in two runs: pages 1-2, then from page 3.
+  const ts = ['Wireless Earbuds Bluetooth 5.3 TWS', 'In-ear Earbuds Sport', 'Bluetooth Headset Earbud'];
+  const site = async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p > 3 ? [] : Array.from({ length: 20 }, (_, i) => makeItem(`e-${p}-${i}`, { title: ts[i % 3] + ' v' + p + i })), page: p })); };
+  const part = async (opts) => { const H = loadHarvest(site); H.start({ query: 'earphones', ...opts }); await H.step(10); return JSON.parse(H.payload()); };
+  const a = await part({ maxPages: 2 });
+  const b = await part({ startPage: 3 });
+  const m = mergePayloads([a, b]);
+  eq('R-F32-2: the merge is off-query (the check cannot see a synonym)', m.coverage.verdict, 'off-query');
+  eq('R-F32-2: and keeps the stream\'s own verdict', [m.coverage.streamVerdict, m.coverage.byQuery[0].streamVerdict], ['exhausted-all-results', 'exhausted-all-results']);
+  const offOf = (x) => ((x && x.relevance) || {}).offSample || [];
+  ok('R-F32-2: and the off titles, top level and per stream', offOf(m).length === 3 &&
+    (m.coverage.byQuery[0].offSample || []).length === 3 && offOf(m).every((t) => /Earbud|Headset/.test(t)), JSON.stringify(m.relevance));
+  const mm = mergePayloads([m, a]);
+  eq('R-F32-2: a merged file merged again keeps them', [mm.coverage.streamVerdict, offOf(mm).length], ['exhausted-all-results', 3]);
+  // A truncated merge says truncated in both fields.
+  const t = mergePayloads([a, await part({ startPage: 2, maxPages: 2 })]);
+  eq('R-F32-2: a merge that never ran dry has streamVerdict truncated', [t.coverage.verdict, t.coverage.streamVerdict], ['off-query', 'truncated']);
+  // Split compounds still match; a one-letter word or an ending never joins.
+  eq('R-F32-2: "wifi camera" over "Wi Fi Cam" titles raises nothing', qr('wifi camera', recheckRep('Wi Fi Cam Home')).warning, null);
+  for (const [q, tt] of [['wired usb mouse', 'Copper Wire D Ring Buckle'], ['cart', 'Car T Shirt Funny'], ['wired usb mouse', 'Craft Wire Ed Spool']]) {
+    ok(`R-F32-2: "${q}" over "${tt}" titles still warns`, qr(q, recheckRep(tt)).warning !== null, JSON.stringify(qr(q, recheckRep(tt)).keywordShare));
+  }
+  ok('R-F32-2: lib.mjs no longer says the check "must never fire on a correct stream"', !/must never fire on a correct stream/.test(SRC('lib.mjs')) &&
+    /so on such a correct stream the check DOES fire/.test(SRC('lib.mjs')));
+  ok('R-F32-2: nor does harvest.js', !/must never fire on a correct stream/.test(harvestText));
+  ok('R-F32-2: SKILL.md says a merge keeps relevance.offSample and coverage.streamVerdict',
+    /A `decode\.mjs` merge keeps the same two fields:\s+`relevance\.offSample`, and `coverage\.streamVerdict` for the whole merge/.test(skillSrc));
+  ok('R-F32-2: SKILL.md names the join limit ("Car Pet" for "carpet")', /`Car Pet\s+Seat Cover` for `carpet`/.test(skillSrc));
+});
+
+console.log('\nR-F15-2: listing.js: the page title decides whether "box" is the product; packaging words stay cartons');
+await block('R-F15-2', async () => {
+  const MOUSE = 'Wired USB Mouse Optical - AliExpress';
+  const LUNCH = 'Bento Lunch Box for Kids Leakproof - AliExpress';
+  const p = (t, title) => leListing([leEl('P', { text: t })], { title });
+  // A box product, with its title: its own size (the baseline said carton).
+  eq('R-F15-2: "Lunch Box Size" on a lunch box page is the product size', leSizes(await p('Lunch Box Size: 20 x 15 x 6 cm', LUNCH)),
+    [['Lunch Box Size: 20 x 15 x 6 cm'], []]);
+  eq('R-F15-2: the same in a fetched description', leSizes(await leListing([], { desc: { body: 'Lunch Box Size: 20 x 15 x 6 cm' }, title: LUNCH })),
+    [['Lunch Box Size: 20 x 15 x 6 cm'], []]);
+  const HE_LUNCH = 'קופסת אוכל לילדים - AliExpress';
+  eq('R-F15-2: Hebrew "גודל קופסה לאוכל" on a box page is the product size', leSizes(await p('גודל קופסה לאוכל: 20x15x6 ס"מ', HE_LUNCH)),
+    [['גודל קופסה לאוכל: 20x15x6 ס"מ'], []]);
+  eq('R-F15-2: Hebrew "גודל קופסה:" (box size) on a box page is still the carton', leSizes(await p('גודל קופסה: 22x17x8 ס"מ', HE_LUNCH)),
+    [[], ['גודל קופסה: 22x17x8 ס"מ']]);
+  eq('R-F15-2: Hebrew "קופסת מתנה" (gift box) is the carton', leSizes(await p('גודל קופסת מתנה: 12x7x4 ס"מ', MOUSE)),
+    [[], ['גודל קופסת מתנה: 12x7x4 ס"מ']]);
+  // A product that is not a box: every box size is the carton.
+  for (const t of ['White box size: 15x10x5cm', 'Single box size: 15x10x5cm', 'Brown box size: 15x10x5cm', 'Neutral box size: 15x10x5cm',
+    'Display box size: 15x10x5cm', 'Individual box size: 15x10x5cm', 'Product box size: 15x10x5cm', 'Master box size: 40x30x20cm',
+    'Material: ABS Box size: 12x7x4cm', 'Lunch Box Size: 20 x 15 x 6 cm']) {
+    eq(`R-F15-2: "${t}" on a mouse page is the carton`, leSizes(await p(t, MOUSE)), [[], [t]]);
+  }
+  // With no title known, the packaging words and the glued label still mean the carton.
+  for (const t of ['White box size: 15x10x5cm', 'Master box size: 40x30x20cm', 'Material: ABS Box size: 12x7x4cm', 'Color: Black Box size: 12x7x4cm']) {
+    eq(`R-F15-2: "${t}" with no page title is the carton`, leSizes(await p(t)), [[], [t]]);
+  }
+  // What must not change: a mouse page's own size, and a box page's packaging.
+  eq('R-F15-2: "Size: 12 x 6 x 4 cm" on a mouse page is the product size', leSizes(await p('Size: 12 x 6 x 4 cm', MOUSE)), [['Size: 12 x 6 x 4 cm'], []]);
+  eq('R-F15-2: "Gift box size" on a lunch box page is the carton', leSizes(await p('Gift box size: 22x17x8cm', LUNCH)), [[], ['Gift box size: 22x17x8cm']]);
+  eq('R-F15-2: "White box size" on a lunch box page is the carton', leSizes(await p('White box size: 22x17x8cm', LUNCH)), [[], ['White box size: 22x17x8cm']]);
+  ok('R-F15-2: SKILL.md says the product title decides first', /The product title decides first:\s+when the page title holds no "box" \(or קופס\), every box size is the\s+carton/.test(skillSrc));
+});
+
+console.log('\nR-F17-2: step 5: a comma or a dot after "Reviews" is a separator, never lost');
+await block('R-F17-2', async () => {
+  const more = 'More to love 4.8800+ sold cute toy 4.9 5479 Reviews';
+  eq('R-F17-2: "Reviews, 10,000+ sold" after an earlier sold text gives 10,000+', leStep5([], more + ', 10,000+ sold US $1.58').out.soldRaw, '10,000+');
+  eq('R-F17-2: "Reviews. 10,000+ sold" gives 10,000+', leStep5([], more + '. 10,000+ sold').out.soldRaw, '10,000+');
+  eq('R-F17-2: "Reviews,10,000+ sold" gives 10,000+', leStep5([], '4.9 5479 Reviews,10,000+ sold').out.soldRaw, '10,000+');
+  // The F17 cases with no separator (the baseline lost a digit).
+  eq('R-F17-2: "Reviews 1.2K sold" gives 1.2K', leStep5([], '4.9 5479 Reviews 1.2K sold').out.soldRaw, '1.2K');
+  eq('R-F17-2: "Reviews 4.000+ נמכרו" gives 4.000+', leStep5([], '4.9 5479 Reviews 4.000+ נמכרו').out.soldRaw, '4.000+');
+  eq('R-F17-2: "Reviews10,000+ sold" gives 10,000+', leStep5([], '4.9 5479 Reviews10,000+ sold').out.soldRaw, '10,000+');
+  // What must not change.
+  eq('R-F17-2: the live separator still works', leStep5([], RV.gyro).out.soldRaw, '50,000+');
+  eq('R-F17-2: "Reviews (5479) 300 sold" falls back to the first sold text', leStep5([], 'Reviews (5479) 300 sold').out.soldRaw, '300');
+});
+
+console.log('\nR-F09: rank.mjs refuses one-hyphen, upper-case and em-dash flags and stray words (exit 2)');
+await block('R-F09', async () => {
+  const f2 = [{ id: 'a', title: 'x', rating: 4.8, ownRating: 4.8, reviews: 500, sold: 5000, constraints: { wires: 'pass' } },
+    { id: 'b', title: 'y', rating: 4.9, ownRating: 4.9, reviews: 900, sold: 5000, constraints: { wires: 'fail' } }];
+  const EM = String.fromCharCode(0x2014), EN = String.fromCharCode(0x2013);
+  for (const [args, tok] of [[['-constraint', 'wires'], '-constraint'], [['--Constraint', 'wires'], '--Constraint'],
+    [[EM + 'constraint', 'wires'], EM + 'constraint'], [[EN + 'constraint', 'wires'], EN + 'constraint'],
+    [['--CONSTRAINT=wires'], '--CONSTRAINT=wires'], [['-top', '1'], '-top'], [['--Top', '1'], '--Top'], [['--top', '1', 'extra'], 'extra']]) {
+    const r = rankRun(f2, ['--mode', 'final', ...args]);
+    ok(`R-F09: ${JSON.stringify(args)} exits 2 and names ${JSON.stringify(tok)}`, r.code === 2 && r.err.includes(JSON.stringify(tok)) && r.out === null,
+      `exit ${r.code} ${r.err.slice(0, 120)}`);
+  }
+  // What must not change.
+  const good = rankRun(f2, ['--mode', 'final', '--constraint', 'wires']);
+  eq('R-F09: --constraint wires still ranks only the item that passes', [good.code, good.out.constraints, good.out.ranked.map((x) => x.id)], [0, ['wires'], ['a']]);
+  const eqf = rankRun(f2, ['--mode=final', '--top=1']);
+  eq('R-F09: --name=value still works', [eqf.code, eqf.out.mode, eqf.out.ranked.length], [0, 'final', 1]);
+  const neg = rankRun(f2, ['--mode', 'final', '--min-rating', '-1']);
+  eq('R-F09: a value that starts with one hyphen is still a value', [neg.code, neg.out.ranked.length], [0, 2]);
+  const miss = rankRun(f2, ['--top', '--mode', 'final']);
+  ok('R-F09: a flag followed by a flag still names the missing value', miss.code === 2 && /--top needs a value/.test(miss.err), miss.err);
+  ok('R-F09: SKILL.md says one-hyphen, upper-case and em-dash flags and stray words exit 2',
+    /So are a\s+flag with one hyphen \(`-constraint`\), in upper case \(`--Constraint`\) or with\s+an em dash from autocorrect in place of `--`, a stray word/.test(skillSrc));
+});
+
+console.log('\nR-F10: rank.mjs reads a brandScore string and sets aside one outside 0..1');
+await block('R-F10', async () => {
+  const pool = (bs) => [{ id: 'fake', title: 't', rating: 4.9, ownRating: 4.9, reviews: 2000, sold: 10000, soldRaw: '10,000+', brandScore: bs },
+    { id: 'ok', title: 't', rating: 4.8, ownRating: 4.8, reviews: 1500, sold: 5000, brandScore: 0.8 },
+    { id: 'house', title: 't', rating: 4.8, ownRating: 4.8, reviews: 1500, sold: 5000, brandScore: 0.5 }];
+  const num = rank(pool(0.05), ['--mode', 'final']);
+  const str = rank(pool('0.05'), ['--mode', 'final']);
+  eq('R-F10: brandScore "0.05" ranks like 0.05', str.ranked.map((x) => [x.id, x.score]), num.ranked.map((x) => [x.id, x.score]));
+  ok('R-F10: and is flagged brand-implausible', str.ranked.find((x) => x.id === 'fake').flags.includes('brand-implausible'), JSON.stringify(str.ranked.map((x) => x.flags)));
+  for (const bs of [8, -3, 1.5]) {
+    const r = rank(pool(bs), ['--mode', 'final']);
+    ok(`R-F10: brandScore ${bs} is set aside, not ranked`, !r.ranked.some((x) => x.id === 'fake') && r.droppedReasons['brandScore-out-of-range'] === 1,
+      JSON.stringify([r.ranked.map((x) => x.id), r.droppedReasons]));
+    ok(`R-F10: brandScore ${bs} is named in a warning`, r.warnings.some((w) => /^brandScore-out-of-range/.test(w) && w.includes('fake:' + bs)), JSON.stringify(r.warnings));
+  }
+  const abc = rank(pool('abc'), ['--mode', 'final']);
+  ok('R-F10: brandScore "abc" is set aside as not-a-number', abc.droppedReasons['not-a-number:brandScore'] === 1 && abc.warnings.some((w) => /^not-a-number/.test(w)),
+    JSON.stringify(abc.droppedReasons));
+  // What must not change: 0 and 1 are in range, and no brandScore is neutral.
+  const edge = rank([{ ...pool(0)[0] }, { ...pool(0)[1], brandScore: 1 }, { ...pool(0)[2], brandScore: undefined }], ['--mode', 'final']);
+  eq('R-F10: brandScore 0 and 1 are ranked, a missing one is neutral', [edge.ranked.length, edge.brandDefaulted, edge.droppedCount], [3, 1, 0]);
+  ok('R-F10: SKILL.md says an out-of-range or non-number brandScore is set aside', /sets aside an item\s+whose score is not a number or is outside 0\.\.1, with a warning/.test(skillSrc));
+});
+
+console.log('\nR-F11: rank.mjs never drops a finalist without a word');
+await block('R-F11', async () => {
+  const good = { id: 'good', title: 'x', rating: 4.8, ownRating: 4.8, reviews: 500, sold: 5000 };
+  const heb = { id: 'heb', title: 'y', rating: null, ownRating: null, reviews: null, pooledReviews: null, soldRaw: '1,000+' };
+  const r = rank([good, heb], ['--mode', 'final']);
+  eq('R-F11: a finalist with no rating and no counts is own-reviews-unknown, not "no rating"', [r.ranked.map((x) => x.id), r.droppedReasons],
+    [['good'], { 'own-reviews-unknown': 1 }]);
+  ok('R-F11: and is named in the own-reviews-unknown warning', r.warnings.some((w) => /^own-reviews-unknown/.test(w) && w.includes('heb')), JSON.stringify(r.warnings));
+  const r2 = rank([good, { id: 'pool', title: 'z', rating: null, reviews: null, pooledReviews: 5479 }], ['--mode', 'final']);
+  eq('R-F11: with only a pooled count, the same', r2.droppedReasons, { 'own-reviews-unknown': 1 });
+  const r3 = rank([good, { id: 'hand', title: 'w', rating: null, reviews: 300 }], ['--mode', 'final']);
+  ok('R-F11: an own count but no rating is set aside with a no-rating warning', r3.droppedReasons['no rating'] === 1 &&
+    r3.warnings.some((w) => /^no-rating/.test(w) && w.includes('hand')), JSON.stringify([r3.droppedReasons, r3.warnings]));
+  // What must not change: in shortlist mode SEO junk is dropped quietly.
+  const s = rank([{ id: 'k', title: 'x', rating: 4.8, sold: 5000 }, { id: 'junk', title: 'seo', rating: null, reviews: null, sold: null }], ['--mode', 'shortlist']);
+  eq('R-F11: shortlist: SEO junk is "no rating", no warning', [s.droppedReasons, s.warnings], [{ 'no rating': 1 }, []]);
+  ok('R-F11: SKILL.md says such a finalist is own-reviews-unknown also with no rating', /named in a warning, also when it has no rating at all/.test(skillSrc));
+});
+
+console.log('\nR-F12: rank.mjs: a bad --require regex is a bad flag value (exit 2), not a stack trace');
+await block('R-F12', async () => {
+  const f1 = [{ id: 'm', title: 'wired mouse', rating: 4.8, sold: 5000 }];
+  for (const args of [['--require', '('], ['--require=('], ['--require', '[a-']]) {
+    const r = rankRun(f1, args);
+    ok(`R-F12: ${JSON.stringify(args)} exits 2 and names --require`, r.code === 2 && /--require is not a valid regular expression/.test(r.err) && !/at new RegExp/.test(r.err),
+      `exit ${r.code} ${r.err.slice(0, 160)}`);
+  }
+  const blank = rankRun(f1, ['--require', ' ']);
+  ok('R-F12: a blank --require exits 2', blank.code === 2 && /--require needs a regex/.test(blank.err), `exit ${blank.code} ${blank.err.slice(0, 120)}`);
+  const good = rankRun(f1, ['--require', 'mouse|maus']);
+  eq('R-F12: a valid regex still filters', [good.code, good.out.ranked.map((x) => x.id)], [0, ['m']]);
+  ok('R-F12: SKILL.md says a bad --require regex exits 2', /a blank\s+`--require ''` and a `--require` regex that does not compile/.test(skillSrc));
 });
 
 // ---------------------------------------------- the whole suite on dist/

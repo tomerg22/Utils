@@ -48,24 +48,36 @@ import { median, parseSold, queryRelevance } from './lib.mjs';
 
 /* --name value, or --name=value. An unknown --name is an error: a typo
  * such as --constriant silently dropped a hard requirement, and
- * --mode=final silently ran shortlist (review, 2026-10-18). */
+ * --mode=final silently ran shortlist (review, 2026-10-18).
+ * Every word on the line is a known --flag or the value right after one.
+ * Only "--" and lower case was checked, so "-constraint", "--Constraint",
+ * an em dash from autocorrect ("\u2014constraint") and a stray word were
+ * skipped with exit 0, and the hard requirement was dropped (recheck,
+ * 2026-10-19). */
 const FLAGS = ['mode', 'top', 'min-rating', 'min-evidence', 'w-quality', 'w-volume', 'w-brand', 'prior',
   'brand-default', 'require', 'spread', 'constraint'];
-const argv = process.argv.slice(2).flatMap((a) => (/^--[a-z-]+=/.test(a) ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a]));
-for (let i = 0; i < argv.length; i++) {
-  if (!/^--[a-z]/.test(argv[i])) continue;
-  if (!FLAGS.includes(argv[i].slice(2))) {
-    console.error('rank.mjs: unknown flag ' + argv[i] + ' (known: --' + FLAGS.join(', --') + ')');
-    process.exit(2);
-  }
-  i++; // its value
-}
 /* A flag with no value (last on the line, or followed by another --flag)
  * is an error, never a silent NaN. Measured 2026-10-18: `--spread x`, a bare
  * `--spread` or `--top abc` made headCount NaN, slice(0, NaN) returned [],
  * and the output said kept 3, ranked 0, with no warning: "nothing
  * qualified", read off a typo. */
 const die = (msg) => { console.error('rank.mjs: ' + msg); process.exit(2); };
+const argv = process.argv.slice(2).flatMap((a) => (/^--[a-z-]+=/.test(a) ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a]));
+const KNOWN = ' (known: --' + FLAGS.join(', --') + ')';
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (/^--[a-z]/.test(a)) {
+    if (!FLAGS.includes(a.slice(2))) die('unknown flag ' + a + KNOWN);
+    // Its value, unless a flag comes next: then arg() names the missing value.
+    if (i + 1 < argv.length && !/^--[a-z]/.test(argv[i + 1])) i++;
+    continue;
+  }
+  // One hyphen, upper case, or a dash that is not "-" (U+2010-U+2015, U+2212).
+  if (/^[-\u2010-\u2015\u2212]/.test(a)) {
+    die('unknown flag ' + JSON.stringify(a) + ': a flag is two ASCII hyphens and lower case, as --constraint' + KNOWN);
+  }
+  die('stray argument ' + JSON.stringify(a) + ': every value follows its --flag' + KNOWN);
+}
 const arg = (name, dflt) => {
   const i = argv.indexOf(`--${name}`);
   if (i === -1) return dflt;
@@ -95,6 +107,8 @@ const W_BRAND = numArg('w-brand', 0.15, { min: 0 });
 const PRIOR = numArg('prior', MODE === 'final' ? 50 : 300, { min: 0 });
 const BRAND_DEFAULT = numArg('brand-default', 0.5, { min: 0 });
 const REQUIRE = arg('require', null); // regex on title — drops off-category items
+// A blank regex (an unset $VAR) would filter nothing, with no word.
+if (REQUIRE != null && !/\S/.test(REQUIRE)) die('--require needs a regex, got a blank value');
 const SPREAD = numArg('spread', 0, { min: 0, int: true });
 
 /* All occurrences of a repeatable flag, e.g. --constraint wires --constraint 9v */
@@ -216,6 +230,7 @@ const all = [...byId.values()];
  * for the whole pool with no warning (review, 2026-10-18). A numeric string
  * is read; anything else is set aside by name. */
 const badNumbers = [];
+const badBrands = [];
 for (const i of all) {
   // A sold TEXT ("1,000+") is read like soldRaw; a price that is not a
   // number only loses its price.
@@ -223,13 +238,18 @@ for (const i of all) {
   if (i.price != null && typeof i.price !== 'number') {
     i.price = /^\s*\d+(\.\d+)?\s*$/.test(String(i.price)) ? Number(i.price) : null;
   }
-  for (const k of ['reviews', 'pooledReviews', 'rating', 'ownRating']) {
+  /* brandScore too: a string "0.05" was read as NO brand data, so a
+   * counterfeit lost its demotion and its brand-implausible flag, with no
+   * warning (recheck, 2026-10-19). */
+  for (const k of ['reviews', 'pooledReviews', 'rating', 'ownRating', 'brandScore']) {
     const v = i[k];
     if (v == null || typeof v === 'number') continue;
     if (typeof v === 'string' && /^\s*\d+(\.\d+)?\s*$/.test(v)) { i[k] = Number(v); continue; }
     i.notANumber = (i.notANumber || []).concat(k);
   }
   if (i.notANumber) badNumbers.push(i);
+  // A brandScore is 0..1 (SKILL.md step 6). 8 (a 0..10 scale) scored 2.03.
+  else if (typeof i.brandScore === 'number' && !(i.brandScore >= 0 && i.brandScore <= 1)) badBrands.push(i);
 }
 for (const i of all) {
   if (i.sold == null && i.soldRaw != null) i.sold = parseSold(i.soldRaw);
@@ -258,12 +278,18 @@ const ownReviewsUnknown = (i) => i.reviews == null;
  * JSON-LD ratingValue, which is POOLED across other sellers like the
  * JSON-LD reviewCount. The listing's own rating is `ownRating`, from the
  * same review block as the own count. Final mode shrinks a rating by the own
- * count, so it must use the own rating: a listing rated 4.1 by its own 1,090
- * buyers was ranked on the pool's 4.9. */
+ * count, so it must use the own rating. test.mjs checks it on a made-up
+ * listing (pooled 4.9, own 4.1 from 1,090 ratings): that pair is a test
+ * case, not a measured page. On the pages copied on 2026-09-25 the own and
+ * the header ratings matched ("4.9 1090 ratings" under "4.9 5479 Reviews"). */
 const ratingOf = (i) => (MODE === 'final' && typeof i.ownRating === 'number' ? i.ownRating : i.rating);
 
 const evidenceOf = (i) => (MODE === 'final' ? i.reviews : i.sold);
-const reqRe = REQUIRE ? new RegExp(REQUIRE, 'i') : null;
+// A bad regex is a bad flag value: exit 2, never a stack trace (exit 1).
+let reqRe = null;
+try { reqRe = REQUIRE ? new RegExp(REQUIRE, 'i') : null; } catch (e) {
+  die(`--require is not a valid regular expression: ${JSON.stringify(REQUIRE)} (${String(e.message).replace(/^Invalid regular expression: /, '')})`);
+}
 
 const kept = [];
 const dropped = [];
@@ -274,13 +300,17 @@ for (const i of all) {
   const violated = CONSTRAINTS.filter((n) => constraintStatus(i, n) === 'fail');
   const unknown = CONSTRAINTS.filter((n) => constraintStatus(i, n) === 'unknown');
   if (i.notANumber) dropped.push({ ...i, why: 'not-a-number:' + i.notANumber.join('+') });
+  else if (badBrands.includes(i)) dropped.push({ ...i, why: 'brandScore-out-of-range' });
   else if (reqRe && !reqRe.test(i.title || '')) { dropped.push({ ...i, why: 'off-category' }); requireDropped++; }
   else if (violated.length) dropped.push({ ...i, why: `violates:${violated.join('+')}` });
-  else if (ratingOf(i) == null) dropped.push({ ...i, why: 'no rating' });
   /* With no own count the only rating is the pooled one, so it is not
    * judged on it: set aside as unknown, never "rating<4" (review,
-   * 2026-10-18). */
+   * 2026-10-18). This comes BEFORE "no rating" in final mode: a finalist
+   * whose reader returned no rating and no counts (a Hebrew page) was
+   * dropped as "no rating", the SEO-junk reason, with no warning (recheck,
+   * 2026-10-19). SEO junk is a shortlist matter. */
   else if (MODE === 'final' && ownReviewsUnknown(i)) dropped.push({ ...i, why: 'own-reviews-unknown' });
+  else if (ratingOf(i) == null) dropped.push({ ...i, why: 'no rating' });
   else if (ratingOf(i) < MIN_RATING) dropped.push({ ...i, why: `rating<${MIN_RATING}` });
   else if (MODE !== 'final' && soldUnparsed(i)) dropped.push({ ...i, why: 'sold-unparsed' });
   // `--min-evidence 0` keeps a 0; unknown evidence (null) is never kept.
@@ -336,11 +366,22 @@ if (unparsed.length)
       ? 'Their sold-based flags were skipped.'
       : 'They were set aside, NOT judged: they may be the best sellers. Fix parseSold/SOLD_RE ' +
         'in lib.mjs and every inlined copy, or open their detail pages.'));
+if (badBrands.length) {
+  warnings.push(`brandScore-out-of-range: ${badBrands.length} item(s) carry a brandScore outside 0..1 ` +
+    `(${badBrands.slice(0, 3).map((i) => i.id + ':' + i.brandScore).join(', ')}). They were set aside, NOT ranked: ` +
+    'score brands 0..1 (SKILL.md step 6).');
+}
 const noOwn = MODE === 'final' ? dropped.filter((d) => d.why === 'own-reviews-unknown') : [];
 if (noOwn.length)
   warnings.push(`own-reviews-unknown: ${noOwn.length} finalist(s) carry no own review count, only the pooled ` +
     `one or none (${noOwn.slice(0, 3).map((i) => i.id).join(', ')}). They were set aside, NOT ranked and NOT ` +
     'called thin: re-read the review block ("N ratings") on their detail pages. Never rank on the pooled number.');
+// A finalist is never set aside without a word: it was read in step 5.
+const noRating = MODE === 'final' ? dropped.filter((d) => d.why === 'no rating') : [];
+if (noRating.length)
+  warnings.push(`no-rating: ${noRating.length} finalist(s) carry an own review count but no rating ` +
+    `(${noRating.slice(0, 3).map((i) => i.id).join(', ')}). They were set aside, NOT ranked: re-read the review ` +
+    'block ("4.9 1090 ratings") on their detail pages and pass ownRating.');
 if (CONSTRAINTS.length && unverified.length)
   warnings.push(`unverified-constraint: ${unverified.length} item(s) were NOT ranked because ` +
     `their status for [${CONSTRAINTS.join(', ')}] is unknown. Check them, do not assume they pass.`);

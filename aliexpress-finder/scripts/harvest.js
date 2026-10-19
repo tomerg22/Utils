@@ -7,7 +7,9 @@
  *
  *   __aeHarvest.start({ query: 'wire brush set' })   // returns the plan
  *   await __aeHarvest.step(6)                        // repeat until done
- *   await __aeHarvest.send(8765)                     // payload -> receiver.mjs
+ *   await __aeHarvest.send(8765, {via: 'form'})      // payload -> receiver.mjs, after
+ *                                                    // curl -s http://127.0.0.1:8765/ answers ok
+ *   (a plain send(8765) fetch was refused by both browsers on 2026-10-18)
  *   __aeHarvest.restore()                            // reload a saved harvest
  *
  * WHY THIS EXISTS (measured 2026-08-21)
@@ -249,19 +251,30 @@ function wallVerdict(sig) {
  * query, so a whole off-category stream looked like a complete harvest.
  *
  * THE RULE: a title is on-query when it holds AT LEAST ONE query keyword as
- * a whole word or a simple inflection of it (see `stemWord`: plurals,
- * -er/-ing/-ed, mice/mouse; "wire" is not "wired"). The craft wire holds
- * none of "wired", "usb", "mouse", so the live case is caught.
+ * a whole word or a simple inflection of it (see `bases`: plurals,
+ * -er/-ing/-ed, mice/mouse; "wire" is not "wired"), or as two words written
+ * apart ("Screw Driver" holds "screwdriver"). The craft wire holds none of
+ * "wired", "usb", "mouse", so the live case is caught.
  *
  * WHY SO LOOSE (review of the fix, 2026-10-18): a stricter "head word"
  * rule needs to know which keyword is the noun. Taking the last word failed
  * on "mouse wired" and "mouse for computer"; a list of qualifier words
  * failed on "rc car", "coil spring" and "faux leather", whose last word is
  * the noun but was on the list. A false alarm makes the operator throw a
- * good harvest away, so the check must never fire on a correct stream. The
- * cost: an off stream that shares one keyword passes (craft wire for
- * "wire brush set"). `keywordShare` gives the share per keyword, so a low
- * share on the noun can still be seen by eye.
+ * good harvest away, so the rule must not fire on a correct stream that
+ * uses the query's words. The cost: an off stream that shares one keyword
+ * passes (craft wire for "wire brush set"), and so does one whose title
+ * words join into a keyword ("Car Pet Seat Cover" for "carpet").
+ * `keywordShare` gives the share per keyword, so a low share on the noun
+ * can still be seen by eye.
+ *
+ * WHAT IT CANNOT SEE: a synonym. "Earbuds" for "earphones" or "Cam" for
+ * "camera" count as off, so on such a correct stream the check DOES fire
+ * (review, 2026-10-18). Words alone cannot tell it from craft wire for
+ * "wired usb mouse". So the warning quotes the titles that hold no keyword
+ * (`offSample`), the payload keeps the stream's own verdict
+ * (`coverage.streamVerdict`, also in a decode.mjs merge), and the operator
+ * reads the titles before re-wording the query.
  *
  * A title holding a Hebrew, Arabic or Cyrillic word cannot be compared with
  * English keywords: on the Hebrew storefront "כבל USB Type C Samsung" is a
@@ -271,8 +284,9 @@ function wallVerdict(sig) {
 function queryRelevance(query, titles) {
   var STOP = /^(and|for|the|with|set|sets|pcs|pc|new|of|in|on|to|a|an|kit|lot)$/;
   var words = function (s) { return String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean); };
+  var qwords = words(query);
   // Each keyword once: "usb c to usb c cable" counted usb twice.
-  var toks = words(query).filter(function (t, i, a) { return t.length >= 2 && !STOP.test(t) && a.indexOf(t) === i; });
+  var toks = qwords.filter(function (t, i, a) { return t.length >= 2 && !STOP.test(t) && a.indexOf(t) === i; });
   var list = (titles || []).map(function (t) { return String(t || ''); }).filter(Boolean);
   if (!toks.length) return { measured: false, reason: 'no-query-keywords', checked: 0 };
   var latin = list.filter(function (t) {
@@ -283,41 +297,93 @@ function queryRelevance(query, titles) {
   }
   /* Latin script is not English: a Spanish or German account's titles
    * ("Ratón inalámbrico para PC", "Kabellose Maus mit USB") cannot match
-   * English keywords either. Their function words give them away. */
-  var FOREIGN = /(^|[^a-z])(para|con|und|mit|für|pour|avec|sans|sin|por|les|des|une|della|voor|och)([^a-z]|$)/i;
-  var foreign = latin.filter(function (t) { return FOREIGN.test(t); }).length;
+   * English keywords either. Their function words give them away. Six of
+   * them are English words too ("Pour Over Kettle", "Les Paul", "Con Rod"),
+   * so one of those counts only beside a second one or a letter with an
+   * accent. Alone, "pour" used to turn the whole check off (review,
+   * 2026-10-18). */
+  var FOREIGN = /(^|[^a-z])(und|mit|für|avec|sans|por|une|della|voor|och)([^a-z]|$)/i;
+  var FOREIGN_TOO = /(^|[^a-z])(para|con|pour|les|des|sin)(?=[^a-z]|$)/gi;
+  var ACCENT = /[\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u017f]/;
+  var isForeign = function (t) {
+    if (FOREIGN.test(t)) return true;
+    var seen = [];
+    (t.match(FOREIGN_TOO) || []).forEach(function (m) {
+      var w = m.toLowerCase().replace(/[^a-z]/g, '');
+      if (seen.indexOf(w) < 0) seen.push(w);
+    });
+    return seen.length >= 2 || (seen.length === 1 && ACCENT.test(t));
+  };
+  var foreign = latin.filter(isForeign).length;
   if (foreign * 10 >= latin.length * 3) {
     return { measured: false, reason: 'titles-not-english', checked: 0, keywords: toks };
   }
-  /* One word for its simple forms: plurals (boxes, cables, knives, mice),
-   * -er/-ing/-ed (charger, charging), -ier/-ying (magnifier, magnifying).
-   * A base must keep 4+ letters, so "wired" stays "wired", never "wire".
+  /* One word for its simple forms. Each word gives a few bases, and two
+   * words match when they share one. One stem per word missed "toy" and
+   * "toys", "box" and "boxes", "dress" and "dresses" (review, 2026-10-18).
+   *   plurals: toys, cars, ties, boxes, buses, dresses, cables, knives, mice
+   *   -er/-ing/-ed: charger, charging. That base keeps 4+ letters, so
+   *     "wired" is never "wire".
+   *   -ier/-ying: magnifier, magnifying
+   * A word ending in -ss keeps its last s: "dress" is not "dres".
+   * "-es" comes off only after s, x, z, ch, sh or o (boxes, dresses,
+   * watches, heroes). After any other letter only the "s" comes off:
+   * "tubes" is "tube", never "tub", and "tapes" is never "tap". A plain
+   * "-s" comes off only when 3 letters stay: "ups" is not "up" (recheck,
+   * 2026-10-19: the -es rule had been widened to every word).
    * A shared PREFIX is not a shared word: "water" and "waterproof",
    * "table" and "tablet" used to match (review, 2026-10-18). */
   var IRREGULAR = { mice: 'mouse', men: 'man', women: 'woman', feet: 'foot', teeth: 'tooth', children: 'child', geese: 'goose' };
-  var stemWord = function (w) {
-    if (IRREGULAR[w]) return IRREGULAR[w];
-    if (w.length > 5 && /ives$/.test(w)) return w.slice(0, -4) + 'ife';
-    if (w.length > 5 && /ves$/.test(w)) return w.slice(0, -3) + 'f';
-    if (w.length > 4 && /ies$/.test(w)) return w.slice(0, -3) + 'y';
-    if (w.length > 5 && /ying$/.test(w)) return w.slice(0, -4) + 'y';
-    if (/(s|x|z|ch|sh)es$/.test(w) && w.length > 5) return w.slice(0, -2);
-    var m = w.match(/^(.{4,}?)(ings|ing|ers|er|ed|s)$/);
-    var b = m ? m[1] : w;
-    return b.replace(/i$/, 'y');
+  var bases = function (w) {
+    var out = [];
+    var add = function (b) {
+      if (b.length < 2) return;
+      b = b.replace(/i$/, 'y');
+      if (out.indexOf(b) < 0) out.push(b);
+    };
+    add(w);
+    if (IRREGULAR[w]) add(IRREGULAR[w]);
+    if (w.length > 5 && /ives$/.test(w)) add(w.slice(0, -4) + 'ife');
+    if (w.length > 5 && /ves$/.test(w)) add(w.slice(0, -3) + 'f');
+    if (w.length > 4 && /ies$/.test(w)) add(w.slice(0, -3) + 'y');
+    if (w.length > 5 && /ying$/.test(w)) add(w.slice(0, -4) + 'y');
+    if (w.length > 4 && /(s|x|z|ch|sh|o)es$/.test(w)) add(w.slice(0, -2));
+    if (w.length > 3 && /[^s]s$/.test(w)) add(w.slice(0, -1));
+    var m = w.match(/^(.{4,}?)(ings|ing|ers|er|ed)$/);
+    if (m) add(m[1]);
+    return out;
   };
-  var has = function (ws, t) {
-    var st = stemWord(t);
-    return ws.some(function (w) { return w === t || stemWord(w) === st; });
-  };
+  var meets = function (xs, ys) { return xs.some(function (x) { return ys.indexOf(x) >= 0; }); };
+  var kb = {};
+  toks.forEach(function (k) { kb[k] = bases(k); });
+  // Two query keywords side by side are one word too: "screw driver" is
+  // held by a title that says "Screwdriver".
+  var pairs = [];
+  for (var qi = 0; qi + 1 < qwords.length; qi++) {
+    if (toks.indexOf(qwords[qi]) >= 0 && toks.indexOf(qwords[qi + 1]) >= 0) {
+      pairs.push({ a: qwords[qi], b: qwords[qi + 1], bs: bases(qwords[qi] + qwords[qi + 1]) });
+    }
+  }
   var per = {};
   toks.forEach(function (k) { per[k] = 0; });
   var on = 0;
   var off = [];
   latin.forEach(function (t) {
     var ws = words(t);
+    // ... and two title words side by side: "Screw Driver" is "screwdriver".
+    // Not a one-letter word or a bare ending: "Copper Wire D Ring" does not
+    // hold "wired", and "Car T Shirt" does not hold "cart" (recheck,
+    // 2026-10-19). A join must never undo the "wire is not wired" rule.
+    var all = ws.slice();
+    for (var wi = 0; wi + 1 < ws.length; wi++) {
+      if (ws[wi].length >= 2 && ws[wi + 1].length >= 2 && !/^(ed|er|es|ers|ing|ings)$/.test(ws[wi + 1])) all.push(ws[wi] + ws[wi + 1]);
+    }
+    var wb = all.map(bases);
+    var got = {};
+    toks.forEach(function (k) { if (wb.some(function (b) { return meets(b, kb[k]); })) got[k] = true; });
+    pairs.forEach(function (p) { if (wb.some(function (b) { return meets(b, p.bs); })) { got[p.a] = true; got[p.b] = true; } });
     var hit = false;
-    toks.forEach(function (k) { if (has(ws, k)) { per[k]++; hit = true; } });
+    toks.forEach(function (k) { if (got[k]) { per[k]++; hit = true; } });
     if (hit) on++;
     else if (off.length < 3) off.push(t.slice(0, 60));
   });
@@ -332,9 +398,11 @@ function queryRelevance(query, titles) {
     offSample: off,
     warning: warn
       ? 'off-query-results: only ' + on + ' of ' + latin.length + ' titles hold any of the keywords [' +
-        toks.join(', ') + ']. The site served another category (e.g. ' + JSON.stringify(off[0] || '') +
-        '). This is NOT a complete harvest of the product: do not report it as exhausted-all-results. ' +
-        'Re-word the query and say so to the user.'
+        toks.join(', ') + ']. Titles that hold none: ' + JSON.stringify(off) + '. Read them first: this ' +
+        'check cannot see a synonym ("earbuds" for "earphones"). If they are the product, the stream is ' +
+        'fine (coverage.streamVerdict). If the site served another category, this is NOT a complete ' +
+        'harvest of the product: do not report it as exhausted-all-results. Re-word the query and say so ' +
+        'to the user.'
       : null,
   };
 }
@@ -345,6 +413,9 @@ function queryRelevance(query, titles) {
    * TEXT size. Passing the HTML as the text (as this file used to) made the
    * two equal, so a large quiet interstitial with no "punish" string could
    * never be called a suspected wall and was reported as a parse-error. */
+  // The slider wall's own sentences (the same list as listing.js and
+  // extract.js). Not "please slide" alone: product titles use it.
+  const STRONG_WALL = /unusual traffic|slide to verify|(להחליק|החלק|גרור|המחוון)[^.]{0,40}(לאמת|אימות)/i;
   function pageText(html) {
     return String(html || '')
       .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -365,9 +436,9 @@ function queryRelevance(query, titles) {
   /* One key per RUN: prefix + slug + ':' + start time. A key per query let
    * restore() hand back an older run of the same query (other filters,
    * already exhausted) when the current run had not saved yet, and a key
-   * nobody deleted stayed forever. Only the newest MAX_BACKUPS runs are kept,
-   * and when the store is full the older runs are dropped and the save is
-   * tried once more (review of the fix, 2026-10-18). */
+   * nobody deleted stayed forever. Only the MAX_BACKUPS runs SAVED last are
+   * kept, and when the store is full the runs saved longest ago are dropped
+   * and the save is tried once more (review of the fix, 2026-10-18). */
   const MAX_BACKUPS = 3;
   function storage() {
     try { return window.localStorage || null; } catch (e) { return null; }
@@ -390,7 +461,19 @@ function queryRelevance(query, titles) {
         if (k && k.indexOf(BACKUP_PREFIX) === 0) out.push(k);
       }
     } catch (e) { /* storage blocked */ }
-    return out.sort((x, y) => parseKey(y).stamp - parseKey(x).stamp); // newest first
+    /* Saved last first, not started last (review, 2026-10-18): the start
+     * stamp made an older run that was restored and read on count as the
+     * oldest. restore() then handed back another run, and prune() deleted
+     * the one being worked on. persist() writes "savedAt" as the second
+     * field; an entry without it falls back to its start stamp. */
+    const savedAt = (k) => {
+      let text = '';
+      try { text = String(ls.getItem(k) || ''); } catch (e) { text = ''; }
+      const m = /"savedAt":(\d+)/.exec(text);
+      return m ? Number(m[1]) : parseKey(k).stamp;
+    };
+    const at = new Map(out.map((k) => [k, savedAt(k)]));
+    return out.sort((x, y) => (at.get(y) - at.get(x)) || (parseKey(y).stamp - parseKey(x).stamp));
   }
   function prune(ls, keepKey, max) {
     let kept = 0;
@@ -449,6 +532,30 @@ function queryRelevance(query, titles) {
                (typeof v === 'string' && /^\s*\d+\s*$/.test(v));
     if (!ok) throw new Error('harvest: ' + name + ' must be a whole number >= 0, got ' + JSON.stringify(v));
     return Number(v);
+  };
+  /* The last page the site serves (measured 2026-08-21: "page 60 is the
+   * hard ceiling"). maxPages used to go past it, and the empty page 61 then
+   * ended the run as exhausted-all-results although the site had only
+   * stopped serving (review, 2026-10-18). A higher maxPages is cut to it
+   * with a note, a run that reaches it stops as page-cap (truncated), and
+   * page 61 is never fetched. What the site serves past 60 was not measured
+   * again. */
+  const LAST_PAGE = 60;
+  const capNote = (n) => 'maxPages ' + n + ' cut to ' + LAST_PAGE + ': the site serves no page past ' + LAST_PAGE;
+  /* What restore() says about a saved stop. The stop comes back with the
+   * harvest, and step() reads nothing while a stop is set: SKILL.md said
+   * step(6) carries on after restore(), and a restored wall stop made no
+   * request at all (recheck 2026-10-18, F06). So the reply names the call
+   * that clears it. No stop, no note. Short: a suspect-wall reply carries
+   * the wall verdict too, and Chrome cuts a result at 1,000 characters. */
+  const restoreNote = (st) => {
+    const s = st.stop;
+    if (!s) return null;
+    if (s === 'exhausted') return 'stop exhausted: nothing is left to read. Export it';
+    if (s === 'page-cap' && st.page >= LAST_PAGE) return 'stop page-cap at page ' + LAST_PAGE + ': nothing is left to read. Export it';
+    const lift = s === 'request-budget' ? 'resume({ maxRequests })' : (s === 'page-cap' ? 'resume({ maxPages })' : 'resume()');
+    return 'stop ' + s + ': step() reads nothing until ' + lift +
+           (s === 'blocked' || s === 'suspect-wall' ? '. A wall: Step 2 first' : '');
   };
 
   /* The SSR payload sits behind an `init-data-start` comment marker and is a
@@ -510,14 +617,16 @@ function queryRelevance(query, titles) {
      *               unrated and <4.0 items, so this removes nothing it would
      *               have kept — it just stops wasting requests on rows that
      *               get dropped anyway.
-     *   maxPages    default 20   the LAST page number read (AliExpress hard
-     *               ceiling is page 60)
+     *   maxPages    default 20   the LAST page number read. AliExpress
+     *               serves no page past 60: a higher value is cut to 60 and
+     *               the plan says so in `note`
      *   maxRequests default 24   (the wall tripped near 50-60 in a session).
      *               0 means "no request left": it is NOT replaced by the
      *               default (it used to be, so a fully spent budget became 24)
      *   startPage   default 1    first page to fetch. A recovery harvest that
      *               cannot restore() starts after the pages already saved,
-     *               instead of spending its budget on them again
+     *               instead of spending its budget on them again. Above 60
+     *               it is refused: there is nothing to read there
      *   extra       raw extra query string, e.g. '&shpf_co=CN' or
      *               '&attr=11795-4362329' (attribute ids come from the
      *               searchRefineFilters module — see SKILL.md step 1)
@@ -532,9 +641,14 @@ function queryRelevance(query, titles) {
       }
       const slug = slugify(opts.query);
       if (!slug) throw new Error('harvest: opts.query is required (English keywords)');
-      const maxPages = num(opts.maxPages, 20, 'maxPages');
+      let maxPages = num(opts.maxPages, 20, 'maxPages');
       const maxRequests = num(opts.maxRequests, 24, 'maxRequests');
       const startPage = Math.max(1, num(opts.startPage, 1, 'startPage'));
+      if (startPage > LAST_PAGE) {
+        throw new Error('harvest: startPage ' + startPage + ' is past page ' + LAST_PAGE + ', the last page the site serves');
+      }
+      const note = maxPages > LAST_PAGE ? capNote(maxPages) : null;
+      if (note) maxPages = LAST_PAGE;
       let base = 'https://he.aliexpress.com/w/wholesale-' + slug +
                  '.html?SortType=total_tranpro_desc';
       if (opts.fourStar !== false) base += '&selectedSwitches=filterCode%3A4StarRating';
@@ -550,30 +664,33 @@ function queryRelevance(query, titles) {
         running: false, backup: null, startedAt: Date.now(),
       };
       // Saved at once, so a hang on page 1 can never leave an older run of
-      // this query as the newest backup.
+      // this query as the backup saved last.
       this.st.backup = persist(this.st);
       /* No query string in anything returned to the operator. The Chrome
        * connector replaces a whole result with "[BLOCKED: Cookie/query string
        * data]" when it contains one (measured 2026-09-14); the in-app browser
        * does not care. debugUrl() has the full URL for the in-app browser. */
-      return { query: this.st.query,
+      return Object.assign({ query: this.st.query,
                searchPath: '/w/wholesale-' + slug + '.html',
                sort: 'total_tranpro_desc', fourStar: this.st.fourStar,
                extraApplied: !!this.st.extra,
-               startPage, maxPages, maxRequests };
+               startPage, maxPages, maxRequests }, note ? { note } : {});
     },
 
     /* Reload a harvest saved in localStorage (see BACKUP above), in this tab
-     * or a fresh one on the same origin. With no query, the newest backup is
-     * taken. The state comes back as it was saved: items, pages read,
+     * or a fresh one on the same origin. With no query, the run SAVED last
+     * is taken (not the one started last). The state comes back as it was
+     * saved: items, pages read,
      * requests spent and the stop reason, so step() carries on from the next
-     * unread page and the request budget keeps counting. */
+     * unread page and the request budget keeps counting. A saved stop comes
+     * back too: then step() reads nothing until resume() clears it, and the
+     * reply's `note` says so (see restoreNote). */
     restore(query) {
       if (this.st && this.st.running) return { err: 'a step() loop is running; wait until status().running is false' };
       const ls = storage();
       if (!ls) return { err: 'localStorage unavailable: no backup can exist in this page' };
       let best = null;
-      for (const k of backupKeys()) { // newest first
+      for (const k of backupKeys()) { // saved last first
         if (query && parseKey(k).slug !== slugify(query)) continue;
         let o = null;
         try { o = JSON.parse(ls.getItem(k)); } catch (e) { continue; }
@@ -587,12 +704,13 @@ function queryRelevance(query, titles) {
       st.pages = st.pages || [];
       st.items.forEach((i) => st.seen.add(String(i.id)));
       this.st = st;
+      const note = restoreNote(st);
       return Object.assign(this.status(), {
         restored: true, savedAt: new Date(best.savedAt || 0).toISOString(),
-      });
+      }, note ? { note } : {});
     },
 
-    /* Saved harvests in localStorage, newest first. No URL, no query string. */
+    /* Saved harvests in localStorage, saved last first. No URL, no query string. */
     backups() {
       const ls = storage();
       if (!ls) return [];
@@ -605,7 +723,7 @@ function queryRelevance(query, titles) {
                      savedAt: new Date(o.savedAt || 0).toISOString() });
         } catch (e) { out.push({ query: parseKey(k).slug, err: 'unreadable' }); }
       }
-      return out; // newest first, at most MAX_BACKUPS
+      return out; // saved last first, at most MAX_BACKUPS
     },
 
     /* Delete a backup once its payload is safely on disk. */
@@ -625,8 +743,8 @@ function queryRelevance(query, titles) {
      * only way on was start(), which threw the harvest away and spent requests
      * re-reading it. 'exhausted' is a real end and is not cleared. A raised
      * maxRequests / maxPages is taken here, so a 'request-budget' or
-     * 'page-cap' stop can be lifted on purpose. The page that hit the wall
-     * was not counted, so it is fetched again. */
+     * 'page-cap' stop can be lifted on purpose, up to page 60 (LAST_PAGE).
+     * The page that hit the wall was not counted, so it is fetched again. */
     resume(opts) {
       const s = this.st;
       if (!s) return { err: 'call start() or restore() first' };
@@ -634,12 +752,18 @@ function queryRelevance(query, titles) {
       opts = opts || {};
       s.maxRequests = num(opts.maxRequests, s.maxRequests, 'maxRequests');
       s.maxPages = num(opts.maxPages, s.maxPages, 'maxPages');
+      const note = s.maxPages > LAST_PAGE ? capNote(s.maxPages) : null;
+      if (note) s.maxPages = LAST_PAGE;
       if (s.stop === 'exhausted') {
         return Object.assign(this.status(), { err: 'the stream already ran dry (exhausted): nothing to resume' });
       }
+      if (s.stop === 'page-cap' && s.page >= LAST_PAGE) {
+        return Object.assign(this.status(), { err: 'page ' + LAST_PAGE + ' was read and the site serves no page past it: ' +
+          'nothing to resume. The stream verdict stays truncated.' }, note ? { note } : {});
+      }
       const was = s.stop;
       s.stop = null; s.wall = null; s.lastErr = null;
-      return Object.assign(this.status(), { resumed: was, nextPage: s.page + 1 });
+      return Object.assign(this.status(), { resumed: was, nextPage: s.page + 1 }, note ? { note } : {});
     },
 
     /* The full first-page URL. In-app browser only: the Chrome connector
@@ -694,6 +818,12 @@ function queryRelevance(query, titles) {
      *                  via:'form'). Only the receiver's own output can say
      *                  "saved". The state was written to localStorage first,
      *                  so if nothing was saved, restore() brings it back.
+     *
+     * via:'form' (what SKILL.md tells the operator to use, since both
+     * browsers refused the loopback fetch on 2026-10-18) never tries the
+     * fetch. It always posts the form, so it navigates even to a dead port,
+     * visible tab or hidden: the curl check before send() is the only guard,
+     * and restore() is the way back (recheck 2026-10-18, F05).
      *
      * WHY (measured 2026-10-17): a refused fetch used to fall through to the
      * form, exactly like a held one. With the receiver gone (it had exited
@@ -835,7 +965,9 @@ function queryRelevance(query, titles) {
       s.running = true;
       try {
         for (let k = 0; k < (n || 1) && !s.stop; k++) {
-          if (s.page >= s.maxPages) { s.stop = 'page-cap'; break; }
+          // LAST_PAGE as well: a state restored or carried over from older
+          // code can hold a maxPages above it.
+          if (s.page >= s.maxPages || s.page >= LAST_PAGE) { s.stop = 'page-cap'; break; }
           if (s.requests >= s.maxRequests) { s.stop = 'request-budget'; break; }
           const p = s.page + 1;
           let html = '', finalUrl = '', status = null;
@@ -856,8 +988,13 @@ function queryRelevance(query, titles) {
           // runs only when nothing parsed, on the page's visible text, so the
           // big-HTML-no-content rule can fire at all (see pageText()).
           const c = carve(html);
+          /* A page whose payload parsed served content. Its text counts only
+           * for the wall's own sentences, as in listing.js: one title with
+           * "please slide" in the payload made a served page 'blocked'
+           * (recheck, 2026-10-18). The URL and the captcha HTML always count. */
+          const wallText = c.err ? html : (STRONG_WALL.test(pageText(html)) ? pageText(html) : '');
           let verdict = wallVerdict({
-            url: finalUrl, text: html, html: html, dataNodes: c.err ? 0 : 1,
+            url: finalUrl, text: wallText, html: html, dataNodes: c.err ? 0 : 1,
           });
           // Only when the anchor itself is missing. A json or unbalanced error
           // means the payload DID come back (rule 1), so it stays a
@@ -1092,7 +1229,12 @@ function queryRelevance(query, titles) {
     H.st.backup = persist(H.st);
   }
   window.__aeHarvest = H;
+  /* The export named here is the one SKILL.md step 3 gives: a plain
+   * send(8765) was refused by both browsers on 2026-10-18, so naming it
+   * cost one wasted call per export (review, 2026-10-18). */
   return 'aeHarvest ready' + (H.st ? ' (kept the current harvest: ' + H.st.items.length + ' items; start() begins a new one)' : '') +
-         ' — __aeHarvest.start({query:"..."}) then await __aeHarvest.step(6) until done (top-level await); ' +
-         'await __aeHarvest.send(8765) to export; __aeHarvest.restore() reloads a saved harvest';
+         '. __aeHarvest.start({query:"..."}) then await __aeHarvest.step(6) until done (top-level await). ' +
+         'To export, check the receiver (curl -s http://127.0.0.1:8765/ answers ok), then ' +
+         'await __aeHarvest.send(8765, {via:\'form\'}) (a plain send() was refused by both browsers on 2026-10-18). ' +
+         '__aeHarvest.restore() reloads a saved harvest';
 })()

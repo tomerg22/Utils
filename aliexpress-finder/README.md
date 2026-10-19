@@ -63,9 +63,9 @@ read as they are, never changed.
 | File | Role |
 |------|------|
 | `SKILL.md` | The skill: 8-step workflow plus gotchas verified against the live site |
-| `scripts/harvest.js` | Browser-side paged harvester. Resumable, reads until an empty page or a page with no new ids (the server's `finished` flag is not trusted: it was true on every page of a 230-item stream), detects the anti-bot wall *before* parsing so a block can never be mistaken for a parse error, and flags a stream whose titles do not match the query (`off-query`). Saves its state to `localStorage` after every page; `restore()` reloads it in a fresh tab, `resume()` clears a stop, `startPage` skips saved pages. `send()` replies `DELIVERED` / `NOT DELIVERED` / `UNCONFIRMED` and never navigates after a refused fetch. Runs unchanged in both browsers: `forceEnglish()` for the logged-out in-app browser, `expose()`/`chunks()` to export through the Chrome connector, both `sold` and `נמכר` parsed, currency per item, tab `visibility` reported |
-| `scripts/extract.js` | Single-page extractor for the currently loaded page. Reads the embedded `_dida_config_._init_data_` payload (~60 records), falls back to DOM scraping (`₪`, `US $`, `€`, `£`), and flags captcha interstitials |
-| `scripts/receiver.mjs` | Loopback HTTP receiver: `__aeHarvest.send(port)` POSTs the harvest payload to it from either browser and it writes `harvest-<query>-<stamp>.json`, replying with the path. No retyping, no chunking. Takes any number of payloads, exits after 60 idle minutes, `GET /` answers `ok …` |
+| `scripts/harvest.js` | Browser-side paged harvester. Resumable, reads until an empty page or a page with no new ids (the server's `finished` flag is not trusted: it was true on every page of a 230-item stream), detects the anti-bot wall *before* parsing so a block can never be mistaken for a parse error, and flags a stream whose titles do not match the query (`off-query`). Saves its state to `localStorage` after every page; `restore()` reloads the run saved last in a fresh tab, `resume()` clears a stop, `startPage` skips saved pages, and `maxPages` stops at page 60, the last page the site serves. `send()` replies `DELIVERED` / `NOT DELIVERED` / `UNCONFIRMED`. `send(port, {via: 'form'})`, the export to use, always posts the form, so it navigates even to a dead port: curl the receiver first, and `restore()` is the way back. A plain `send()` never navigates after a refused fetch. Runs unchanged in both browsers: `forceEnglish()` for the logged-out in-app browser, `expose()`/`chunks()` to export through the Chrome connector, both `sold` and `נמכר` parsed, currency per item, tab `visibility` reported |
+| `scripts/extract.js` | Single-page extractor for the currently loaded page. Reads the embedded `_dida_config_._init_data_` payload (~60 records), falls back to DOM scraping (`₪`, `US $`, `€`, `£`), and flags captcha interstitials. The result also stays on `window.__aeExtract`, because the Chrome connector cuts the return at 1,000 characters: return pieces of it, or post it all to the receiver with `__aeExtract.send(port)` |
+| `scripts/receiver.mjs` | Loopback HTTP receiver: after a `curl` check, `__aeHarvest.send(port, {via: 'form'})` POSTs the harvest payload to it from either browser (a plain `send(port)` fetch was refused by both on 2026-10-18), and it writes `harvest-<query>-<stamp>.json` and prints `saved <path>` in its own output. No retyping, no chunking. Takes any number of payloads, exits after 60 idle minutes, `GET /` answers `ok …` |
 | `scripts/decode.mjs` | Fallback decoder and merger: reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps in any order (refuses a partial set), or from a plain payload JSON or an array of them; several payloads are merged and deduped, never dropped |
 | `scripts/fixtures/` | Test data: the titles of two real 2026-10-17 harvests (a craft-wire stream served for `wired usb mouse`, and a real mouse stream), for the relevance tests |
 | `scripts/build.mjs` | Writes `scripts/dist/*.min.js`, the browser files without comments, for the install paste (about 45% of the source). Run it after editing a browser file; the tests fail on a stale copy |
@@ -73,7 +73,7 @@ read as they are, never changed.
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). For hardware the label on the case is the spec sheet |
 | `scripts/rank.mjs` | Scoring: shrunk quality (the listing's own rating in final mode) + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification, `--constraint` hard requirement filters, absence-is-not-evidence, off-query and tie-at-cutoff warnings, `sold-unparsed` and `own-reviews-unknown` set-asides, strict flag values |
 | `scripts/lib.mjs` | Pure helpers shared by the ranker, the browser files, the step-5 reader and the tests |
-| `scripts/test.mjs` | Test suite — 761 assertions, including the step-5 reader pulled out of `SKILL.md` and the harvest scenarios run on the `dist` copy |
+| `scripts/test.mjs` | Test suite — 1125 assertions, including the step-5 reader pulled out of `SKILL.md` and the harvest scenarios run on the `dist` copy |
 
 ## Tests
 
@@ -122,6 +122,16 @@ found during live runs:
 - a product size marked as the carton, a bold-label size skipped, a wall or
   an HTTP error page read as the description, the description cut off
 - a title's "Bluetooth 5.0" read as the rating
+- a correct stream called off-query: short plurals (`toys`, `boxes`), `-ss`
+  nouns (`dresses`), split compounds (`Screw Driver`), English titles with
+  `pour` or `les`; backups ranked by start time, not save time; a `maxPages`
+  past the site's page 60 that ended as all results
+- a lunch box's own size called the carton; a product size lost when the
+  same line held the package size; a real description that starts with `[`
+  thrown away with its images; a served search page called a wall because
+  a title said "please slide"; the step-5 reader cutting the selected option
+  first, taking the first digit of the sold count, and reading spec rows past
+  the end of the spec block
 
 `harvest.js`, `extract.js` and `listing.js` run in the browser and cannot import
 `lib.mjs`, so each inlines the helpers it needs (`parseSold`, `SOLD_RE`,

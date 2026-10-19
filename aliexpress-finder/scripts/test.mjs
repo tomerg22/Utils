@@ -4109,6 +4109,77 @@ await block('R-F12', async () => {
   ok('R-F12: SKILL.md says a bad --require regex exits 2', /a blank\s+`--require ''` and a `--require` regex that does not compile/.test(skillSrc));
 });
 
+console.log('\nR-SPEC-MORE: the spec table\'s "View more" is clicked before its rows are read (live 2026-10-19)');
+await block('R-SPEC-MORE', async () => {
+  /* Live, signed-in Chrome, 2026-10-19: the Specifications table showed 6
+   * rows; "Type: Bluetooth Wireless" appeared only after its "View more"
+   * button (class comet-v2-btn ... specification--btn--...) was clicked:
+   * 15 rows in the same call, and the button was then removed. The step-5
+   * reader never clicked it, so a "wireless" requirement looked unknown. */
+  const row = (k, val) => ({ className: 'specification--prop--J', textContent: k + val, shadowRoot: null,
+    querySelector: (sel) => (/title/.test(sel) ? { textContent: k } : /desc/.test(sel) ? { textContent: val } : null) });
+  const ldj = [{ textContent: JSON.stringify({ '@type': 'Product', aggregateRating: { ratingValue: '4.8', reviewCount: '1026' }, offers: { price: '8.49', priceCurrency: 'USD' } }) }];
+  const page = () => {
+    const els = [row('Power Type', 'Rechargeable'), row('Number of Rollers', '1 pcs')];
+    const hidden = [row('Interface Type', 'Bluetooth'), row('Battery Included', 'Yes'), row('Type', 'Bluetooth Wireless')];
+    const clicks = { spec: 0, review: 0 };
+    const btn = { className: 'comet-v2-btn comet-v2-btn-slim comet-v2-btn-large specification--btn--Y4pYc4b', textContent: 'View more',
+      shadowRoot: null, querySelector: () => null,
+      click() { clicks.spec++; els.splice(els.indexOf(btn), 1); els.push(...hidden); } };
+    const review = { className: 'comet-v2-btn comet-v2-btn-slim comet-v2-btn-large', textContent: 'View more', shadowRoot: null,
+      querySelector: () => null, click() { clicks.review++; } };
+    els.push(review, btn);
+    const document = { title: 'Mouse', body: { innerText: RV.gyro }, querySelectorAll: (sel) => (/ld\+json/.test(sel) ? ldj : [...els]) };
+    return { document, clicks };
+  };
+  const s5 = (pg) => JSON.parse(new Function('document', 'location', 'return (' + step5 + '\n)')(pg.document, { pathname: '/item/1005008556584698.html' }));
+  const p1 = page();
+  const g1 = s5(p1);
+  eq('R-SPEC-MORE: step 5 reads the rows behind "View more"', g1.spec,
+    { 'Power Type': 'Rechargeable', 'Interface Type': 'Bluetooth', 'Battery Included': 'Yes', Type: 'Bluetooth Wireless' });
+  eq('R-SPEC-MORE: step 5 clicks the spec button once and says so', [p1.clicks.spec, g1.specMore], [1, 1]);
+  eq('R-SPEC-MORE: step 5 does not click the reviews "View more"', p1.clicks.review, 0);
+  const g1b = s5(p1);
+  eq('R-SPEC-MORE: a second run finds no button and still reads every row', [g1b.specMore, g1b.spec.Type, p1.clicks.spec], [0, 'Bluetooth Wireless', 1]);
+
+  // listing.js: expand() clicks "View more" leaves by text, at most 8. Eight
+  // earlier ones (review images, review list, related items) use up the cap,
+  // so the spec button must be clicked by its class.
+  const src = RUN('listing.js');
+  const leaf = (tag, p = {}) => ({ tagName: tag, children: [], textContent: p.text || '', className: p.cls || '',
+    naturalWidth: 0, naturalHeight: 0, currentSrc: '', src: '', shadowRoot: null, parentElement: null,
+    getAttribute: () => null, querySelector: () => null, querySelectorAll: () => p.qsa || [],
+    closest: () => null, click: p.click || (() => {}), id: '', nodeType: 1,
+    childNodes: p.text ? [{ nodeType: 3, nodeValue: p.text }] : [] });
+  const lrow = (k, val) => { const t = leaf('DIV', { cls: 'specification--title--S', text: k }); const v = leaf('DIV', { cls: 'specification--desc--D', text: val });
+    return [leaf('DIV', { cls: 'specification--prop--J', qsa: [t, v] }), t, v]; };
+  const lpage = (decoys) => {
+    const els = [];
+    for (let i = 0; i < decoys; i++) els.push(leaf('SPAN', { text: 'View more', cls: 'list-customer-show--mask--G' }));
+    els.push(...lrow('Power Type', 'Rechargeable'));
+    let specClicks = 0;
+    const btn = leaf('BUTTON', { cls: 'comet-v2-btn comet-v2-btn-large specification--btn--Y4pYc4b', text: 'View more',
+      click: () => { specClicks++; els.splice(els.indexOf(btn), 1); els.push(...lrow('Type', 'Bluetooth Wireless')); } });
+    els.push(btn);
+    const document = { body: { scrollHeight: 5000, innerText: 'x'.repeat(2500) }, documentElement: { outerHTML: '' },
+      querySelectorAll: (sel) => (/ld\+json/.test(sel || '') ? [] : [...els]) };
+    const L = new Function('window', 'document', 'location', `${src}; return window.__aeListing;`)({ scrollTo() {}, document }, document, { href: 'https://he.aliexpress.com/item/1.html' });
+    return { L, clicks: () => specClicks };
+  };
+  const l1 = lpage(8);
+  const r1 = await l1.L.read({ description: false });
+  eq('R-SPEC-MORE: listing.js reads the hidden Type row though 8 other "View more" used the expand() cap',
+    [r1.specs.Type, r1.specsSource], ['Bluetooth Wireless', 'dom']);
+  eq('R-SPEC-MORE: listing.js clicked the spec button once and reports it', [l1.clicks(), r1.specExpanded], [1, 1]);
+  const l2 = lpage(0);
+  const r2 = await l2.L.read({ description: false });
+  eq('R-SPEC-MORE: with no decoys the button is still clicked only once', [l2.clicks(), r2.specs.Type], [1, 'Bluetooth Wireless']);
+  const l3 = lpage(0);
+  const r3 = await l3.L.read({ description: false, expand: false });
+  eq('R-SPEC-MORE: read({ expand: false }) clicks nothing', [l3.clicks(), r3.specExpanded, r3.specs.Type], [0, 0, undefined]);
+  ok('R-SPEC-MORE: SKILL.md says the reader clicks the spec "View more" first', /clicks the Specifications table's\s+"View more" button first/.test(skillSrc));
+});
+
 // ---------------------------------------------- the whole suite on dist/
 /* The operator pastes dist/*.min.js, so the suite runs again on them: every
  * scenario above, not a handful (review, 2026-10-18: only 4 assertions

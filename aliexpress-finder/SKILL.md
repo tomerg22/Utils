@@ -856,6 +856,17 @@ here, between the markers, and run the tests after any change.
   // A trailing colon ("Type:") is not part of the name, as in listing.js.
   const want = (k) => WANT.find((w) => w.toLowerCase() === String(k || '').trim().replace(/[:：]$/, '').trim().toLowerCase());
   const spec = {}, opts = [];
+  // The table shows about 6 rows until its "View more" button is clicked.
+  // Measured live 2026-10-19: 6 rows, then 15 in the same call, and the
+  // button is gone after the click. So click it first, then read.
+  let specMore = 0;
+  const more = (r) => { for (const e of r.querySelectorAll('*')) {
+    if (/specification--btn/.test(String(e.className || '')) && typeof e.click === 'function') {
+      try { e.click(); specMore++; } catch (x) {}
+    }
+    if (e.shadowRoot) more(e.shadowRoot);
+  } };
+  more(document);
   const walk = (r) => { for (const e of r.querySelectorAll('*')) {
     const c = String(e.className || '');
     if (/sku-item--(image|text)|sku-property-item/.test(c)) {
@@ -901,7 +912,7 @@ here, between the markers, and run the tests after any change.
     reviews: rv.own, ownRating: rv.ownRating,
     pooledReviews: ar.reviewCount != null ? Number(ar.reviewCount) : null, pooledNote: rv.pooledNote,
     price: o.price != null ? Number(o.price) : null, currency: o.priceCurrency || null,
-    soldRaw: sold ? sold[1].replace(/\s/g, '') : null, spec, specFrom, optionCount: uo.length, options: shown.map(short) };
+    soldRaw: sold ? sold[1].replace(/\s/g, '') : null, spec, specFrom, specMore, optionCount: uo.length, options: shown.map(short) };
   // Never past the connector's 1,000 characters: options go first, named.
   let s = JSON.stringify(out);
   // Unselected ones are cut first, from the end: the selected ones name the
@@ -955,7 +966,13 @@ What comes back, and why each field is there (all measured 2026-09-25):
   `Interface Type`, `Power Type`, `Power Source`, `Battery Included`; edit `WANT` to match
   the user's hard requirements), and `specFrom` says where they came from:
   `dom` (the `specification--prop` rows), `text` (the lines after a
-  "Specifications" heading) or `none`. The class names
+  "Specifications" heading) or `none`. The reader clicks the Specifications table's
+  "View more" button first (class `specification--btn`); `specMore` says
+  how many it clicked. Measured live on 2026-10-19: the table showed 6
+  rows, and `Type: Bluetooth Wireless` appeared only after that click (15
+  rows, in the same call; the button is then gone, so a second run is
+  safe). Before this, the reader returned only `Power Type`, and a
+  "wireless" requirement looked unknown on pages that stated it. The class names
   (`specification--prop`, `--title`, `--desc`) were measured on a live page
   on 2026-10-18 in signed-in Chrome: the `dom` path read the rows. Trust a
   `dom` row. The `text` line layout is not measured live yet. It stops at
@@ -979,7 +996,8 @@ window.__r = await __aeListing.read()   // async since 2026-09-29: top-level awa
 [__r.blocked, __r.suspectedWall, __r.warnings]  // read `blocked` / `suspectedWall` first, then warnings
 ```
 
-It expands every "show more" first, then returns **text and images together**:
+It expands every "show more" first (and the Specifications table's own
+"View more", by its class, reported as `specExpanded`), then returns **text and images together**:
 `sizeLines`, `ratingLines`, `variants`, `selectedVariant` (the first) and
 `selectedVariants` (one per option property), `specs` / `specsSource` (the
 whole Specifications table), `reviews`, `gallery`, `descriptionImages`,

@@ -665,6 +665,20 @@ function wallVerdict(sig) {
       return clicked;
     },
 
+    /* Click the Specifications table's "View more" button, found by its
+     * class (specification--btn), not by its text. Returns how many were
+     * clicked. The button is gone after the click, so this is safe to call
+     * again: it then clicks nothing. */
+    expandSpecs() {
+      let clicked = 0;
+      walk(document, (e) => {
+        const c = typeof e.className === 'string' ? e.className : '';
+        if (!/specification--btn/.test(c) || typeof e.click !== 'function') return;
+        try { e.click(); clicked++; } catch (err) { /* not clickable */ }
+      });
+      return clicked;
+    },
+
     /* Cheap content fingerprint. Compare before/after any mutation (expanding,
      * selecting a variant) to prove whether a re-read is owed — failure 2. */
     fingerprint() {
@@ -907,6 +921,11 @@ function wallVerdict(sig) {
       });
 
       // ---- specification rows ------------------------------------------
+      // The table shows about 6 rows until its own "View more" button is
+      // clicked (measured live 2026-10-19: 6 rows, then 15 in the same
+      // call). expand() may reach it, but only within its cap and only by
+      // its English or Hebrew text, so the button is clicked here by class.
+      const specExpanded = opts.expand === false ? 0 : this.expandSpecs();
       const specs = readSpecs();
 
       // Review counts, read AFTER expanding: the review block renders lazily.
@@ -1013,6 +1032,7 @@ function wallVerdict(sig) {
           visibility: vis,
           warnings,
           expandedClicks: expanded,
+          specExpanded,
           fingerprintBefore: before,
           fingerprint: after,
           pageGrew: after.height !== before.height || after.textLen !== before.textLen,

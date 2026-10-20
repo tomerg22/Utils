@@ -67,13 +67,13 @@ read as they are, never changed.
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. Reads the embedded `_dida_config_._init_data_` payload (~60 records), falls back to DOM scraping (`₪`, `US $`, `€`, `£`), and flags captcha interstitials. The result also stays on `window.__aeExtract`, because the Chrome connector cuts the return at 1,000 characters: return pieces of it, or post it all to the receiver with `__aeExtract.send(port)` |
 | `scripts/receiver.mjs` | Loopback HTTP receiver: after a `curl` check, `__aeHarvest.send(port, {via: 'form'})` POSTs the harvest payload to it from either browser (a plain `send(port)` fetch was refused by both on 2026-10-18), and it writes `harvest-<query>-<stamp>.json` and prints `saved <path>` in its own output. No retyping, no chunking. Takes any number of payloads, exits after 60 idle minutes, `GET /` answers `ok …` |
 | `scripts/decode.mjs` | Fallback decoder and merger: reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps in any order (refuses a partial set), or from a plain payload JSON or an array of them; several payloads are merged and deduped, never dropped |
-| `scripts/fixtures/` | Test data: the titles of two real 2026-10-17 harvests (a craft-wire stream served for `wired usb mouse`, and a real mouse stream), for the relevance tests |
+| `scripts/fixtures/` | Test data: the titles of real harvests for the relevance tests. 2026-10-17: a craft-wire stream served for `wired usb mouse`, and a real mouse stream. 2026-10-19: POCO phones served for `poco f7 ultra wallet case`, USB-C cables served for `type c iem`, three correct streams, and 18 labelled live captures |
 | `scripts/build.mjs` | Writes `scripts/dist/*.min.js`, the browser files without comments, for the install paste (about 45% of the source). Run it after editing a browser file; the tests fail on a stale copy |
 | `scripts/listing.js` | Detail-page reader (`await read()`). Expands the page, then returns text **and** images in one call; walks the shadow DOM (a bare `querySelectorAll('img')` sees 1 image of dozens); `gallery` is the product's own photos only, full size, with other products counted apart; reads the description from its shadow root, or fetches it when a hidden tab left it unrendered; separates product size from carton size, reads options only from the option selector (every selected one), returns the Specifications rows and own vs pooled review counts, reports tab `visibility` and warnings |
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). For hardware the label on the case is the spec sheet |
 | `scripts/rank.mjs` | Scoring: shrunk quality (the listing's own rating in final mode) + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification, `--constraint` hard requirement filters, absence-is-not-evidence, off-query and tie-at-cutoff warnings, `sold-unparsed` and `own-reviews-unknown` set-asides, strict flag values |
 | `scripts/lib.mjs` | Pure helpers shared by the ranker, the browser files, the step-5 reader and the tests |
-| `scripts/test.mjs` | Test suite — 1142 assertions, including the step-5 reader pulled out of `SKILL.md` and the harvest scenarios run on the `dist` copy |
+| `scripts/test.mjs` | Test suite: 1258 assertions, including the step-5 reader pulled out of `SKILL.md` and the harvest scenarios run on the `dist` copy |
 
 ## Tests
 
@@ -115,6 +115,9 @@ found during live runs:
   a refused fetch, with no backup; the receiver had exited after one payload
 - an off-category stream (craft wire for `wired usb mouse`) reported as all
   results, and ranked without a warning
+- an off-category stream carried by one query word reported as all results:
+  POCO phones for `poco f7 ultra wallet case` (the brand word `poco`), USB-C
+  cables for `type c iem` (the connector word `type`)
 - a recovery harvest that re-read saved pages, a zero budget turned into 24,
   and a decoder that kept only the first of two payloads
 - the pooled rating ranked with the own count, a researched house brand

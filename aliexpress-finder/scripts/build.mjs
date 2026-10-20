@@ -174,8 +174,10 @@ export function sameProgram(a, b) {
     const tree = (s) => JSON.stringify(acorn.parse(s, { ecmaVersion: 'latest', allowReturnOutsideFunction: true }),
       (k, v) => (k === 'start' || k === 'end' ? undefined : v));
     process.stdout.write(tree(a) === tree(b) ? 'same' : 'differ');`;
+  // A timeout: one test run hung 12+ minutes on this child (MUT-13, review
+  // 2026-10-20). A child that times out answers null, as a crash does.
   const r = spawnSync(process.execPath, ['--expose-internals', '-e', code], { input: JSON.stringify([a, b]), encoding: 'utf8',
-    maxBuffer: 1 << 28 });
+    maxBuffer: 1 << 28, timeout: 120000 });
   if (r.status !== 0) return null;
   return r.stdout === 'same';
 }

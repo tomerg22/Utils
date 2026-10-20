@@ -344,7 +344,18 @@ if (reqRe && all.length >= 10 && requireDropped >= 0.9 * all.length) warnings.pu
  * payload that names its query, whatever the harvester said. */
 for (const env of envelopes) {
   const rel = queryRelevance(env.query, env.items.map((x) => x && x.title));
-  if (rel.warning && !warnings.includes(rel.warning)) warnings.push(rel.warning);
+  /* A decode.mjs merge of DIFFERENT queries is checked here as one pool
+   * under "q1 | q2". Only the share rule is fair on that pool: the
+   * connector and missing-keyword rules read one query's words as missing
+   * when its stream is small next to the other (F1, review 2026-10-19:
+   * 326 mice + 15 POCO cases fired off-query-keywords). Each part was
+   * checked on its own stream when it was merged; its warning is below. */
+  // Queries are compared as words: "Wired USB mouse" and "wired  usb mouse" are one
+  // stream (CR-3, review 2026-10-20).
+  const norm = (q) => String(q).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const queries = new Set((Array.isArray(env.parts) ? env.parts : []).map((p) => p && p.query).filter(Boolean).map(norm));
+  const poolOnly = env.source === 'merged' && queries.size > 1;
+  if (rel.warning && !warnings.includes(rel.warning) && (!poolOnly || /^off-query-results/.test(rel.warning))) warnings.push(rel.warning);
   // The payload's own warnings (a part's off-query warning inside a
   // decode.mjs merge, merged-queries, …), all of them: on a merge this
   // file's own check sees the joined pool, where a good part can hide an

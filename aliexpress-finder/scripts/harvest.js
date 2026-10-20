@@ -280,11 +280,80 @@ function wallVerdict(sig) {
  * English keywords: on the Hebrew storefront "כבל USB Type C Samsung" is a
  * cable whose noun is Hebrew. Such titles are not counted; when they are
  * half or more, the stream is unmeasured, never off-query.
+ *
+ * ONE WORD CAN CARRY A WHOLE OTHER CATEGORY (live 2026-10-19, two streams
+ * in one day, both reported as exhausted-all-results with no warning):
+ *   - "poco f7 ultra wallet case" was served as 143 items: about 109 POCO
+ *     phones, 31 tablets, 1 tablet case and 2 shipping-fee links, no phone
+ *     case. 139 of the 143 titles held the brand word "poco", and the share
+ *     was 0.979, while f7 (0.021), wallet (0) and case (0.007) were all but
+ *     absent.
+ *   - "type c iem" was served as 49 items: mostly USB-C cables and
+ *     chargers, also flash drives, nail tips and car lights, no IEM. The
+ *     word "type" was in 86% of the titles; iem was in none.
+ * Two narrow rules catch this. Both were chosen by scoring variants on
+ * labelled streams (real harvests and their page cuts, live captures,
+ * synthetic sets), and two reviews then ran the code (2026-10-19, -20).
+ *   1. `off-query-connector`: the query holds a CONNECTOR word (`type`,
+ *      `usb`, `lightning`, `thunderbolt`, `hdmi`, `magsafe`; `typec` and
+ *      `usbc` are split into two words first), a connector word is in half
+ *      the titles or more, and EVERY other keyword is in fewer than 15% of
+ *      the titles. A plug is on cables, chargers, hubs and flash drives
+ *      alike, so it cannot show that the product is there. For this rule a
+ *      keyword also counts when a title names the same goods in other words
+ *      (GOODS below: "Cord" for "cable", "Earbuds" for "earpods").
+ *      Connector words still count for the share. A first version that
+ *      stopped counting them called the real IEM stream off-query when a
+ *      harvest stopped after page 1 or 2: its titles say "Earphones" and
+ *      "In Ear Monitor", synonyms of "iem", and "Type-C". 15%, not 5%: the
+ *      live "type c 120w" stream (cables, flash drives) held "120w" in 10%
+ *      of its titles, and "iem" is in 45% to 50% of the real IEM stream.
+ *   2. `off-query-keywords`: the share passed, yet 3 OR MORE of the
+ *      counted keywords, and more than half of them, are each in fewer
+ *      than 5% of the titles. Connector words are not counted when the
+ *      query has other words. A brand or model word cannot be listed
+ *      (there are too many), so the rule counts what is missing instead.
+ *      A correct stream usually lacks one or two query words: "mouse
+ *      corded" over 326 real mice lacks "corded", and a two-word brand or
+ *      two UK spellings lack 2. "dupe" is a stop word: sellers never write
+ *      it. "type c iem" and "mouse corded" have the same shares (one word
+ *      near 1, one near 0); only rule 1 tells them apart.
+ * A UK form also gives its US form ("aluminium", "Organisers"), and
+ * "magnetic" gives "magnet".
+ * `missingKeywords` lists the counted keywords under 5% of the titles,
+ * `connectorKeywords` the connector words of the query. On both warnings
+ * `offSample` holds up to 3 titles to read before acting: on rule 1,
+ * titles that hold no other keyword; on rule 2, titles that lack every
+ * missing keyword.
+ * WHAT IT STILL CANNOT SEE (each measured in a review): a stream that
+ * lacks only 1 or 2 query words ("iphone 15 case" served as iPhones; the
+ * real POCO phones for "poco wallet case" or "poco f7 case"); a device
+ * query served as its accessories ("canon eos r50" over camera straps and
+ * filters); a connector word the titles do not hold ("lightning earphones"
+ * over USB-C earphones). Its costs on correct streams: a spec written
+ * apart from the titles ("usb c 3 meter" over "3M" titles, "angled" for
+ * "90 Degree"), and attribute words sellers do not use ("whisper quiet
+ * cordless mouse" over silent wireless mice). Read `keywordShare`.
  */
 function queryRelevance(query, titles) {
-  var STOP = /^(and|for|the|with|set|sets|pcs|pc|new|of|in|on|to|a|an|kit|lot)$/;
+  var STOP = /^(and|for|the|with|set|sets|pcs|pc|new|of|in|on|to|a|an|kit|lot|dupe|dupes)$/;
+  var CONNECTOR = /^(type|usb|lightning|thunderbolt|hdmi|magsafe)$/;
+  var MISSING = 0.05;
+  var CONNECTOR_ALONE = 0.15;
+  var has = function (o, k) { return Object.prototype.hasOwnProperty.call(o, k); };
+  var UK = { aluminium: 'aluminum', jewellery: 'jewelry', colour: 'color', colours: 'colors', grey: 'gray',
+    tyre: 'tire', tyres: 'tires', metre: 'meter', metres: 'meters', centre: 'center', favourite: 'favorite',
+    organiser: 'organizer', mould: 'mold', storey: 'story', cheque: 'check', adaptor: 'adapter', fibre: 'fiber',
+    litre: 'liter', polarised: 'polarized', armour: 'armor', stabiliser: 'stabilizer', personalised: 'personalized',
+    pyjamas: 'pajamas', sabre: 'saber', moustache: 'mustache' };
+  var us = function (w) { return has(UK, w) ? UK[w] : w; };
   var words = function (s) { return String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean); };
-  var qwords = words(query);
+  // "usbc" and "typec" in a query are "usb c" and "type c": titles write
+  // "USB-C", whose "c" is one letter and never joins (F7, review 2026-10-19).
+  var qwords = [].concat.apply([], words(query).map(function (w) {
+    var m = w.match(/^(usb|type)c$/);
+    return m ? [m[1], 'c'] : [w];
+  }));
   // Each keyword once: "usb c to usb c cable" counted usb twice.
   var toks = qwords.filter(function (t, i, a) { return t.length >= 2 && !STOP.test(t) && a.indexOf(t) === i; });
   var list = (titles || []).map(function (t) { return String(t || ''); }).filter(Boolean);
@@ -342,7 +411,7 @@ function queryRelevance(query, titles) {
       if (out.indexOf(b) < 0) out.push(b);
     };
     add(w);
-    if (IRREGULAR[w]) add(IRREGULAR[w]);
+    if (has(IRREGULAR, w)) add(IRREGULAR[w]);
     if (w.length > 5 && /ives$/.test(w)) add(w.slice(0, -4) + 'ife');
     if (w.length > 5 && /ves$/.test(w)) add(w.slice(0, -3) + 'f');
     if (w.length > 4 && /ies$/.test(w)) add(w.slice(0, -3) + 'y');
@@ -351,23 +420,62 @@ function queryRelevance(query, titles) {
     if (w.length > 3 && /[^s]s$/.test(w)) add(w.slice(0, -1));
     var m = w.match(/^(.{4,}?)(ings|ing|ers|er|ed)$/);
     if (m) add(m[1]);
+    // "magnetic" is "magnet" (the user's own query "oxyled fridge magnet
+    // light motion" over "Magnetic" titles, review 2026-10-20). 6+ letters
+    // stay, so "organic" is never "organ" and "plastic" never "plast".
+    if (w.length > 7 && /ic$/.test(w)) add(w.slice(0, -2));
+    // A UK form also gives its US form, after the plural and -er/-ing
+    // stems: "Organisers" holds "organizer" (CR-1, review 2026-10-20).
+    out.slice().forEach(function (b) { if (has(UK, b)) add(UK[b]); });
     return out;
   };
   var meets = function (xs, ys) { return xs.some(function (x) { return ys.indexOf(x) >= 0; }); };
-  var kb = {};
-  toks.forEach(function (k) { kb[k] = bases(k); });
+  // Prototype-free maps: a query word like "constructor" is never held by
+  // every title through Object.prototype (F6, review 2026-10-19).
+  var kb = Object.create(null);
+  // A title that writes "TypeC" or "USBC" as one word holds "type" / "usb"
+  // (CR-2, review 2026-10-20: the query split had lost that match).
+  toks.forEach(function (k) { kb[k] = bases(k); if (k === 'type' || k === 'usb') kb[k].push(k + 'c'); });
   // Two query keywords side by side are one word too: "screw driver" is
   // held by a title that says "Screwdriver".
   var pairs = [];
   for (var qi = 0; qi + 1 < qwords.length; qi++) {
     if (toks.indexOf(qwords[qi]) >= 0 && toks.indexOf(qwords[qi + 1]) >= 0) {
-      pairs.push({ a: qwords[qi], b: qwords[qi + 1], bs: bases(qwords[qi] + qwords[qi + 1]) });
+      pairs.push({ a: qwords[qi], b: qwords[qi + 1], bs: bases(qwords[qi] + qwords[qi + 1]).concat(bases(us(qwords[qi]) + us(qwords[qi + 1]))) });
     }
   }
-  var per = {};
-  toks.forEach(function (k) { per[k] = 0; });
+  /* For rule 1 only: connector goods have a small, closed set of names. A
+   * title that names the same goods in other words ("Cord" for "cable",
+   * "Earbuds" for "earpods", "Pendrive" for "stick") holds that keyword for
+   * rule 1 (FA2-1, FA2-3, FA2-5, review 2026-10-20). The share rule and
+   * rule 2 do not use this table. "iem" is in no class, so "type c iem"
+   * over cables still warns. */
+  var GOODS = [['cable', 'cord', 'lead', 'wire', 'line'], ['charger', 'plug', 'brick', 'block', 'puck'],
+    ['adapter', 'adaptor', 'converter', 'connector'],
+    ['hub', 'splitter', 'multiport', 'expander', 'extender', 'dock', 'docking'],
+    ['dongle', 'adapter', 'converter', 'hub', 'splitter', 'multiport', 'dock', 'docking'],
+    ['switch', 'switcher', 'selector', 'multiplexer'], ['wallet', 'purse', 'billfold', 'cardholder'],
+    ['grip', 'popsocket', 'socket', 'kickstand'],
+    ['stick', 'pendrive', 'drive', 'key', 'disk', 'storage', 'memory'],
+    ['earphones', 'earbuds', 'headphones', 'earpods', 'airpods', 'buds', 'earpiece', 'handsfree', 'headset'],
+    ['cam', 'camera', 'webcam'], ['mic', 'microphone'], ['joypad', 'gamepad', 'controller', 'joystick']];
+  var goodsOf = Object.create(null);
+  toks.forEach(function (k) {
+    if (CONNECTOR.test(k)) return;
+    for (var gi = 0; gi < GOODS.length; gi++) {
+      var gb = [].concat.apply([], GOODS[gi].map(bases));
+      if (meets(kb[k], gb)) { goodsOf[k] = gb; break; }
+    }
+  });
+  var perGoods = Object.create(null);
+  // Titles that are a plug's own goods: cables, chargers, adapters.
+  var CABLE_GOODS = /^(cables?|cords?|leads?|wires?|line|chargers?|charging|adapters?|adaptors?|converters?|plugs?|bricks?)$/;
+  var cableGoods = 0;
+  var per = Object.create(null);
+  toks.forEach(function (k) { per[k] = 0; perGoods[k] = 0; });
   var on = 0;
   var off = [];
+  var gots = [];
   latin.forEach(function (t) {
     var ws = words(t);
     // ... and two title words side by side: "Screw Driver" is "screwdriver".
@@ -376,14 +484,20 @@ function queryRelevance(query, titles) {
     // 2026-10-19). A join must never undo the "wire is not wired" rule.
     var all = ws.slice();
     for (var wi = 0; wi + 1 < ws.length; wi++) {
-      if (ws[wi].length >= 2 && ws[wi + 1].length >= 2 && !/^(ed|er|es|ers|ing|ings)$/.test(ws[wi + 1])) all.push(ws[wi] + ws[wi + 1]);
+      if (ws[wi].length >= 2 && ws[wi + 1].length >= 2 && !/^(ed|er|es|ers|ing|ings)$/.test(ws[wi + 1])) {
+        all.push(ws[wi] + ws[wi + 1]);
+        all.push(us(ws[wi]) + us(ws[wi + 1]));
+      }
     }
     var wb = all.map(bases);
-    var got = {};
+    var got = Object.create(null);
     toks.forEach(function (k) { if (wb.some(function (b) { return meets(b, kb[k]); })) got[k] = true; });
     pairs.forEach(function (p) { if (wb.some(function (b) { return meets(b, p.bs); })) { got[p.a] = true; got[p.b] = true; } });
+    toks.forEach(function (k) { if (got[k] || (goodsOf[k] && wb.some(function (b) { return meets(b, goodsOf[k]); }))) perGoods[k]++; });
     var hit = false;
     toks.forEach(function (k) { if (got[k]) { per[k]++; hit = true; } });
+    gots.push(got);
+    if (ws.some(function (w) { return CABLE_GOODS.test(w); })) cableGoods++;
     if (hit) on++;
     else if (off.length < 3) off.push(t.slice(0, 60));
   });
@@ -392,8 +506,48 @@ function queryRelevance(query, titles) {
   toks.forEach(function (k) { keywordShare[k] = r3(per[k] / latin.length); });
   var share = on / latin.length;
   var warn = latin.length >= 5 && share < 0.5;
+  // The connector words of the query, and the keywords that are not one.
+  var conn = toks.filter(function (k) { return CONNECTOR.test(k); });
+  var rest = toks.filter(function (k) { return conn.indexOf(k) < 0; });
+  var under = function (k, cut) { return per[k] < cut * latin.length; };
+  // Rule 1: a connector word carried the share (it is in half the titles
+  // or more, CR-6), and every other keyword, read with its goods class, is low.
+  /* A query whose other words are all specs with a digit ("usb c 2m",
+   * "type c 120w") names no goods, so a page of cables and chargers is its
+   * product. Measured 2026-10-20: titles that are cables, chargers or
+   * adapters were 37% of the junk page served for "usb c 100w", and 71% to
+   * 100% of real cable pages. A query with a noun ("iem", "dock") is never
+   * let off this way: the lightning and thunderbolt cable pages are 92% to
+   * 94% cables and still warn. */
+  var specOnly = rest.length > 0 && rest.every(function (k) { return /\d/.test(k); });
+  var connAlone = latin.length >= 5 && !warn && rest.length > 0 &&
+    conn.some(function (k) { return !under(k, 0.5); }) &&
+    rest.every(function (k) { return perGoods[k] < CONNECTOR_ALONE * latin.length; }) &&
+    !(specOnly && cableGoods >= 0.6 * latin.length);
+  // Rule 2: 3 or more keywords, and more than half, are all but absent.
+  // Connector words are left out of this count when the query has others.
+  var counted = rest.length ? rest : toks;
+  var missing = counted.filter(function (k) { return under(k, MISSING); });
+  var thin = latin.length >= 5 && !warn && !connAlone && missing.length >= 3 && missing.length * 2 > counted.length;
+  var lacking = connAlone ? rest : missing;
+  // Held: counted keywords in 5% of the titles or more (CR-7).
+  var held = counted.filter(function (k) { return missing.indexOf(k) < 0; });
+  var carrier = conn.filter(function (k) { return !under(k, 0.5); });
+  if (connAlone || thin) {
+    // Titles to read: ones that hold none of the lacking keywords.
+    off = [];
+    for (var ti = 0; ti < latin.length && off.length < 3; ti++) {
+      var g = gots[ti];
+      if (!lacking.some(function (k) { return g[k]; })) off.push(latin[ti].slice(0, 60));
+    }
+  }
+  var pct = function (x) { return Math.round(x * 100) + '%'; };
+  var tail = ' Read them first. If they are the product, the stream is fine (coverage.streamVerdict). If not, ' +
+    'this is NOT a harvest of the product: do not report it as exhausted-all-results. Re-word the query ' +
+    'and say so to the user.';
   return {
     measured: true, keywords: toks, keywordShare: keywordShare,
+    connectorKeywords: conn, missingKeywords: missing,
     checked: latin.length, onQuery: on, share: r3(share),
     offSample: off,
     warning: warn
@@ -403,7 +557,20 @@ function queryRelevance(query, titles) {
         'fine (coverage.streamVerdict). If the site served another category, this is NOT a complete ' +
         'harvest of the product: do not report it as exhausted-all-results. Re-word the query and say so ' +
         'to the user.'
-      : null,
+      : connAlone
+        ? 'off-query-connector: the titles matched on the connector word [' + carrier.join(', ') + '], and every ' +
+          'other keyword [' + rest.join(', ') + '] is in fewer than ' + pct(CONNECTOR_ALONE) + ' of the ' + latin.length +
+          ' titles. Cables, chargers, hubs and flash drives all carry a connector word (live 2026-10-19: "type c ' +
+          'iem" was served as USB-C cables). Titles: ' + JSON.stringify(off) + '.' + tail
+        : thin
+          ? 'off-query-keywords: ' + missing.length + ' of the ' + counted.length + ' keywords' +
+            (conn.length && rest.length ? ' that are not connector words' : '') + ' [' + missing.join(', ') +
+            '] are each in fewer than ' + pct(MISSING) + ' of the ' + latin.length + ' titles, so the stream matched ' +
+            (held.length ? 'on [' + held.join(', ') + '] alone' : 'on no keyword in ' + pct(MISSING) + ' of the titles or more') +
+            '. A brand or model word can carry a whole other category (live ' +
+            '2026-10-19: "poco f7 ultra wallet case" was served as POCO phones). Titles: ' + JSON.stringify(off) +
+            '.' + tail
+          : null,
   };
 }
 /* @shared:queryRelevance:end */

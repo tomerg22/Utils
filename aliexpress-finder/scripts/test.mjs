@@ -4208,6 +4208,263 @@ await block('R-SALES', async () => {
     /Reviews ౹ 10,000\+ sales/.test(skillSrc) && /use the search grid's `soldRaw`/.test(skillSrc));
 });
 
+console.log('\nR-BRAND: relevance: a brand word or a connector word alone does not make a stream the product (live 2026-10-19)');
+await block('R-BRAND', async () => {
+  /* Live, signed-in Chrome, 2026-10-19. "poco f7 ultra wallet case" was
+   * served as 143 POCO items (phones, tablets, 1 tablet case, 2 fee links)
+   * and "type c iem" as 49 items (USB-C cables and chargers, flash drives,
+   * nail tips, car lights). The old check passed both (share 0.979 and
+   * 0.857) as exhausted-all-results. The titles, and those of three correct
+   * streams of the same day, are in fixtures/real-streams-2026-10-19.json. */
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  const fx = JSON.parse(SRC('fixtures/real-streams-2026-10-19.json'));
+  const phones = qr(fx.pocoPhones.query, fx.pocoPhones.titles);
+  ok('R-BRAND: the real POCO phone stream warns for "poco f7 ultra wallet case"', /^off-query-keywords: 3 of the 5 keywords/.test(phones.warning || ''),
+    String(phones.warning).slice(0, 80));
+  eq('R-BRAND: it names the keywords the titles lack', phones.missingKeywords, ['f7', 'wallet', 'case']);
+  ok('R-BRAND: the warning quotes 3 titles to read', phones.offSample.length === 3 && phones.warning.includes(JSON.stringify(phones.offSample)),
+    JSON.stringify(phones.offSample));
+  const cables = qr(fx.iemCables.query, fx.iemCables.titles);
+  ok('R-BRAND: the real cable stream warns for "type c iem"', /^off-query-connector: /.test(cables.warning || ''), String(cables.warning).slice(0, 80));
+  eq('R-BRAND: "type" is the connector word, and the share still counts it', [cables.connectorKeywords, cables.share], [['type'], 0.857]);
+  // "type c 120w" names no goods, and 71% of that page is cables and
+  // chargers: its product (R-BRAND-3 pins the 60% limit).
+  eq('R-BRAND: "type c 120w" over that page of cables and chargers raises nothing', qr('type c 120w', fx.iemCables.titles).warning, null);
+  eq('R-BRAND: on the cable warning, missingKeywords names iem', cables.missingKeywords, ['iem']);
+  for (const q of ['type c headset', 'type c hifi']) {
+    // Live 2026-10-19: these were served the same page as "type c iem".
+    ok(`R-BRAND: "${q}" over that cable page warns (off-query-connector)`, /^off-query-connector: /.test(qr(q, fx.iemCables.titles).warning || ''),
+      JSON.stringify(qr(q, fx.iemCables.titles).keywordShare));
+  }
+  eq('R-BRAND: a query of connector words only is measured on them ("usb type c" over the cables)', qr('usb type c', fx.iemCables.titles).warning, null);
+  for (const [k, q] of [['pocoCases', null], ['pocoCases', 'poco f7 ultra wallet case'], ['typeCEarphones', null], ['iemTypeCMic', null]]) {
+    const query = q || fx[k].query;
+    for (const n of [60, 120, 180, Infinity]) {
+      if (n !== Infinity && fx[k].titles.length <= n) continue;
+      const ts = fx[k].titles.slice(0, n);
+      eq(`R-BRAND: the correct real stream ${k}, first ${ts.length} titles, raises nothing for "${query}"`, qr(query, ts).warning, null);
+    }
+  }
+  /* The first version of this fix (2026-10-19) stopped counting connector
+   * words for the share. On the real IEM stream that was a false alarm
+   * after 1 or 2 pages (0.483, 0.467), because its titles call an IEM
+   * "Earphones" or "In Ear Monitor" and say "Type-C" (review FA-1). */
+  eq('R-BRAND: the real IEM stream, pages 1 and 1-2, is not off-query for "iem type c mic"',
+    [qr('iem type c mic', fx.iemTypeCMic.titles.slice(0, 60)).share, qr('iem type c mic', fx.iemTypeCMic.titles.slice(0, 120)).warning], [0.55, null]);
+  const realMice = JSON.parse(SRC('fixtures/real-titles-2026-10-17.json')).mice.titles;
+  for (const q of ['wired usb mouse', 'usb mouse', 'mouse corded', 'usb corded mouse']) {
+    eq(`R-BRAND: the real mouse stream raises nothing for "${q}" (usb is a connector word, mouse is not)`, qr(q, realMice).warning, null);
+  }
+});
+
+console.log('\nR-BRAND-2: relevance: each limit of the two new rules is pinned (review C-1, 2026-10-19)');
+await block('R-BRAND-2', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  const realMice = JSON.parse(SRC('fixtures/real-titles-2026-10-17.json')).mice.titles;
+  const { mergePayloads } = await import('./decode.mjs');
+  const rep = (t, n) => Array.from({ length: n }, (_, i) => t + ' ' + i);
+  // off-query-connector: every other keyword under 15% of the titles.
+  const at = (k) => rep('Type C Cable Fast Charging', 20 - k).concat(rep('Type C Widget', k));
+  eq('R-BRAND-2: "type c widget", widget in 2 of 20 titles (10%): off-query-connector', /^off-query-connector/.test(qr('type c widget', at(2)).warning || ''), true);
+  eq('R-BRAND-2: widget in 3 of 20 titles (15%): nothing', qr('type c widget', at(3)).warning, null);
+  for (const c of ['usb', 'type', 'lightning', 'thunderbolt', 'hdmi', 'magsafe']) {
+    const r = qr(c + ' dock', rep(c + ' Cable 2m Braided', 10));
+    eq(`R-BRAND-2: "${c}" is a connector word ("${c} dock" over ${c} cables)`, [r.connectorKeywords, /^off-query-connector/.test(r.warning || '')], [[c], true]);
+  }
+  eq('R-BRAND-2: a noun is not a connector word ("cable dock" over cables)', qr('cable dock', rep('Cable 2m Braided', 10)).connectorKeywords, []);
+  // off-query-keywords: 3 or more missing, and more than half, each under 5%.
+  const base = rep('Alpha Gadget Pro', 20);
+  eq('R-BRAND-2: 3 of 4 keywords absent: off-query-keywords', /^off-query-keywords: 3 of the 4/.test(qr('alpha beta gamma delta', base).warning || ''), true);
+  const oneBeta = base.slice(0, 19).concat(['Alpha Beta Gadget']);
+  eq('R-BRAND-2: beta in 1 of 20 titles (5%) is not missing: 2 of 4, nothing', [qr('alpha beta gamma delta', oneBeta).missingKeywords, qr('alpha beta gamma delta', oneBeta).warning], [['gamma', 'delta'], null]);
+  eq('R-BRAND-2: 2 missing of 3 is not enough (a two-word brand, two UK spellings)', qr('alpha beta gamma', base).warning, null);
+  eq('R-BRAND-2: 3 missing of 6 is half, not more: nothing', qr('alpha gadget pro beta gamma delta', base).warning, null);
+  ok('R-BRAND-2: 4 missing of 6: off-query-keywords', /^off-query-keywords: 4 of the 6/.test(qr('alpha gadget beta gamma delta epsilon', base).warning || ''));
+  eq('R-BRAND-2: connector words are not counted as missing ("usb alpha beta gamma" over Alpha titles: 2 of 3, nothing)',
+    qr('usb alpha beta gamma', base).warning, null);
+  // UK spellings, glued connector words, prototype keys.
+  const wire = JSON.parse(SRC('fixtures/real-titles-2026-10-17.json')).craftWire.titles;
+  eq('R-BRAND-2: "aluminium jewellery wire" over real craft wire raises nothing (UK spelling, review FA-6)', qr('aluminium jewellery wire', wire).warning, null);
+  eq('R-BRAND-2: "aluminum wire" over "Aluminium Wire" titles is on-query', qr('aluminum wire', rep('Aluminium Wire 1mm', 10)).share, 1);
+  eq('R-BRAND-2: "usbc hub" is "usb hub" over "USB-C Hub" titles (review F7)', [qr('usbc hub', rep('USB-C Hub 7 in 1', 10)).keywords, qr('usbc hub', rep('USB-C Hub 7 in 1', 10)).keywordShare.usb], [['usb', 'hub'], 1]);
+  eq('R-BRAND-2: the query word "constructor" is not held by every title (review F6)', qr('constructor', rep('Gaming Mouse', 10)).share, 0);
+  // The live captures of 2026-10-19 (fixtures/live-streams-2026-10-19.json).
+  const live = JSON.parse(SRC('fixtures/live-streams-2026-10-19.json'));
+  const KNOWN_MISS = ['canonEosR50Device'];
+  for (const k of Object.keys(live).filter((x) => x !== 'note')) {
+    const s = live[k], w = qr(s.query, s.titles).warning;
+    if (s.label === 'mixed') {
+      // Only the junk page served for "usb c 100w" is pinned: 37% of it is cables.
+      if (k === 'usbC100w') ok('R-BRAND-2: live "usb c 100w" (a junk page: flash drives, hubs, some cables) warns', !!w, String(w).slice(0, 60));
+      continue;
+    }
+    if (s.label === 'on') eq(`R-BRAND-2: live "${s.query}" (the product, ${s.titles.length} titles) raises nothing`, w, null);
+    else if (KNOWN_MISS.includes(k)) eq(`R-BRAND-2: live "${s.query}" is a known miss (a device query served as its accessories)`, w, null);
+    else ok(`R-BRAND-2: live "${s.query}" (${s.label}) warns`, !!w, JSON.stringify(qr(s.query, s.titles).keywordShare));
+  }
+  // rank.mjs on a merge of two correct streams of different queries (F1).
+  const fx = JSON.parse(SRC('fixtures/real-streams-2026-10-19.json'));
+  const part = (q, ts, pages) => ({ query: q, source: 'harvest-paged', fourStar: true, coverage: { verdict: 'exhausted-all-results' },
+    pages, items: ts.map((t, i) => ({ id: q.slice(0, 4) + i, title: t, rating: 4.8, sold: 500, soldRaw: '500+' })) });
+  const mice = part('wired usb mouse', realMice, [{ page: 1, n: 60 }, { page: 2, n: 0 }]);
+  const cases = part(fx.pocoCases.query, fx.pocoCases.titles.slice(0, 15), [{ page: 1, n: 15 }, { page: 2, n: 0 }]);
+  const m = mergePayloads([mice, cases]);
+  const r = rank(m, ['--mode', 'shortlist']);
+  eq('R-BRAND-2: a merge of 326 real mice and 15 real POCO cases is not off-query anywhere (review F1)',
+    [m.coverage.verdict, r.warnings.filter((w) => /^off-query/.test(w))], ['exhausted-all-results', []]);
+  // decode.mjs: a wall at page 2, then a recovery part, of the real IEM stream (F2).
+  const iem = fx.iemTypeCMic.titles;
+  const A = { ...part(fx.iemTypeCMic.query, iem.slice(0, 120), [{ page: 1, n: 60 }, { page: 2, n: 60 }]), coverage: { verdict: 'truncated' }, blocked: true };
+  const B = { ...part(fx.iemTypeCMic.query, iem.slice(120), [3, 4, 5, 6].map((p) => ({ page: p, n: 60 })).concat([{ page: 7, n: 0 }])),
+    coverage: { verdict: 'exhausted-from-start-page' } };
+  B.items = B.items.map((x, i) => ({ ...x, id: 'iemB' + i }));
+  eq('R-BRAND-2: the real IEM stream read as a wall part and a recovery part is complete, not off-query (review F2)', mergePayloads([A, B]).coverage.verdict, 'exhausted-all-results');
+  // harvest.js end to end on the real cable stream.
+  const items = fx.iemCables.titles.map((t, i) => makeItem('c' + i, { title: t }));
+  const H = loadHarvest(async (url) => { const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p === 1 ? items : [], page: p })); });
+  H.start({ query: fx.iemCables.query });
+  const st = await H.step(3);
+  const pl = JSON.parse(H.payload());
+  eq('R-BRAND-2: harvest.js calls the real cable stream off-query; it ran dry', [st.relevance.offQuery, pl.coverage.verdict, pl.coverage.streamVerdict],
+    [true, 'off-query', 'exhausted-all-results']);
+  ok('R-BRAND-2: and its payload carries off-query-connector', pl.warnings.some((w) => /^off-query-connector: /.test(w)), JSON.stringify(pl.warnings));
+  // The inlined copy in harvest.js gives the same answer on every fixture stream.
+  const blk = harvestText.match(/\/\* @shared:queryRelevance:start \*\/([\s\S]*?)\/\* @shared:queryRelevance:end \*\//);
+  const inl = new Function(`${blk[1]}; return queryRelevance;`)();
+  const all = [...Object.keys(fx).filter((k) => k !== 'note').map((k) => [fx[k].query, fx[k].titles]),
+    ...Object.keys(live).filter((k) => k !== 'note').map((k) => [live[k].query, live[k].titles]),
+    ['type c widget', at(2)], ['alpha beta gamma delta', base], ['aluminium jewellery wire', wire], ['usbc hub', rep('USB-C Hub', 10)], ['constructor', rep('Mouse', 10)]];
+  eq('R-BRAND-2: harvest.js queryRelevance agrees with lib.mjs on all of them', all.filter(([q, ts]) => JSON.stringify(inl(q, ts)) !== JSON.stringify(qr(q, ts))).length, 0);
+  // SKILL.md says what the code does.
+  ok('R-BRAND-2: SKILL.md names both warnings, the 15% and 5% limits, the 3-keyword floor and the connector words',
+    /`off-query-connector`/.test(skillSrc) && /`off-query-keywords`/.test(skillSrc) && /15%/.test(skillSrc) && /3 or more/.test(skillSrc) &&
+    /`type`, `usb`, `lightning`, `thunderbolt`, `hdmi`, `magsafe`/.test(skillSrc));
+});
+
+
+console.log('\nR-BRAND-3: relevance: the second review of the new rules (2026-10-20): fixes and limits pinned');
+await block('R-BRAND-3', async () => {
+  const { queryRelevance: qr } = await import('./lib.mjs');
+  const rep = (t, n) => Array.from({ length: n }, (_, i) => t + ' ' + i);
+  const fx = JSON.parse(SRC('fixtures/real-streams-2026-10-19.json'));
+  const live = JSON.parse(SRC('fixtures/live-streams-2026-10-19.json'));
+  const realMice = JSON.parse(SRC('fixtures/real-titles-2026-10-17.json')).mice.titles;
+  // CR-6: rule 1 needs a connector word in half the titles or more.
+  const noUsb = ['alpha', 'bravo', 'charlie', 'delta'].flatMap((w) => rep(w + ' Gadget', 14)).concat(rep('Other Thing', 44));
+  eq('R-BRAND-3: "usb" in no title: no off-query-connector, though every other keyword is under 15% (CR-6)',
+    [qr('usb alpha bravo charlie delta', noUsb).share, qr('usb alpha bravo charlie delta', noUsb).warning], [0.56, null]);
+  // CR-2: titles that write "TypeC" or "USBC" as one word.
+  eq('R-BRAND-3: "usbc" over "USBC Charger" titles is on-query (CR-2)', qr('usbc', rep('USBC Charger 65W GaN', 20)).share, 1);
+  eq('R-BRAND-3: "typec" over "TypeC Charger" titles is on-query', qr('typec', rep('TypeC Charger 65W GaN', 20)).share, 1);
+  eq('R-BRAND-3: "typec iem" gives keywords type and iem, and "TypeC" titles hold type', [qr('typec iem', rep('TypeC Earphone IEM', 3).concat(rep('TypeC Cable 1m', 17))).keywords,
+    qr('typec iem', rep('TypeC Earphone IEM', 3).concat(rep('TypeC Cable 1m', 17))).keywordShare.type], [['type', 'iem'], 1]);
+  // CR-1, FA2-2, MUT-03: the UK map works on plurals, joins and both sides.
+  eq('R-BRAND-3: "organiser" over "Organisers" titles is on-query (CR-1)', qr('organiser', rep('Makeup Organisers Acrylic Box', 20)).share, 1);
+  eq('R-BRAND-3: UK joins: "grey hound", "centre piece", "jewellery box" over one-word titles raise nothing',
+    [qr('grey hound', rep('Greyhound Dog Statue Resin', 10)).warning, qr('centre piece', rep('Wedding Table Centrepiece Gold', 10)).warning,
+      qr('jewellery box', rep('Jewellerybox Velvet Ring', 10)).warning], [null, null, null]);
+  const us = rep('Aluminum Jewelry Color Wire Craft', 10);
+  eq('R-BRAND-3: "aluminium jewellery colour wire" over US titles holds all 4 (3 UK words would be 3 missing)',
+    [qr('aluminium jewellery colour wire', us).warning, qr('aluminium jewellery colour wire', us).keywordShare.aluminium], [null, 1]);
+  eq('R-BRAND-3: "aluminum" over "Aluminium" titles is on-query (the title side)', qr('aluminum', rep('Aluminium Sheet 1mm', 10)).share, 1);
+  eq('R-BRAND-3: "usb c adaptor" over adapter titles raises nothing (FA2-2)', qr('usb c adaptor', rep('USB C to HDMI Adapter 4K', 10)).warning, null);
+  // FA2-4, CRIT2-3: "dupe" is a stop word; "magnetic" is "magnet"; "organic" is not "organ".
+  const align = qr('lululemon align leggings dupe', live.lululemonAlignLeggings.titles);
+  eq('R-BRAND-3: "dupe" is not a keyword, so a real leggings stream lacks 2 of 3, not 3 of 4 (FA2-4)', [align.keywords, align.warning], [['lululemon', 'align', 'leggings'], null]);
+  const mag = qr('oxyled fridge magnet light motion', rep('Magnetic LED Cabinet Light with Motion Sensor USB Rechargeable', 10));
+  eq('R-BRAND-3: "magnet" is held by "Magnetic" titles (the user\'s query of 2026-10-19, CRIT2-3)', [mag.keywordShare.magnet, mag.warning], [1, null]);
+  eq('R-BRAND-3: "organ" is not held by "Organic" titles', qr('organ', rep('Organic Cotton Towel', 10)).share, 0);
+  // FA2-1, FA2-3, FA2-5: goods named in other words count for rule 1 only.
+  eq('R-BRAND-3: "usb c lead" over the real "usb c 3m" cable page raises nothing (FA2-1)', qr('usb c lead', live.usbC3m.titles).warning, null);
+  eq('R-BRAND-3: "type c earpods" over the real USB-C earphone stream raises nothing (FA2-5)', qr('type c earpods', fx.typeCEarphones.titles).warning, null);
+  eq('R-BRAND-3: "usb c dongle" over hub titles raises nothing (FA2-3)', qr('usb c dongle', rep('USB C Hub 7 in 1 Adapter', 10)).warning, null);
+  ok('R-BRAND-3: the goods table is not used by the share rule ("lead" alone over cables is off-query-results)',
+    /^off-query-results/.test(qr('lead', rep('USB C Cable 1m', 10)).warning || ''));
+  // The spec-only exemption: a page of cables and chargers for "usb c 2m".
+  eq('R-BRAND-3: "usb c 2m" over the real cable page (71% cables and chargers) raises nothing', qr('usb c 2m', fx.iemCables.titles).warning, null);
+  const mixPage = (n) => rep('Type C Cable Fast Charging', n).concat(rep('Type C Flash Disk 64GB', 10 - n));
+  ok('R-BRAND-3: "type c 2m" over 5 cables and 5 flash disks (50%) warns', /^off-query-connector/.test(qr('type c 2m', mixPage(5)).warning || ''));
+  eq('R-BRAND-3: over 6 cables and 4 flash disks (60%) it raises nothing', qr('type c 2m', mixPage(6)).warning, null);
+  ok('R-BRAND-3: a query with a noun is never let off: "type c iem" over that 60% page warns', /^off-query-connector/.test(qr('type c iem', mixPage(6)).warning || ''));
+  // MUT-04, MUT-05: both limits pinned from below too.
+  const b21 = ['Alpha Beta Gadget'].concat(rep('Alpha Gadget', 20));
+  ok('R-BRAND-3: beta in 1 of 21 titles (4.8%) is missing: off-query-keywords 3 of 4', /^off-query-keywords: 3 of the 4/.test(qr('alpha beta gamma delta', b21).warning || ''));
+  const w21 = rep('Type C Widget', 3).concat(rep('Type C Cable Fast Charging', 18));
+  ok('R-BRAND-3: widget in 3 of 21 titles (14.3%): off-query-connector', /^off-query-connector/.test(qr('type c widget', w21).warning || ''));
+  // MUT-06: the 5-title floor of both rules.
+  eq('R-BRAND-3: 4 titles: neither new rule fires', [qr('type c widget', rep('Type C Cable', 4)).warning, qr('alpha beta gamma delta', rep('Alpha Gadget', 4)).warning], [null, null]);
+  ok('R-BRAND-3: 5 titles: both fire', /^off-query-connector/.test(qr('type c widget', rep('Type C Cable', 5)).warning || '') &&
+    /^off-query-keywords/.test(qr('alpha beta gamma delta', rep('Alpha Gadget', 5)).warning || ''));
+  // MUT-07: offSample on the two new warnings.
+  const s2 = ['Alpha Beta Gadget 0'].concat(rep('Alpha Gadget', 39).map((x, i) => x.replace(/ \d+$/, ' ' + (i + 1))));
+  eq('R-BRAND-3: off-query-keywords: offSample skips a title that holds a missing keyword', qr('alpha beta gamma delta', s2).offSample, ['Alpha Gadget 1', 'Alpha Gadget 2', 'Alpha Gadget 3']);
+  const s1 = ['Type C Widget 0'].concat(rep('Type C Cable', 19).map((x, i) => x.replace(/ \d+$/, ' ' + (i + 1))));
+  eq('R-BRAND-3: off-query-connector: offSample skips a title that holds the other keyword', qr('type c widget', s1).offSample, ['Type C Cable 1', 'Type C Cable 2', 'Type C Cable 3']);
+  // MUT-08, CR-7: the warning texts.
+  const w1 = qr('type c widget', rep('Type C Cable', 20)).warning;
+  ok('R-BRAND-3: off-query-connector names the carrier, the limit and the title count, and says not to report all results',
+    /matched on the connector word \[type\]/.test(w1) && /fewer than 15% of the 20 titles/.test(w1) && /do not report it as exhausted-all-results/.test(w1), w1);
+  const w2 = qr('alpha beta gamma delta', rep('Alpha Gadget', 20)).warning;
+  ok('R-BRAND-3: off-query-keywords names the count, the limit and what matched', /3 of the 4 keywords \[beta, gamma, delta\] are each in fewer than 5% of the 20 titles, so the stream matched on \[alpha\] alone/.test(w2) &&
+    /do not report it as exhausted-all-results/.test(w2), w2);
+  const w3 = qr('usb ' + fx.pocoPhones.query, fx.pocoPhones.titles).warning;
+  ok('R-BRAND-3: with a connector word in the query, the count says so and the connector is not "matched" (CR-7)',
+    /3 of the 5 keywords that are not connector words/.test(w3) && /matched on \[poco, ultra\] alone/.test(w3), w3);
+  const many = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india', 'juliet', 'kilo', 'lima', 'mike'];
+  const w4 = qr(many.join(' '), many.flatMap((w) => rep(w + ' Thing', 4)).concat(rep('Other Thing', 48))).warning;
+  ok('R-BRAND-3: when no keyword is in 5% of the titles, the text says so instead of "[]"', /matched on no keyword in 5% of the titles or more/.test(w4 || ''), String(w4));
+  // MUT-10: guards on connector words.
+  const conOnly = rep('USB Fan Portable', 12).concat(rep('Desk Lamp', 8));
+  ok('R-BRAND-3: a query of connector words only counts them for rule 2 ("usb hdmi lightning thunderbolt": 3 of 4 missing)',
+    /^off-query-keywords: 3 of the 4 keywords \[hdmi, lightning, thunderbolt\]/.test(qr('usb hdmi lightning thunderbolt', conOnly).warning || ''));
+  eq('R-BRAND-3: "typewriter" is not the connector word "type"', qr('typewriter ribbon', rep('Typewriter Ribbon Black', 10)).connectorKeywords, []);
+  // MUT-01, MUT-02, CR-3: rank.mjs and the joined pool of a merge.
+  const cases15 = fx.pocoCases.titles.slice(0, 15);
+  const pool = realMice.concat(cases15);
+  const poolQ = 'wired mouse | poco f7 ultra wallet case';
+  ok('R-BRAND-3: (the check this guards) the joined pool of 326 mice and 15 POCO cases fires off-query-keywords', /^off-query-keywords/.test(qr(poolQ, pool).warning || ''));
+  const items = pool.map((t, i) => ({ id: 'j' + i, title: t, rating: 4.8, sold: 500, soldRaw: '500+' }));
+  const merged = (parts, source = 'merged') => ({ source, query: poolQ, parts, items, warnings: [] });
+  const rk = (p) => rank(p, ['--mode', 'shortlist']).warnings.filter((w) => /^off-query/.test(w));
+  eq('R-BRAND-3: rank.mjs drops that pool warning on a merge of two queries (F1)', rk(merged([{ query: 'wired mouse' }, { query: 'poco f7 ultra wallet case' }])), []);
+  ok('R-BRAND-3: a payload with parts but not a merge keeps it', rk(merged([{ query: 'wired mouse' }, { query: 'poco f7 ultra wallet case' }], 'harvest-paged')).some((w) => /^off-query-keywords/.test(w)));
+  const ph = fx.pocoPhones.titles.map((t, i) => ({ id: 'p' + i, title: t, rating: 4.8, sold: 500, soldRaw: '500+' }));
+  const oneStream = { source: 'merged', query: fx.pocoPhones.query, items: ph, warnings: [],
+    parts: [{ query: 'Poco F7 Ultra Wallet Case' }, { query: 'poco  f7 ultra wallet case' }] };
+  ok('R-BRAND-3: one query written in two cases is one stream: rank.mjs keeps its off-query-keywords (CR-3)', rk(oneStream).some((w) => /^off-query-keywords/.test(w)));
+  const wire = JSON.parse(SRC('fixtures/real-titles-2026-10-17.json')).craftWire.titles;
+  const offPool = wire.concat(fx.iemCables.titles).map((t, i) => ({ id: 'o' + i, title: t, rating: 4.8, sold: 500, soldRaw: '500+' }));
+  ok('R-BRAND-3: on a merge of two queries the share rule still reaches the ranking (craft wire + cables)',
+    rk({ source: 'merged', query: 'wired usb mouse | type c iem', items: offPool, warnings: [], parts: [{ query: 'wired usb mouse' }, { query: 'type c iem' }] })
+      .some((w) => /^off-query-results/.test(w)));
+  // Survivors of the mutation run after the second review (2026-10-20).
+  const mid = rep('Type C Cable', 8).concat(rep('Alpha Gadget', 2), rep('Bravo Gadget', 2), rep('Other Thing', 8));
+  eq('R-BRAND-3: "type" in 40% of the titles does not carry the share: no off-query-connector', [qr('type c alpha bravo', mid).share, qr('type c alpha bravo', mid).warning], [0.6, null]);
+  eq('R-BRAND-3: "usb c dongle" over titles that say only "Hub" raises nothing (hub is in the dongle class)', qr('usb c dongle', rep('USB C Hub 7 in 1', 10)).warning, null);
+  ok('R-BRAND-3: one spec word and one plain word is not a spec-only query ("type c 2m hifi" over cables warns)',
+    /^off-query-connector/.test(qr('type c 2m hifi', rep('Type C Cable Fast Charging', 10)).warning || ''));
+  eq('R-BRAND-3: "grayhound" over "Grey Hound" titles: the UK form of a title join', qr('grayhound', rep('Grey Hound Statue', 10)).share, 1);
+  eq('R-BRAND-3: "adaptor" over "Adapter" titles is on-query for the share rule (the UK map, not the goods table)', qr('adaptor', rep('Power Adapter 12V', 10)).share, 1);
+  ok('R-BRAND-3: the connector text names only the connector word that carried the share', /matched on the connector word \[usb\], and every/.test(qr('usb hdmi widget', rep('USB Cable Fast', 10)).warning || ''),
+    String(qr('usb hdmi widget', rep('USB Cable Fast', 10)).warning).slice(0, 90));
+  // The limits the second review measured, pinned so a change sees them.
+  eq('R-BRAND-3: known miss: the real POCO phones lack only 2 words for "poco wallet case" and "poco f7 case" (R1-MH1-F4)',
+    [qr('poco wallet case', fx.pocoPhones.titles).warning, qr('poco f7 case', fx.pocoPhones.titles).warning], [null, null]);
+  eq('R-BRAND-3: known miss: "lightning earphones" over real USB-C earphones (the connector word is in no title, CRIT2-1)',
+    qr('lightning earphones', fx.typeCEarphones.titles).warning, null);
+  ok('R-BRAND-3: known cost: "usb c 3 meter" over the real "usb c 3m" page warns (titles write "3M", FA2-6)',
+    /^off-query-connector/.test(qr('usb c 3 meter', live.usbC3m.titles).warning || ''));
+  // The inlined copy agrees on every input above.
+  const blk = harvestText.match(/\/\* @shared:queryRelevance:start \*\/([\s\S]*?)\/\* @shared:queryRelevance:end \*\//);
+  const inl = new Function(`${blk[1]}; return queryRelevance;`)();
+  const cases = [['usb alpha bravo charlie delta', noUsb], ['typec iem', rep('TypeC Cable', 10)], ['organiser', rep('Organisers', 10)],
+    ['aluminium jewellery colour wire', us], ['oxyled fridge magnet light motion', rep('Magnetic Light', 10)], ['usb c lead', live.usbC3m.titles],
+    ['type c earpods', fx.typeCEarphones.titles], ['usb c 2m', fx.iemCables.titles], ['type c 2m', mixPage(6)], ['alpha beta gamma delta', s2],
+    ['type c widget', s1], ['usb ' + fx.pocoPhones.query, fx.pocoPhones.titles], [poolQ, pool], ['usb hdmi lightning thunderbolt', conOnly]];
+  eq('R-BRAND-3: harvest.js queryRelevance agrees with lib.mjs on all of them', cases.filter(([q, ts]) => JSON.stringify(inl(q, ts)) !== JSON.stringify(qr(q, ts))).length, 0);
+});
+
 // ---------------------------------------------- the whole suite on dist/
 /* The operator pastes dist/*.min.js, so the suite runs again on them: every
  * scenario above, not a handful (review, 2026-10-18: only 4 assertions
@@ -4219,7 +4476,7 @@ if (!DIST) {
   const last = (child.stdout || '').trim().split('\n').pop();
   ok('every assertion passes on dist/ too', child.status === 0 && /^PASSED/.test(last), last + ' ' + (child.stderr || '').slice(0, 200));
   // The README states the exact count (this check included).
-  const readmeN = Number((SRC('../README.md').match(/Test suite — (\d+) assertions/) || [])[1]);
+  const readmeN = Number((SRC('../README.md').match(/Test suite: (\d+) assertions/) || [])[1]);
   const total = pass + fails.length + 1;
   ok(`README.md states the real number of assertions (${total})`, readmeN === total, `README says ${readmeN}`);
 }

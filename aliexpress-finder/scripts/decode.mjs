@@ -48,7 +48,7 @@
  * when its LAST page read hit the wall.
  */
 import { readFileSync } from 'node:fs';
-import { queryRelevance } from './lib.mjs';
+import { queryRelevance, fourStarWarning } from './lib.mjs';
 
 const CHUNK_RE = /AEPAYLOAD (\d+)\/(\d+)(?: ([0-9a-z]+))? START\n([\s\S]*?)\nAEPAYLOAD END/g;
 const START_RE = /AEPAYLOAD \d+\/\d+(?: [0-9a-z]+)? START/g;
@@ -112,7 +112,12 @@ export function fromInAppFiles(texts) {
 
 const slugOf = (q) => String(q || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 /* The filterKey harvest.js writes, so an older payload without one (and
- * without extra) joins the same stream as a new one. */
+ * without extra) joins the stream of a payload harvested with the same
+ * fourStar value. A payload with no fourStar field counts as true
+ * (harvest.js used the switch by default before 2026-10-20), and the
+ * default is false since 2026-10-20, so an old payload does NOT join a new
+ * default run: they are different search streams (merged-filters). Such a
+ * part also gets the four-star-switch warning (lib.mjs fourStarWarning). */
 const filterKeyOf = (fourStar, extra) => {
   let h = 5381;
   const t = (fourStar === false ? '0' : '4') + '|' + (extra || '');
@@ -169,6 +174,8 @@ function partOf(p) {
   };
   part.filterKey = p.filterKey ||
     (p.extraApplied ? oldExtraKey(part, (p.items || []).map((i) => (i && i.id != null ? i.id : ''))) : filterKeyOf(p.fourStar, ''));
+  const fw = fourStarWarning(p);
+  if (fw) part.warnings.push(fw);
   return part;
 }
 
@@ -363,6 +370,10 @@ if (isMain) {
   let res;
   try { res = assemble(texts); } catch (e) { console.error('decode: ' + e.message); process.exit(1); }
   const p = res.payload;
+  // One payload is passed through as it is, so an old 4-star file gets its
+  // warning here (a merge adds it per part).
+  const fw = fourStarWarning(p);
+  if (fw) p.warnings = [...(Array.isArray(p.warnings) ? p.warnings : []), fw];
   const summary = { via: res.via, query: p.query, coverage: p.coverage, cardCount: p.cardCount, withRating: p.withRating,
     blocked: p.blocked, suspectedWall: p.suspectedWall, parts: Array.isArray(p.parts) ? p.parts.length : 1,
     warnings: (p.warnings || []).map((w) => w.slice(0, 160)) };

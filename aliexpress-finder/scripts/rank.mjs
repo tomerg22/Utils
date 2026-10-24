@@ -44,7 +44,7 @@
  * paid. A score of 0.35 must now name its problem; see SKILL.md step 6.
  */
 
-import { median, parseSold, queryRelevance } from './lib.mjs';
+import { median, parseSold, queryRelevance, fourStarWarning } from './lib.mjs';
 
 /* --name value, or --name=value. An unknown --name is an error: a typo
  * such as --constriant silently dropped a hard requirement, and
@@ -363,6 +363,10 @@ for (const env of envelopes) {
   for (const w of Array.isArray(env.warnings) ? env.warnings : []) {
     if (typeof w === 'string' && !warnings.includes(w)) warnings.push(w);
   }
+  // A payload harvested with the 4StarRating switch before harvest.js
+  // warned about it (review 2026-10-24): one four-star warning, never two.
+  const fw = fourStarWarning(env);
+  if (fw && !warnings.some((w) => /^four-star-switch/.test(w))) warnings.push(fw);
 }
 if (badNumbers.length) {
   warnings.push(`not-a-number: ${badNumbers.length} item(s) carry a field that is not a number ` +

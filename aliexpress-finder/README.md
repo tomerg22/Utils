@@ -63,7 +63,7 @@ read as they are, never changed.
 | File | Role |
 |------|------|
 | `SKILL.md` | The skill: 8-step workflow plus gotchas verified against the live site |
-| `scripts/harvest.js` | Browser-side paged harvester. Resumable, reads until an empty page or a page with no new ids (the server's `finished` flag is not trusted: it was true on every page of a 230-item stream), detects the anti-bot wall *before* parsing so a block can never be mistaken for a parse error, and flags a stream whose titles do not match the query (`off-query`). Saves its state to `localStorage` after every page; `restore()` reloads the run saved last in a fresh tab, `resume()` clears a stop, `startPage` skips saved pages, and `maxPages` stops at page 60, the last page the site serves. `send()` replies `DELIVERED` / `NOT DELIVERED` / `UNCONFIRMED`. `send(port, {via: 'form'})`, the export to use, always posts the form, so it navigates even to a dead port: curl the receiver first, and `restore()` is the way back. A plain `send()` never navigates after a refused fetch. Runs unchanged in both browsers: `forceEnglish()` for the logged-out in-app browser, `expose()`/`chunks()` to export through the Chrome connector, both `sold` and `נמכר` parsed, currency per item, tab `visibility` reported |
+| `scripts/harvest.js` | Browser-side paged harvester. Resumable, reads until an empty page or a page with no new ids (the server's `finished` flag is not trusted: it was true on every page of a 230-item stream harvested with the 4★ switch), detects the anti-bot wall *before* parsing so a block can never be mistaken for a parse error, and flags a stream whose titles do not match the query (`off-query`). Saves its state to `localStorage` after every page; `restore()` reloads the run saved last in a fresh tab, `resume()` clears a stop, `startPage` skips saved pages, and `maxPages` stops at page 60, the last page the site serves. `send()` replies `DELIVERED` / `NOT DELIVERED` / `UNCONFIRMED`. `send(port, {via: 'form'})`, the export to use, always posts the form, so it navigates even to a dead port: curl the receiver first, and `restore()` is the way back. A plain `send()` never navigates after a refused fetch. Runs unchanged in both browsers: `forceEnglish()` for the logged-out in-app browser, `expose()`/`chunks()` to export through the Chrome connector, both `sold` and `נמכר` parsed, currency per item, tab `visibility` reported; `fourStar` off by default since 2026-10-20 (measured that day, the 4★ URL switch returns a small fixed pool per query; `true`, or an `extra` that carries it, adds it and warns) |
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. Reads the embedded `_dida_config_._init_data_` payload (~60 records), falls back to DOM scraping (`₪`, `US $`, `€`, `£`), and flags captcha interstitials. The result also stays on `window.__aeExtract`, because the Chrome connector cuts the return at 1,000 characters: return pieces of it, or post it all to the receiver with `__aeExtract.send(port)` |
 | `scripts/receiver.mjs` | Loopback HTTP receiver: after a `curl` check, `__aeHarvest.send(port, {via: 'form'})` POSTs the harvest payload to it from either browser (a plain `send(port)` fetch was refused by both on 2026-10-18), and it writes `harvest-<query>-<stamp>.json` and prints `saved <path>` in its own output. No retyping, no chunking. Takes any number of payloads, exits after 60 idle minutes, `GET /` answers `ok …` |
 | `scripts/decode.mjs` | Fallback decoder and merger: reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps in any order (refuses a partial set), or from a plain payload JSON or an array of them; several payloads are merged and deduped, never dropped |
@@ -73,7 +73,7 @@ read as they are, never changed.
 | `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). For hardware the label on the case is the spec sheet |
 | `scripts/rank.mjs` | Scoring: shrunk quality (the listing's own rating in final mode) + log-scaled volume + optional brand score, `--require` category filter, `--spread` tier stratification, `--constraint` hard requirement filters, absence-is-not-evidence, off-query and tie-at-cutoff warnings, `sold-unparsed` and `own-reviews-unknown` set-asides, strict flag values |
 | `scripts/lib.mjs` | Pure helpers shared by the ranker, the browser files, the step-5 reader and the tests |
-| `scripts/test.mjs` | Test suite: 1258 assertions, including the step-5 reader pulled out of `SKILL.md` and the harvest scenarios run on the `dist` copy |
+| `scripts/test.mjs` | Test suite: 1319 assertions, including the step-5 reader pulled out of `SKILL.md` and the harvest scenarios run on the `dist` copy |
 
 ## Tests
 
@@ -97,6 +97,10 @@ found during live runs:
 - the site's own `totalResults` used as a coverage denominator
 - a shortlist sampled only at its head, so a strong-review listing could never
   earn the review count that would promote it
+- the 4★ URL switch applied by default: measured on 2026-10-20, the site
+  answers it with a small fixed pool per query, which hid a 4.8-rated best
+  seller; the switch is off by default, `fourStar: true` (or an `extra` that
+  carries it) warns, and `decode.mjs`/`rank.mjs` warn on an older 4★ payload
 - a search URL returned to the operator, which the Chrome connector blocks
   outright; and a payload returned through a channel that cuts it at 1,000
   characters — the tests assert no `?` in any returned value and round-trip

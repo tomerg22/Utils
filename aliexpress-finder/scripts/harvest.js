@@ -45,9 +45,12 @@
  *    awaiting fetches sequentially — that is already ~1s apart.
  *
  * REQUESTS ARE THE SCARCE RESOURCE, NOT RESULTS. The wall tripped after
- * roughly 50-60 rapid fetches in one session. Hence maxRequests, and hence
- * the 4-star filter (see start()), which roughly triples usable rows per
- * request instead of spending more requests.
+ * roughly 50-60 rapid fetches in one session. Hence maxRequests. (The
+ * 4-star URL switch used to be the other half of this: in 2026-08 it took
+ * rated rows from 13/60 to 60/60 at an unfiltered page 20. Measured
+ * 2026-10-20 it makes the site serve a small fixed pool per query instead,
+ * so it is off by default; see start(). Unfiltered orders-sorted pages 1-3
+ * carried 60 rated rows of 60 that day; deep pages were not re-measured.)
  *
  * TWO BROWSERS, ONE FILE (measured 2026-09-14). This runs unchanged in the
  * in-app browser (mcp__Claude_Browser__javascript_tool) and in the Chrome
@@ -709,6 +712,23 @@ function queryRelevance(query, titles) {
    * again. */
   const LAST_PAGE = 60;
   const capNote = (n) => 'maxPages ' + n + ' cut to ' + LAST_PAGE + ': the site serves no page past ' + LAST_PAGE;
+  /* Said by start(), status() and payload() when the switch is in the URL
+   * (fourStar true, or an `extra` that carries it). No "?" and no
+   * "key=value" in it: the Chrome connector blocks a result that looks like
+   * a query string (see start()). */
+  const FOUR_STAR_NOTE = 'four-star-switch: the 4StarRating switch makes the site serve a small fixed pool per ' +
+    'query (25 to 74 listings on three queries, a reported total of 60, measured 2026-10-20 signed in and ' +
+    'logged out), not the rated catalogue: most top sellers are missing and the stream is not the market. ' +
+    'Harvest without it (the default); rank.mjs drops unrated and sub-4.0 rows itself.';
+  /* status() gets a short marker instead: with the full note a status()
+   * holding a wall object passed the Chrome connector's 1,000-character
+   * cut and lost running/done/visibility (review 2026-10-20). */
+  const FOUR_STAR_SHORT = 'four-star-switch: a small fixed pool, see payload().warnings';
+  /* The switch is on when the URL fetched carries it: fourStar true, or an
+   * `extra` that adds it by hand (review 2026-10-24: that run warned
+   * nowhere). st.fourStar stays the flag for filterKey, so stream keys do not
+   * change; a restored backup has `base`, so this holds after restore(). */
+  const switchOn = (st) => !!st && (st.fourStar === true || /4StarRating/i.test(String(st.base || '')));
   /* What restore() says about a saved stop. The stop comes back with the
    * harvest, and step() reads nothing while a stop is set: SKILL.md said
    * step(6) carries on after restore(), and a restored wall stop made no
@@ -778,12 +798,22 @@ function queryRelevance(query, titles) {
 
     /* opts:
      *   query       (required) English keywords, e.g. 'wire brush set'
-     *   fourStar    default TRUE — adds filterCode:4StarRating. Measured:
-     *               pool 18,655 -> 7,206, and rated rows go from 13/60 at an
-     *               unfiltered page 20 to 60/60. rank.mjs already discards
-     *               unrated and <4.0 items, so this removes nothing it would
-     *               have kept — it just stops wasting requests on rows that
-     *               get dropped anyway.
+     *   fourStar    default FALSE (since 2026-10-20). true adds the
+     *               4StarRating switch. In 2026-08 it cut the pool
+     *               18,655 -> 7,206 and took rated rows from 13/60 at an
+     *               unfiltered page 20 to 60/60, so it was the default.
+     *               Measured 2026-10-20, signed in and logged out: the site
+     *               now answers the switch with a small fixed pool per query
+     *               (25 to 74 listings on three queries, a reported total of
+     *               60, finished on page 1, 4 of 59 unrated, most top
+     *               sellers absent, the same ids under any sort). A harvest
+     *               with it ends "exhausted" after 1-2 pages of items and is
+     *               NOT the market. rank.mjs drops unrated and <4.0 rows
+     *               itself, and unfiltered orders-sorted pages 1-3 carried 60
+     *               rated rows of 60 that day (deep pages not re-measured).
+     *               With the switch in the URL (true, or an `extra` that
+     *               carries it), start(), status() and payload() say so
+     *               (`note` / a `four-star-switch` warning).
      *   maxPages    default 20   the LAST page number read. AliExpress
      *               serves no page past 60: a higher value is cut to 60 and
      *               the plan says so in `note`
@@ -818,11 +848,11 @@ function queryRelevance(query, titles) {
       if (note) maxPages = LAST_PAGE;
       let base = 'https://he.aliexpress.com/w/wholesale-' + slug +
                  '.html?SortType=total_tranpro_desc';
-      if (opts.fourStar !== false) base += '&selectedSwitches=filterCode%3A4StarRating';
+      if (opts.fourStar === true) base += '&selectedSwitches=filterCode%3A4StarRating';
       if (opts.extra) base += opts.extra;
       this.st = {
         query: opts.query, slug, base,
-        fourStar: opts.fourStar !== false,
+        fourStar: opts.fourStar === true,
         extra: opts.extra || null,
         startPage, maxPages, maxRequests,
         page: startPage - 1, requests: 0,
@@ -837,11 +867,12 @@ function queryRelevance(query, titles) {
        * connector replaces a whole result with "[BLOCKED: Cookie/query string
        * data]" when it contains one (measured 2026-09-14); the in-app browser
        * does not care. debugUrl() has the full URL for the in-app browser. */
+      const notes = [note, switchOn(this.st) ? FOUR_STAR_NOTE : null].filter(Boolean);
       return Object.assign({ query: this.st.query,
                searchPath: '/w/wholesale-' + slug + '.html',
                sort: 'total_tranpro_desc', fourStar: this.st.fourStar,
                extraApplied: !!this.st.extra,
-               startPage, maxPages, maxRequests }, note ? { note } : {});
+               startPage, maxPages, maxRequests }, notes.length ? { note: notes.join(' ') } : {});
     },
 
     /* Reload a harvest saved in localStorage (see BACKUP above), in this tab
@@ -871,10 +902,15 @@ function queryRelevance(query, titles) {
       st.pages = st.pages || [];
       st.items.forEach((i) => st.seen.add(String(i.id)));
       this.st = st;
-      const note = restoreNote(st);
-      return Object.assign(this.status(), {
+      // The stop note comes first; the four-star marker of status() stays.
+      // `note` is taken out and put back LAST, so a cut at 1,000 characters
+      // eats the marker's tail, not restored/savedAt (review 2026-10-24).
+      const base = this.status();
+      const notes = [restoreNote(st), base.note].filter(Boolean);
+      delete base.note;
+      return Object.assign(base, {
         restored: true, savedAt: new Date(best.savedAt || 0).toISOString(),
-      }, note ? { note } : {});
+      }, notes.length ? { note: notes.join(' ') } : {});
     },
 
     /* Saved harvests in localStorage, saved last first. No URL, no query string. */
@@ -921,16 +957,23 @@ function queryRelevance(query, titles) {
       s.maxPages = num(opts.maxPages, s.maxPages, 'maxPages');
       const note = s.maxPages > LAST_PAGE ? capNote(s.maxPages) : null;
       if (note) s.maxPages = LAST_PAGE;
+      // The cap note comes first; the four-star marker of status() stays,
+      // and `note` goes back last (see restore()).
+      const withNote = (base, extra) => {
+        const notes = [note, base.note].filter(Boolean);
+        delete base.note;
+        return Object.assign(base, extra, notes.length ? { note: notes.join(' ') } : {});
+      };
       if (s.stop === 'exhausted') {
         return Object.assign(this.status(), { err: 'the stream already ran dry (exhausted): nothing to resume' });
       }
       if (s.stop === 'page-cap' && s.page >= LAST_PAGE) {
-        return Object.assign(this.status(), { err: 'page ' + LAST_PAGE + ' was read and the site serves no page past it: ' +
-          'nothing to resume. The stream verdict stays truncated.' }, note ? { note } : {});
+        return withNote(this.status(), { err: 'page ' + LAST_PAGE + ' was read and the site serves no page past it: ' +
+          'nothing to resume. The stream verdict stays truncated.' });
       }
       const was = s.stop;
       s.stop = null; s.wall = null; s.lastErr = null;
-      return Object.assign(this.status(), { resumed: was, nextPage: s.page + 1 }, note ? { note } : {});
+      return withNote(this.status(), { resumed: was, nextPage: s.page + 1 });
     },
 
     /* The full first-page URL. In-app browser only: the Chrome connector
@@ -1277,7 +1320,10 @@ function queryRelevance(query, titles) {
                          onQuery: rel.measured ? rel.share : null }, noId ? { noId } : {}));
           // Saved per page: a later page may hang the tab for good.
           s.backup = persist(s);
-          /* STOP RULES (measured 2026-09-29, signed-in Chrome, USD account).
+          /* STOP RULES (measured 2026-09-29, signed-in Chrome, USD account, on
+           * a stream with the 4StarRating switch, then the default; measured
+           * 2026-10-20 without it, `nitrile gloves` page 1 claimed 8,487 and
+           * said finished:false on pages 1-3).
            * The stream is dry only when a page comes back EMPTY, or when every
            * id on it was already seen (the server is repeating itself).
            *
@@ -1311,6 +1357,7 @@ function queryRelevance(query, titles) {
       return {
         query: s.query, startPage: s.startPage || 1, pagesRead: s.page, requests: s.requests,
         maxRequests: s.maxRequests,
+        fourStar: !!s.fourStar,
         unique: s.seen.size, stop: s.stop, endSignal: s.endSignal, lastErr: s.lastErr == null ? null : noQ(s.lastErr),
         blocked: s.stop === 'blocked',
         suspectedWall: s.stop === 'suspect-wall',
@@ -1324,6 +1371,8 @@ function queryRelevance(query, titles) {
         done: s.stop !== null,
         running: !!s.running,
         visibility: visibility(),
+        // Last, so a cut at 1,000 characters loses the marker, not a field.
+        ...(switchOn(s) ? { note: FOUR_STAR_SHORT } : {}),
       };
     },
 
@@ -1369,7 +1418,7 @@ function queryRelevance(query, titles) {
           claimedTotalIsUnreliable: true,
         },
         relevance: rel,
-        warnings: rel.warning ? [rel.warning] : [],
+        warnings: [].concat(rel.warning ? [rel.warning] : [], switchOn(s) ? [FOUR_STAR_NOTE] : []),
         pages: s.pages,
         cardCount: s.items.length,
         withRating: s.items.filter((i) => i.rating !== null).length,

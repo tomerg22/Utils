@@ -381,8 +381,93 @@ const fakeStorage = () => {
     url.includes('/w/wholesale-wire-brush-set.html'), url);
   eq('plan names the path without the query string', plan.searchPath, '/w/wholesale-wire-brush-set.html');
   ok('always sorts by orders', url.includes('SortType=total_tranpro_desc'));
-  ok('applies the 4-star filter by default',
-    url.includes('selectedSwitches=filterCode%3A4StarRating'), url);
+  ok('does NOT apply the 4-star switch by default (since 2026-10-20 it returns a fixed pool of about 60)',
+    !url.includes('4StarRating'), url);
+  eq('the plan says fourStar is off', plan.fourStar, false);
+  ok('and carries no note about it', !plan.note);
+  eq('status() reports fourStar off', H.status().fourStar, false);
+  ok('payload carries no four-star warning', !JSON.parse(H.payload()).warnings.some((w) => /^four-star-switch/.test(w)));
+  const plan4 = H.start({ query: 'a b', fourStar: true });
+  ok('fourStar:true adds the switch', H.debugUrl().includes('selectedSwitches=filterCode%3A4StarRating'), H.debugUrl());
+  eq('and the plan says so', plan4.fourStar, true);
+  ok('with a note that the pool is fixed at about 60', /four-star-switch/.test(plan4.note || '') && /60/.test(plan4.note || ''), plan4.note);
+  ok('no "?" in that note', !(plan4.note || '').includes('?'));
+  ok('status() repeats the note', H.status().fourStar === true && /four-star-switch/.test(H.status().note || ''), JSON.stringify(H.status().note));
+  ok('payload warns four-star-switch', JSON.parse(H.payload()).warnings.some((w) => /^four-star-switch/.test(w)));
+  // Review 2026-10-20: the full note in status() pushed a wall reply past the Chrome 1,000-character cut.
+  const W = loadHarvest(async () => reply('<html>' + '<div></div>'.repeat(6000) + '</html>'));
+  W.start({ query: 'silent wireless mouse for office laptop rechargeable', fourStar: true });
+  await W.step(1);
+  const ws = W.status();
+  eq('a big page with no data is a suspect-wall', ws.stop, 'suspect-wall');
+  ok('status() with fourStar true and a wall stays under 1,000 characters', JSON.stringify(ws).length < 1000, String(JSON.stringify(ws).length));
+  ok('and carries a short four-star marker',
+    /^four-star-switch/.test(ws.note || '') && ws.note.length < 80, JSON.stringify(ws.note));
+  // Review 2026-10-24: the "marker is last" property was untested.
+  eq('the four-star marker is the last key of status()', Object.keys(ws).pop(), 'note');
+  const Wl = loadHarvest(async () => reply('<html>' + '<div></div>'.repeat(6000) + '</html>'));
+  Wl.start({ query: 'silent wireless mouse for office laptop rechargeable '.repeat(3).trim(), fourStar: true });
+  await Wl.step(1);
+  const cutS = JSON.stringify(Wl.status()).slice(0, 1000);
+  ok('a 1,000-character cut of status() keeps done, running and visibility',
+    /"done":true/.test(cutS) && /"running":false/.test(cutS) && /"visibility":"/.test(cutS), cutS.slice(-80));
+  // restore() and resume() keep the stop or cap note AND the marker.
+  const ls5 = fakeStorage();
+  const w5 = { localStorage: ls5 };
+  new Function('window', 'fetch', harvestSrc)(w5, async () => reply(makePage({ items: [makeItem('r1')] })));
+  w5.__aeHarvest.start({ query: 'cheese grater', fourStar: true, maxRequests: 1 });
+  await w5.__aeHarvest.step(3);
+  eq('a budget of 1 stops after one page', w5.__aeHarvest.status().stop, 'request-budget');
+  const w6 = { localStorage: ls5 };
+  new Function('window', 'fetch', harvestSrc)(w6, async () => reply(makePage({ items: [] })));
+  const r6 = w6.__aeHarvest.restore('cheese grater');
+  ok('restore() keeps the stop note AND the four-star marker', /^stop request-budget/.test(r6.note || '') && /four-star-switch/.test(r6.note || ''), JSON.stringify(r6.note));
+  eq('and reports fourStar', r6.fourStar, true);
+  const r7 = w6.__aeHarvest.resume({ maxRequests: 5, maxPages: 99 });
+  ok('resume() keeps the cap note AND the four-star marker', /^maxPages 99 cut to 60/.test(r7.note || '') && /four-star-switch/.test(r7.note || ''), JSON.stringify(r7.note));
+  const r8 = w6.__aeHarvest.resume({ maxRequests: 6 });
+  ok('a plain resume() still carries the marker', /^four-star-switch/.test(r8.note || ''), JSON.stringify(r8.note));
+  eq('resume() puts note last', [Object.keys(r7).pop(), Object.keys(r8).pop()], ['note', 'note']);
+  // Review 2026-10-24: a restored fourStar:true suspect-wall run put note
+  // before restored/savedAt, and a cut at 1,000 ate those instead.
+  const ls9 = fakeStorage();
+  const big9 = async () => reply('<html>' + '<div></div>'.repeat(6000) + '</html>');
+  const w9 = { localStorage: ls9 };
+  new Function('window', 'fetch', harvestSrc)(w9, big9);
+  w9.__aeHarvest.start({ query: 'silent wireless mouse for office laptop rechargeable', fourStar: true });
+  await w9.__aeHarvest.step(1);
+  const w10 = { localStorage: ls9 };
+  new Function('window', 'fetch', harvestSrc)(w10, big9);
+  const rw = w10.__aeHarvest.restore();
+  eq('restore() of a fourStar:true suspect-wall run puts note last', Object.keys(rw).pop(), 'note');
+  const cutR = JSON.stringify(rw).slice(0, 1000);
+  ok('a 1,000-character cut of that restore() keeps restored, savedAt and the stop note',
+    /"restored":true/.test(cutR) && /"savedAt":"/.test(cutR) && /stop suspect-wall/.test(cutR), cutR.slice(-120));
+  // Review 2026-10-24: a restored fourStar:true run must keep fetching with the switch.
+  const ls11 = fakeStorage();
+  const urls11 = [];
+  const site11 = async (url) => { urls11.push(url); const p = Number(new URL(url).searchParams.get('page'));
+    return reply(makePage({ items: p < 4 ? [makeItem('r' + p)] : [], page: p })); };
+  const a11 = { localStorage: ls11 };
+  new Function('window', 'fetch', harvestSrc)(a11, site11);
+  a11.__aeHarvest.start({ query: 'cheese grater', fourStar: true, maxRequests: 1 });
+  await a11.__aeHarvest.step(3);
+  const b11 = { localStorage: ls11 };
+  new Function('window', 'fetch', harvestSrc)(b11, site11);
+  b11.__aeHarvest.restore();
+  b11.__aeHarvest.resume({ maxRequests: 6 });
+  urls11.length = 0;
+  await b11.__aeHarvest.step(6);
+  ok('a restored fourStar:true run fetches every later page with the switch',
+    urls11.length > 0 && urls11.every((u) => u.includes('selectedSwitches=filterCode%3A4StarRating')), JSON.stringify(urls11));
+  // Review 2026-10-24: the switch added by hand through `extra` warned nowhere.
+  const He = loadHarvest(async () => reply(makePage({ items: [makeItem('e1')], finished: true })));
+  const planE = He.start({ query: 'nitrile gloves', extra: '&selectedSwitches=filterCode%3A4StarRating' });
+  await He.step(2);
+  ok('an extra that carries the switch gets the start() note', /four-star-switch/.test(planE.note || ''), JSON.stringify(planE.note));
+  ok('and the status() marker', /^four-star-switch/.test(He.status().note || ''), JSON.stringify(He.status().note));
+  ok('and the payload warning', JSON.parse(He.payload()).warnings.some((w) => /^four-star-switch/.test(w)));
+  eq('while fourStar stays false (stream keys do not change)', [planE.fourStar, JSON.parse(He.payload()).fourStar], [false, false]);
   H.start({ query: 'a b', fourStar: false });
   ok('fourStar:false omits the rating filter',
     !H.debugUrl().includes('4StarRating'), H.debugUrl());
@@ -402,16 +487,18 @@ const fakeStorage = () => {
  * ever be read back. Everything an operator is told to return must be free
  * of "?" and of cookie text; only debugUrl() may carry the URL. */
 console.log('\nharvest.js — nothing returned to the operator carries a query string');
-{
+for (const fs of [false, true]) {
+  // Both values: the default moved from true to false on 2026-10-20, and the
+  // true path (opt-in, every restored older backup) kept no guard of its own.
   const H = loadHarvest(async () => reply(makePage({ items: [makeItem('q1')], finished: true })));
-  const plan = H.start({ query: 'wire brush set', extra: '&shpf_co=CN' });
+  const plan = H.start({ query: 'wire brush set', extra: '&shpf_co=CN', fourStar: fs });
   await H.step(1);
   for (const [name, text] of [['start()', JSON.stringify(plan)], ['status()', JSON.stringify(H.status())],
                               ['payload()', H.payload()]]) {
-    ok(`${name} output has no "?"`, !text.includes('?'), text.slice(0, 120));
-    ok(`${name} output has no "&shpf"`, !text.includes('shpf'), text.slice(0, 120));
+    ok(`${name} output has no "?"${fs ? ' (fourStar true)' : ''}`, !text.includes('?'), text.slice(0, 120));
+    ok(`${name} output has no "&shpf"${fs ? ' (fourStar true)' : ''}`, !text.includes('shpf'), text.slice(0, 120));
   }
-  ok('debugUrl() is the one place the full URL lives', H.debugUrl().includes('?SortType='));
+  ok(`debugUrl() is the one place the full URL lives${fs ? ' (fourStar true)' : ''}`, H.debugUrl().includes('?SortType='));
 }
 
 console.log('\nharvest.js — a WALL must never look like a parse bug');
@@ -2622,10 +2709,57 @@ await block('S7', async () => {
   const fc = await mkH({ extra: '&shpf_co=CN', startPage: 4 }, { 4: ['c4'], 5: [] });
   eq('the same filters do join', mergePayloads([fa, fc]).coverage.verdict, 'exhausted-all-results');
   ok('SKILL.md tells the recovery start() to keep fourStar and extra', /plus the SAME `fourStar` and `extra` as the first run/.test(skillSrc));
+  // Review 2026-10-24: fourStar true vs the default, and old payloads.
+  const f4 = await mkH({ fourStar: true, maxRequests: 3 }, { 1: ['a1'], 2: ['a2'], 3: ['a3'], 4: ['a4'] });
+  const f0 = await mkH({ startPage: 4 }, { 4: ['b4'], 5: [] });
+  const m40 = mergePayloads([f4, f0]);
+  ok('a fourStar:true payload and a default one have different filterKeys', f4.filterKey !== f0.filterKey);
+  eq('they are two streams', m40.coverage.byQuery.length, 2);
+  eq('a default recovery run does not complete a fourStar:true run', m40.coverage.verdict, 'truncated');
+  ok('merged-filters is named', m40.warnings.some((w) => /^merged-filters/.test(w)), JSON.stringify(m40.warnings));
+  ok('the four-star-switch warning survives the merge', m40.warnings.some((w) => /^four-star-switch/.test(w)));
+  const f4r = await mkH({ fourStar: true, startPage: 4 }, { 4: ['c4'], 5: [] });
+  eq('a fourStar:true recovery run does complete it', mergePayloads([f4, f4r]).coverage.verdict, 'exhausted-all-results');
+  const rk4 = rank(m40, ['--mode', 'shortlist', '--top', '5', '--min-evidence', '1']);
+  eq('rank.mjs carries exactly one four-star-switch warning', rk4.warnings.filter((w) => /^four-star-switch/.test(w)).length, 1);
+  const rk0 = rank(f0, ['--mode', 'shortlist', '--top', '5', '--min-evidence', '1']);
+  ok('a default payload ranks with no four-star warning', !rk0.warnings.some((w) => /^four-star-switch/.test(w)), JSON.stringify(rk0.warnings));
+  // A payload from before 2026-10-20: fourStar true or no field, and no warning of its own.
+  const legacy = { query: 'wire brush set', source: 'harvest-paged', coverage: { verdict: 'truncated' },
+    pages: [1, 2, 3].map((page) => ({ page, n: 1 })), items: ['a1', 'a2', 'a3'].map((id) => ({ id, title: 'wire brush ' + id, rating: 4.8, sold: 5000 })) };
+  eq('an old payload without fourStar joins a fourStar:true recovery', mergePayloads([legacy, f4r]).coverage.verdict, 'exhausted-all-results');
+  eq('and never a default one', mergePayloads([legacy, f0]).coverage.verdict, 'truncated');
+  const mL = mergePayloads([legacy, f0]);
+  ok('decode.mjs adds the old-payload four-star warning to its part', mL.warnings.some((w) => /^four-star-switch: this harvest used/.test(w)), JSON.stringify(mL.warnings));
+  const rkL = rank(legacy, ['--mode', 'shortlist', '--top', '5', '--min-evidence', '1']);
+  ok('rank.mjs adds it to an old payload ranked directly', rkL.warnings.some((w) => /^four-star-switch: this harvest used/.test(w)), JSON.stringify(rkL.warnings));
+  const rkF4 = rank(f4, ['--mode', 'shortlist', '--top', '5', '--min-evidence', '1']);
+  ok('a new fourStar:true payload keeps harvest.js\'s own warning, not the old one',
+    rkF4.warnings.filter((w) => /^four-star-switch/.test(w)).length === 1 && !rkF4.warnings.some((w) => /this harvest used/.test(w)), JSON.stringify(rkF4.warnings));
+  const extract = { query: 'wire brush set', source: 'extract', items: legacy.items };
+  const rkX = rank(extract, ['--mode', 'shortlist', '--top', '5', '--min-evidence', '1']);
+  ok('a single-page extract (no fourStar) gets no four-star warning', !rkX.warnings.some((w) => /^four-star-switch/.test(w)), JSON.stringify(rkX.warnings));
+  const dL = tmp('ae-4s-');
+  fsx.writeFileSync(join(dL, 'old.json'), JSON.stringify({ ...legacy, fourStar: true }));
+  const chk = JSON.parse(execFileSync('node', [join(HERE, 'decode.mjs'), '--check', join(dL, 'old.json')], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }));
+  ok('decode.mjs --check of one old payload names the four-star warning', (chk.warnings || []).some((w) => /^four-star-switch/.test(w)), JSON.stringify(chk.warnings));
+  const one = JSON.parse(execFileSync('node', [join(HERE, 'decode.mjs'), join(dL, 'old.json')], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }));
+  ok('and its decoded output carries it to rank.mjs', (one.warnings || []).some((w) => /^four-star-switch/.test(w)), JSON.stringify(one.warnings));
 });
 
 console.log('\nS8 — doc text matches the code');
 await block('S8', async () => {
+  ok('SKILL.md no longer calls the 4-star switch mandatory', !/Two parameters, both mandatory/.test(skillSrc) && !/highest-value single/.test(skillSrc));
+  ok('SKILL.md says harvest.js defaults to fourStar false', /`harvest.js` therefore defaults to `fourStar: false`/.test(skillSrc));
+  ok('SKILL.md step 1 URL carries no selectedSwitches', !/wholesale-<kebab-keywords>\.html\?SortType=total_tranpro_desc&selectedSwitches/.test(skillSrc));
+  ok('SKILL.md does not claim relevance catches deep drift', !/deep drift is now caught by `relevance`/.test(skillSrc));
+  ok('SKILL.md says decode.mjs and rank.mjs warn on an older 4-star payload', /`decode.mjs` and\s+`rank.mjs` add the same warning/.test(skillSrc));
+  // Known limit (review 2026-10-24): 25% deep drift raises no relevance warning,
+  // which is why SKILL.md must not say the share rule catches it.
+  const { queryRelevance: qrel } = await import('./lib.mjs');
+  const on = Array.from({ length: 1800 }, (_, i) => 'Stainless Steel Wire Brush Set ' + i);
+  const off = Array.from({ length: 600 }, (_, i) => 'Hair Clip Claw Clamp ' + i);
+  eq('known limit: 25% deep drift raises no relevance warning', qrel('wire brush set', [...on, ...off]).warning, null);
   ok('SKILL.md states the any-keyword rule', /holding at least one query keyword as a whole word/.test(skillSrc));
   ok('SKILL.md no longer states "at least two of its keywords"', !/at least two of its keywords/.test(skillSrc));
 });
@@ -3184,7 +3318,7 @@ await block('R-F03', async () => {
   // A backup written by older code: maxPages 70, read up to page 59.
   const ls = fakeStorage();
   ls.setItem('__aeHarvest:wire-brush:1', JSON.stringify({ v: 2, savedAt: Date.now(), query: 'wire brush', slug: 'wire-brush',
-    base: 'https://he.aliexpress.com/w/wholesale-wire-brush.html?SortType=total_tranpro_desc', fourStar: true, extra: null, startPage: 1, maxPages: 70, maxRequests: 70,
+    base: 'https://he.aliexpress.com/w/wholesale-wire-brush.html?SortType=total_tranpro_desc&selectedSwitches=filterCode%3A4StarRating', fourStar: true, extra: null, startPage: 1, maxPages: 70, maxRequests: 70,
     page: 59, requests: 59, items: [], pages: [], claimedTotal: null, stop: 'request-budget', endSignal: null, lastErr: null, wall: null, startedAt: 1 }));
   const w = { localStorage: ls };
   fetched.length = 0;
@@ -3821,6 +3955,10 @@ await block('R-F24', async () => {
   const H = loadHarvest(endless);
   const plan = H.start({ query: 'wire brush set' });
   eq('R-F24: start() defaults are maxPages 20 and maxRequests 24', [plan.maxPages, plan.maxRequests], [PIN.maxPages, PIN.maxRequests]);
+  eq('R-F24: start() default fourStar is false', plan.fourStar, false);
+  eq('R-F24: SKILL.md states the fourStar default', (skillSrc.match(/`startPage: 1`, `fourStar: (true|false)`/) || [])[1], 'false');
+  eq('R-F24: the harvest.js usage header states the fourStar default', (harvestText.match(/fourStar\s+default (TRUE|FALSE)/) || [])[1], 'FALSE');
+  ok('R-F24: the SKILL.md levers table marks the 4-star row do-not-use', /\| Rating 4★\+ \(do not use/.test(skillSrc));
   const s1 = await H.step(100);
   eq('R-F24: with no options a run reads pages 1-20 and stops as page-cap', [s1.stop, s1.pagesRead, s1.requests], ['page-cap', PIN.maxPages, PIN.maxPages]);
   const Hb = loadHarvest(endless);

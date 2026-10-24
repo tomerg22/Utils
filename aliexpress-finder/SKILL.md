@@ -15,8 +15,10 @@ because personal skills and both browser tool sets are absent there.
 
 ## Before you start
 
-Read this whole file. The gotchas below are verified against the live site
-(last full run 2026-08-21); skipping them produces silently empty or wrong results.
+Read this whole file. The gotchas below were measured on the live site, each
+on the date it names (last live run 2026-10-20). The site changes: the 4★
+switch of step 1 was right on 2026-08-21 and wrong on 2026-10-20. Skipping
+them produces silently empty or wrong results.
 
 Sanity-check the tooling whenever you change it. After editing a browser
 file, rebuild its install copy first (the tests fail on a stale one):
@@ -189,8 +191,14 @@ NOT close the tab first: the harvest lives in that tab's `window`. Since
    <last page read + 1>, maxRequests: <24 minus the requests spent> })`,
    plus the SAME `fourStar` and `extra` as the first run (other filters are
    another search stream, and `decode.mjs` will not join their pages), so
-   the budget is not spent re-reading saved pages. `maxRequests: 0` means
-   no request is left; it is not replaced by the default any more.
+   the budget is not spent re-reading saved pages. Read `fourStar` from the
+   exported payload; `extra` is not echoed there (only `extraApplied`), so
+   take it from the first `start()` call. A run without the switch needs no
+   `fourStar`: false is the default since 2026-10-20. If the first run had
+   the switch (`fourStar: true`, or a run from before 2026-10-20), do not
+   continue it: that stream may be the fixed pool of step 1, so start over
+   from page 1 without it. `maxRequests: 0` means no request is left; it is
+   not replaced by the default any more.
 5. Export again. Two saved payloads merge with `decode.mjs a.json b.json >
    harvest.json`: items are deduped by id, and the merged verdict is
    `exhausted-all-results` only when the pages read, together, run from
@@ -244,23 +252,40 @@ redirects `www.aliexpress.com/item/…` there with `gatewayAdapt=glo2isr` and
 only the locale changes.
 
 ```
-https://he.aliexpress.com/w/wholesale-<kebab-keywords>.html?SortType=total_tranpro_desc&selectedSwitches=filterCode%3A4StarRating
+https://he.aliexpress.com/w/wholesale-<kebab-keywords>.html?SortType=total_tranpro_desc
 ```
 
-Two parameters, both mandatory.
+One parameter, mandatory.
 
 `SortType=total_tranpro_desc` sorts by orders. On default sort the top results
 included "Lenovo 225W 500000mAh" at ₪48 — a physically impossible capacity, i.e.
 a counterfeit. Sorting by orders removed those entirely.
 
-`selectedSwitches=filterCode%3A4StarRating` is the highest-value single
-parameter and it is easy to miss. Measured on `wire brush set`: it cut the pool
-from 18,655 to 7,206, and — the point — it took the share of returned rows that
-actually carry a rating from **13 of 60** at an unfiltered page 20 to **60 of
-60**. Across a full 20-page harvest, 1,166 of 1,166 rows were rated. `rank.mjs`
-discards every unrated item and everything below 4.0 anyway, so this filter
-removes nothing it would have kept. It roughly triples usable rows per request,
-and requests — not results — are the scarce resource here (see step 2).
+**Do not add `selectedSwitches=filterCode%3A4StarRating`.** This file used to
+call it mandatory, on a 2026-08-21 measurement: on `wire brush set` it cut the
+pool from 18,655 to 7,206 and took the rated share of a page from 13 of 60 at
+an unfiltered page 20 to 60 of 60. Measured again on 2026-10-20 (signed-in
+Chrome and a logged-out curl alike) the site answers the switch with a small
+fixed pool per query: `nitrile gloves` 74 in 2 pages (59 logged out) against
+8,487 without, `wire brush set` 60 against 7,209, `silent wireless mouse` 25
+against 12,632. The reported total was 60 on all three. For `nitrile gloves`
+and `wire brush set` the engine reports a hit set of exactly 60
+(`pageInfo.trace.utLogMap.hitDocs`). The pool is the same ids under the
+orders sort and the default sort, 4 of 59 are unrated, nothing is below 4.0,
+and most top sellers are absent (8 of the top 10 unfiltered `nitrile gloves`
+listings, signed in; a 4.8 listing with 8,701 ratings and 50,000+ sales sat
+at position 5 unfiltered and was not in the pool). A harvest with the switch
+ends `exhausted-all-results` after 1-2 pages of items and reports that pool
+as the whole market. A 19-agent review of the saved page JSON found no
+listing property that selects the pool (not rating, sales, price, Choice,
+store, ship-from or category). `harvest.js` therefore defaults to `fourStar: false`; `fourStar:
+true` still adds the switch and then says so in `note` and in a
+`four-star-switch` warning (so does an `extra` that carries it). `rank.mjs`
+drops unrated and sub-4.0 rows itself. On 2026-10-20 unfiltered orders-sorted
+pages 1-3 of `nitrile gloves` carried 60 rated rows of 60 (signed-in Chrome).
+Deep unfiltered pages were not measured again (page 20 of `wire brush set`
+had 13 of 60 rated in 2026-08), so a deep run may spend requests on rows
+`rank.mjs` drops. That costs requests; the switch costs the market.
 
 **BROADEN the query, do not narrow it.** This file used to say that a thin pool
 means running "a second, more specific one". That advice is deleted because it
@@ -297,7 +322,7 @@ In the in-app browser `JSON.stringify(__aeRefine)` returns it all.
 
 | Lever | URL param | Value form |
 |---|---|---|
-| Rating 4★+ | `selectedSwitches` | `filterCode:4StarRating` |
+| Rating 4★+ (do not use: measured 2026-10-20 to return a small fixed pool, see above) | `selectedSwitches` | `filterCode:4StarRating` |
 | Free shipping / sale / Choice | `selectedSwitches` | `filterCode:freeshipping`, `:bigsale`, `:choice_atm` |
 | Any attribute (colour, material, brand) | `attr` | `<attributeId>-<valueId>`, e.g. `11795-4362329` |
 | Ship from | `shpf_co` | `IL`, `TR`, `CN` |
@@ -462,7 +487,7 @@ same page twice, found no new ids and ended a 600-item run at 240 as
 `exhausted-all-results`; measured by the 2026-09-29 review.)
 
 **`pageInfo.finished` is ignored, on purpose.** Measured 2026-09-29 in
-signed-in Chrome: `cheese grater` reported `finished: true` on pages 1, 2 and
+signed-in Chrome, on a 4★ stream (the switch was the default then): `cheese grater` reported `finished: true` on pages 1, 2 and
 3 while page 3 still held 60 ids never seen; the stream served 60, 60, 60, 50
 and then an empty page. Trusting the flag stopped the run after page 1 and
 would have reported 60 of 230 items as `exhausted-all-results`. A short page
@@ -471,7 +496,7 @@ on page 5. Reading to the empty page costs one request. Each entry in
 `payload().pages` still records the flag, for diagnosis.
 
 Defaults are `maxPages: 20` (the last page number read), `maxRequests: 24`,
-`startPage: 1`, `fourStar: true`. `maxRequests: 0` is a budget of zero, not
+`startPage: 1`, `fourStar: false` (since 2026-10-20, step 1). `maxRequests: 0` is a budget of zero, not
 the default. The site serves no page past 60. So a `maxPages` above 60 is
 cut to 60, and the plan (or the `resume()` reply) says so in `note`. A run
 that reaches page 60 stops as `page-cap`, and its verdict is `truncated`,
@@ -489,10 +514,24 @@ fixed depth — it varies enormously by query and is not even stable between run
 | `cheese grater` (4★, signed-in Chrome) | 230 over 4 pages, empty page 5 |
 | `rotary grater` (4★, signed-in Chrome) | 23 on page 1, empty page 2 |
 
+The (4★) rows were measured with the switch on, then the default. It is off
+since 2026-10-20 (step 1), so expect deeper streams now. The switch can still
+be on: `fourStar: true` or an `extra` that carries `4StarRating` (both warn
+`four-star-switch`), or a payload from before 2026-10-20 (`decode.mjs` and
+`rank.mjs` add the same warning to it). When a harvest ends `exhausted` with
+`pagesRead` 1-3 (the last one empty), and `claimedTotal` is 60 or
+`payload().pages[0].finished` is true, read one page without the switch
+before trusting it.
+
 **`pageInfo.totalResults` is not a denominator.** The balance-board query
 claimed **160,188** results and served nothing past page 4. In signed-in
-Chrome it did the opposite: it grew with each page read (60, 120, 180), so it
-counted what had been served. Never report coverage as a percentage of it.
+Chrome, on the 4★ `cheese grater` stream of 2026-09-29, it did the opposite:
+it grew with each page read (60, 120, 180), so it counted what had been
+served. On 2026-10-20 the unfiltered signed-in `nitrile gloves` stream's page 1
+claimed 8,487 with `finished: false` on pages 1-3, while the 4★ stream of the
+same query claimed 60 with `finished: true` on every page: that is why
+`claimedTotal` 60 and `finished` on page 1 are signs of the switch (above).
+Never report coverage as a percentage of it.
 Report `coverage.verdict`: `exhausted-all-results`, `truncated`,
 `exhausted-from-start-page` (a `startPage` run: merge it before calling it
 complete) or `off-query` (below).
@@ -502,9 +541,15 @@ returns recommendations rather than results. Measured: pages 1-12 of `wire brush
 set` gave 709 unique items with 59-60 fresh on *every* page, zero duplicates and
 zero category drift. Drift is real but only **deep** and only **unfiltered** —
 page 40 of an unfiltered brush search returns hair clips, and page 60 is the
-hard ceiling. With the 4★ filter, on-category stayed 97-100% through page 20
-on `wire brush set` and `travel duffel bag`. That is two queries, not a
-guarantee.
+hard ceiling. With the 4★ filter (then the default), on-category stayed
+97-100% through page 20 on `wire brush set` and `travel duffel bag`. That
+is two queries, not a guarantee, and the switch is off since 2026-10-20
+(step 1). Nothing catches deep drift for you now. The `relevance` share rule
+(below) warns only when fewer than half of ALL titles hold a keyword, so a
+stream whose last quarter is hair clips passes; under the 60-page cap, drift
+that begins at page 31 or later can never reach that threshold. Read
+`pages[].onQuery` (the share per page) to see where drift begins, and remove
+the drifted items with the `--require` class split of step 4.
 
 **Check that the stream is the product at all.** Measured 2026-10-17: the
 slug `wholesale-wired-usb-mouse` was served as craft wire, 281 of 282
@@ -762,7 +807,13 @@ whose titles do not match its query makes the merge `off-query`, even from
 an old harvest.js. A merged file keeps its parts' verdicts as they were
 written: after `decode.mjs` changes, merge again from the original payloads. A JSON array of payloads is accepted too. A dump whose
 `AEPAYLOAD … START` has no matching `END` (cut, or saved with CRLF and
-then changed) is an error, never a silent drop.
+then changed) is an error, never a silent drop. A payload harvested with the
+4★ switch (`fourStar: true`, or no `fourStar` field: every harvest.js run
+before 2026-10-20) gets a `four-star-switch` warning from `decode.mjs` and
+`rank.mjs` when it carries none of its own. It may be the fixed pool of
+step 1, or a real deep stream from before the site changed: apply the
+pages/`claimedTotal` check under the coverage table, and harvest again
+without the switch before you rank or report it.
 
 - *In-app browser:* call `__aeHarvest.payload()`. The result exceeds the
   tool-result limit, the harness saves it to a file and prints the path —
@@ -817,8 +868,9 @@ class the user wants, or present both.
 
 The no-rating filter removes AliExpress's SEO keyword-stuffing links (titles
 like "milk frother containeraliexpress milk frother…", all fields null).
-In `final` mode no finalist is dropped as junk: see step 7. The 4★
-URL filter from step 1 already removes nearly all of these upstream.
+In `final` mode no finalist is dropped as junk: see step 7. (The 4★ URL
+switch used to remove nearly all of these upstream. It is off since
+2026-10-20, step 1, so this filter is the one that does it.)
 
 Expect **ties**. Sold is bucketed ("10,000+", "50,000+", "100K+"), so top
 candidates score identically. That is exactly why step 5 exists. When a tie
@@ -1327,7 +1379,7 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 
 | File | Role |
 |------|------|
-| `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until an empty page or a page with no new ids (never on `finished`), reports `coverage.verdict`, `endSignal`, `relevance` (off-query streams) and `visibility`. Runs unchanged in both browsers; `forceEnglish()` (in-app only), `send()` (outcome-first reply; `send(port, {via: 'form'})` always posts the form, so it navigates even to a dead port: curl the receiver first; a plain `send()` never navigates after a refused fetch; a backup is saved before any form POST; the fetch race is skipped in a hidden tab), `restore()`/`backups()`/`dropBackup()` (localStorage backup per page, the run saved last first), `resume()` (clears a stop, keeps the items), `startPage`, `maxPages` capped at the site's last page (60), one `step()` loop at a time (`running` in `status()`), `expose()`/`chunks()` (Chrome export, visible tab only), `debugUrl()` (in-app only). |
+| `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until an empty page or a page with no new ids (never on `finished`), reports `coverage.verdict`, `endSignal`, `relevance` (off-query streams) and `visibility`. Runs unchanged in both browsers; `forceEnglish()` (in-app only), `send()` (outcome-first reply; `send(port, {via: 'form'})` always posts the form, so it navigates even to a dead port: curl the receiver first; a plain `send()` never navigates after a refused fetch; a backup is saved before any form POST; the fetch race is skipped in a hidden tab), `restore()`/`backups()`/`dropBackup()` (localStorage backup per page, the run saved last first), `resume()` (clears a stop, keeps the items), `startPage`, `maxPages` capped at the site's last page (60), one `step()` loop at a time (`running` in `status()`), `expose()`/`chunks()` (Chrome export, visible tab only), `debugUrl()` (in-app only); `fourStar` off by default since 2026-10-20 (`true`, or an `extra` that carries the 4★ switch, makes `start()` `note`, `status()` `note` and a `four-star-switch` payload warning say so). |
 | `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; after a `curl` check, `__aeHarvest.send(port, {via: 'form'})` POSTs the payload to it and it writes `harvest-<query>-<stamp>.json` and prints `saved <path>` in its own output (a fetch gets the same line as its reply). No payload limit by default; exits after 60 idle minutes; `GET /` answers `ok …`. |
 | `scripts/decode.mjs` | **Fallback decoder and merger.** Reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps (any order, refuses a partial set), or from a plain payload JSON or an array of them. Several payloads are merged, deduped by id, never dropped. |
 | `scripts/build.mjs` | Writes `scripts/dist/*.min.js`: the three browser files without comments, for the install paste. `--check` reports a stale copy; `test.mjs` fails on one. |
@@ -1348,6 +1400,30 @@ matches `lib.mjs` on every fixture — keep them in sync, the test will catch yo
 if you don't. A drifted `wallVerdict` means one entry point silently stops
 detecting walls; a drifted `SOLD_RE` means best sellers silently lose their
 sold count.
+
+### Defects fixed 2026-10-20 (the nitrile-gloves session)
+
+The mandatory 4★ URL switch of step 1 hid the best listing. For `Nitrile
+Gloves 8Mil` the harvest read 74 items in 2 pages, ended
+`exhausted-all-results`, and the report's four picks had 9 to 876 ratings.
+The user then sent 1005008255507851: 4.8 from 8,701 ratings, 50,000+ sold,
+position 5 of the unfiltered orders-sorted search, absent from the 74. The
+switch no longer filters by rating: the site answers it with a small fixed
+pool per query (25 to 74 listings, a reported total of 60, the same ids
+under any sort, unrated items inside, most top sellers outside), signed in
+and logged out alike, on three queries. Fix: `harvest.js` defaults to
+`fourStar: false`; `fourStar: true` (or an `extra` that carries the switch)
+says so in `start()`'s `note`, `status()` and a `four-star-switch` payload
+warning; `decode.mjs` and `rank.mjs` add that warning to an older 4★ payload
+that has none. Step 1 records both measurements. The review of the fix
+(2026-10-24) also found: `status()` with the full note passed the Chrome
+1,000-character cut (it now ends with a short marker), `restore()` and
+`resume()` dropped or misplaced that marker, and the drift text claimed
+`relevance` catches deep drift (it does not; step 3). Rules: a URL switch is
+never mandatory on one day's measurement; when a harvest ends `exhausted`
+after 1-3 pages with `claimedTotal` 60 or `finished` on page 1, read one page
+without the switch before trusting it; `rank.mjs` is where the rating cut
+lives.
 
 ### Defects fixed 2026-10-19 (the Poco F7 Ultra wallet case session)
 
@@ -1500,7 +1576,7 @@ pages. Each has a guard in code, and its tests fail on the old code.
 
 1. **The harvest stopped at page 1 and called it exhausted.** `harvest.js`
    ended the run on `pageInfo.finished: true`. That flag was true on every
-   page served: `cheese grater` pages 1-3 each carried it, and page 3 still
+   page served (a 4★ stream, the default then): `cheese grater` pages 1-3 each carried it, and page 3 still
    held 60 new ids. The stream really ended with an empty page 5, at 230
    items. The run was saved only because the operator noticed that
    "cheese grater" could not have just 60 results. Guard: the run ends only on

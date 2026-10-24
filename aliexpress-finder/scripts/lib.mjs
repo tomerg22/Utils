@@ -521,6 +521,29 @@ function queryRelevance(query, titles) {
 
 export { parseSold, SOLD_RE, parseReviewBlock, wallVerdict, queryRelevance };
 
+/* A payload harvested with the 4StarRating switch that carries no
+ * four-star-switch warning of its own: every harvest.js run before
+ * 2026-10-20 (the switch was the default then) and any payload with no
+ * fourStar field. harvest.js writes the warning only for runs it makes now,
+ * so an old file decoded and ranked with no warning at all (review
+ * 2026-10-24). decode.mjs and rank.mjs add this one. Only harvest-paged
+ * parts count: a single-page extract records no fourStar. Worded as "may":
+ * deep 4-star streams were real before the site changed (step 3 table). */
+export const FOUR_STAR_OLD = 'four-star-switch: this harvest used the 4StarRating switch (fourStar true, or no ' +
+  'fourStar field: harvest.js used it by default before 2026-10-20). Measured 2026-10-20, the site answers that ' +
+  'switch with a small fixed pool per query, not the rated catalogue. If the stream ran dry after 1-3 pages, with ' +
+  'a claimed total of 60 or finished on page 1, it is that pool and not the market: harvest again without the ' +
+  'switch before you rank or report it.';
+const hasFourStar = (ws) => Array.isArray(ws) && ws.some((w) => typeof w === 'string' && /^four-star-switch/.test(w));
+/** FOUR_STAR_OLD when a payload (or a part of a decode.mjs merge) was
+ * harvested with the switch and says nothing about it; null otherwise. */
+export function fourStarWarning(p) {
+  if (!p || typeof p !== 'object' || hasFourStar(p.warnings)) return null;
+  const parts = p.source === 'merged' && Array.isArray(p.parts) ? p.parts : [p];
+  return parts.some((x) => x && x.source === 'harvest-paged' && x.fourStar !== false && !hasFourStar(x.warnings))
+    ? FOUR_STAR_OLD : null;
+}
+
 /** Median of a numeric array, or null when empty. */
 export function median(xs) {
   const s = [...xs].sort((a, b) => a - b);

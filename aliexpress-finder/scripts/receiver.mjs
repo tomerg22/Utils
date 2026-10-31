@@ -126,7 +126,7 @@ export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () 
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
       // Two payloads in one millisecond used to share a name, and the second
       // overwrote the first while both were answered "saved".
-      const base = join(dir, 'harvest-' + slugify(v.payload.query).slice(0, 80) + '-' + stamp);
+      const base = join(dir, 'harvest-' + slugify(v.payload.query || v.payload.kind).slice(0, 80) + '-' + stamp);
       let file = base + '.json';
       for (let n = 2; existsSync(file); n++) file = base + '-' + n + '.json';
       // A write error (dir removed, disk full) answers 500 and keeps the

@@ -5,6 +5,7 @@
  *   node rank.mjs --mode shortlist --top 10  < harvest.json
  *   node rank.mjs --mode final     --top 4   < finalists.json
  *   node rank.mjs --mode final --require 'מקציף|קצף' < finalists.json
+ *   node rank.mjs --mode final --criterion noise:low --criterion airflow:high < finalists.json
  *
  * stdin: a JSON array of items, or {items:[...]}, or an array of extractor
  *        payloads (multiple pages) — all are accepted and merged/deduped by id.
@@ -55,7 +56,7 @@ import { median, parseSold, queryRelevance, fourStarWarning } from './lib.mjs';
  * skipped with exit 0, and the hard requirement was dropped (recheck,
  * 2026-10-19). */
 const FLAGS = ['mode', 'top', 'min-rating', 'min-evidence', 'w-quality', 'w-volume', 'w-brand', 'prior',
-  'brand-default', 'require', 'spread', 'constraint'];
+  'brand-default', 'require', 'spread', 'constraint', 'criterion', 'w-criterion'];
 /* A flag with no value (last on the line, or followed by another --flag)
  * is an error, never a silent NaN. Measured 2026-10-18: `--spread x`, a bare
  * `--spread` or `--top abc` made headCount NaN, slice(0, NaN) returned [],
@@ -143,6 +144,37 @@ const argAll = (name) => {
  *   { constraints: { wires: 'pass' | 'fail' | 'unknown' } }
  */
 const CONSTRAINTS = argAll('constraint');
+/* WHY --criterion EXISTS (measured 2026-10-31, the PSU fan session)
+ *
+ * The user said "the noise is important". Ratings and review counts were all
+ * this file could rank on, so a fan with a "loud noise (8)" buyer tag came
+ * second and an 18 dBA fan fourth. The order had to be overruled by hand.
+ *
+ * A --constraint says what an item MUST be. A --criterion says what the user
+ * wants MORE or LESS of. Finalists carry the number in attrs:
+ *   { attrs: { noise: 18.1, airflow: 59.21 } }
+ * --criterion noise:low --criterion airflow:high
+ * Each value is scaled 0..1 across the ranked pool. Several criteria count
+ * equally, and their mean takes --w-criterion (default 0.5) of the score.
+ *
+ * A finalist with no number is set aside BY NAME: unknown noise is not quiet
+ * and not loud. The number's source (a maker's sheet or a seller's text) is
+ * for the report to say: this file cannot tell them apart.
+ */
+const CRITERIA = argAll('criterion').map((raw) => {
+  const m = /^([A-Za-z0-9_-]+):(low|high)$/.exec(raw);
+  if (!m) die(`--criterion must be name:low or name:high, got ${JSON.stringify(raw)}`);
+  return { name: m[1], dir: m[2] };
+});
+if (CRITERIA.length && MODE !== 'final') die('--criterion needs --mode final: attrs come from the detail pages (step 5)');
+if (new Set(CRITERIA.map((c) => c.name)).size < CRITERIA.length) die('--criterion names the same attribute twice');
+const W_CRITERION = numArg('w-criterion', 0.5, { min: 0 });
+if (W_CRITERION > 1) die(`--w-criterion must be 0..1, got ${W_CRITERION}`);
+const attrOf = (item, name) => {
+  const v = item && item.attrs && typeof item.attrs === 'object' ? item.attrs[name] : null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  return typeof v === 'string' && /^\s*-?\d+(\.\d+)?\s*$/.test(v) ? Number(v) : null;
+};
 const constraintStatus = (item, name) => {
   const c = item && item.constraints;
   const v = c && typeof c === 'object' ? c[name] : undefined;
@@ -207,6 +239,8 @@ absorb(raw);
 // Dedupe by id, preferring the record that carries the most data.
 const byId = new Map();
 for (const it of pool) {
+  // A __aeListing.capture() record carries the whole read; ranking needs none of it.
+  delete it.detail;
   const prev = byId.get(it.id);
   const score = (o) => (o.reviews ? 2 : 0) + (o.rating ? 1 : 0);
   if (!prev || score(it) > score(prev)) byId.set(it.id, { ...prev, ...it });
@@ -316,6 +350,9 @@ for (const i of all) {
   // `--min-evidence 0` keeps a 0; unknown evidence (null) is never kept.
   else if (ev == null) dropped.push({ ...i, why: MIN_EVIDENCE > 0 ? `evidence<${MIN_EVIDENCE}` : 'evidence-unknown' });
   else if (ev < MIN_EVIDENCE || (MIN_EVIDENCE > 0 && !ev)) dropped.push({ ...i, why: `evidence<${MIN_EVIDENCE}` });
+  else if (CRITERIA.some((c) => attrOf(i, c.name) == null)) {
+    dropped.push({ ...i, why: 'criterion-unknown:' + CRITERIA.filter((c) => attrOf(i, c.name) == null).map((c) => c.name).join('+') });
+  }
   // Unverified is held back LAST, so a genuinely bad item is reported as bad
   // rather than as merely unchecked.
   else if (unknown.length) unverified.push({ ...i, why: `unverified:${unknown.join('+')}` });
@@ -397,6 +434,22 @@ if (noRating.length)
   warnings.push(`no-rating: ${noRating.length} finalist(s) carry an own review count but no rating ` +
     `(${noRating.slice(0, 3).map((i) => i.id).join(', ')}). They were set aside, NOT ranked: re-read the review ` +
     'block ("4.9 1090 ratings") on their detail pages and pass ownRating.');
+/* A finalist is never set aside without a word (see no-rating above). Measured
+ * 2026-10-31: the default floor dropped 4 of 8 fans, among them the two
+ * quietest (9 and 5 own ratings), and the only trace was a count. In a niche
+ * with few sales the floor can decide the answer, so it names who it took. */
+const thin = MODE === 'final' ? dropped.filter((d) => /^evidence/.test(d.why)) : [];
+if (thin.length) {
+  warnings.push(`below-evidence-floor: ${thin.length} finalist(s) have fewer than ${MIN_EVIDENCE} own ratings and were set aside (` +
+    thin.slice(0, 6).map((i) => `${i.id} ${String(i.title || '').slice(0, 30)}: ${i.reviews}`).join('; ') + (thin.length > 6 ? '; …' : '') +
+    `). This is about evidence, not quality. Rerun with --min-evidence 1 when the niche is small, and report the thin count.`);
+}
+const noAttr = dropped.filter((d) => d.why.startsWith('criterion-unknown:'));
+if (noAttr.length) {
+  warnings.push(`criterion-unknown: ${noAttr.length} finalist(s) carry no number for a --criterion (` +
+    noAttr.slice(0, 6).map((i) => `${i.id}: ${i.why.slice('criterion-unknown:'.length)}`).join('; ') +
+    '). They were set aside, NOT ranked: read the number from the spec rows, the description or the photo, or report it as unknown.');
+}
 if (CONSTRAINTS.length && unverified.length)
   warnings.push(`unverified-constraint: ${unverified.length} item(s) were NOT ranked because ` +
     `their status for [${CONSTRAINTS.join(', ')}] is unknown. Check them, do not assume they pass.`);
@@ -462,6 +515,22 @@ const wq = anyBrand ? W_QUALITY : W_QUALITY / (W_QUALITY + W_VOLUME);
 const wv = anyBrand ? W_VOLUME : W_VOLUME / (W_QUALITY + W_VOLUME);
 const wb = anyBrand ? W_BRAND : 0;
 
+// The range of each --criterion across the ranked pool, for the 0..1 scale.
+const ranges = CRITERIA.map((c) => {
+  const vals = kept.map((i) => attrOf(i, c.name));
+  return { ...c, min: Math.min(...vals), max: Math.max(...vals) };
+});
+const criterionOf = (i) => {
+  if (!ranges.length) return null;
+  const parts = ranges.map((r) => {
+    // All equal: nobody is better on it, so it moves nobody.
+    if (r.max === r.min) return 0.5;
+    const x = (attrOf(i, r.name) - r.min) / (r.max - r.min);
+    return r.dir === 'low' ? 1 - x : x;
+  });
+  return parts.reduce((a, b) => a + b, 0) / parts.length;
+};
+
 const scored = kept
   .map((i) => {
     const ev = evidenceOf(i);
@@ -470,7 +539,9 @@ const scored = kept
     const volume = maxEv > 0 ? Math.log10(1 + ev) / Math.log10(1 + maxEv) : 0;
     // Missing brand data is NEUTRAL, not zero — see header note.
     const brand = typeof i.brandScore === 'number' ? i.brandScore : BRAND_DEFAULT;
-    const score = wq * quality + wv * volume + wb * brand;
+    const base = wq * quality + wv * volume + wb * brand;
+    const crit = criterionOf(i);
+    const score = crit == null ? base : (1 - W_CRITERION) * base + W_CRITERION * crit;
 
     const flags = [];
     if (i.discountPct != null && i.discountPct >= 80) flags.push('extreme-discount');
@@ -498,6 +569,7 @@ const scored = kept
       quality: +quality.toFixed(4),
       volume: +volume.toFixed(4),
       brandUsed: +brand.toFixed(3),
+      ...(crit == null ? {} : { baseScore: +base.toFixed(4), criterionScore: +crit.toFixed(4) }),
       score: +score.toFixed(4),
       flags,
     };
@@ -576,6 +648,7 @@ console.log(
     {
       mode: MODE,
       weights: { quality: +wq.toFixed(3), volume: +wv.toFixed(3), brand: +wb.toFixed(3) },
+      ...(CRITERIA.length ? { criteria: ranges, criterionWeight: W_CRITERION } : {}),
       prior: PRIOR,
       brandDefault: anyBrand ? BRAND_DEFAULT : null,
       brandDefaulted,
@@ -594,6 +667,8 @@ console.log(
       kept: kept.length,
       droppedCount: dropped.length,
       droppedReasons: dropped.reduce((a, d) => ({ ...a, [d.why]: (a[d.why] || 0) + 1 }), {}),
+      // Final mode names them: each one was read in step 5.
+      ...(MODE === 'final' ? { droppedItems: dropped.map((d) => ({ id: d.id, title: String(d.title || '').slice(0, 60), why: d.why })) } : {}),
       ranked,
     },
     null,

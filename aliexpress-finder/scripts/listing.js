@@ -17,6 +17,10 @@
  *                             // fetch: if read() timed out, read this next call
  *   await __aeListing.read({ description: false })  // never fetch
  *   __aeListing.changed(fp)   // did the page change since fingerprint fp?
+ *   await __aeListing.capture() // read() + price + JSON-LD, saved in localStorage; short reply
+ *   __aeListing.options()     // the option tiles; pick('12CM') selects one by exact name
+ *   __aeListing.price()       // the price on screen, for the options selected now
+ *   __aeListing.sendAll(8765) // every captured record to receiver.mjs (navigates)
  *
  * The Chrome connector cuts a result at 1,000 characters, so there keep the
  * result on window (`window.__r = await __aeListing.read()`) and return the
@@ -182,6 +186,14 @@ function wallVerdict(sig) {
 }
 /* @shared:wallVerdict:end */
 
+  /* @shared:soldRe:start */
+  /* The sold marker follows the page language: "1,000+ נמכרו" on a Hebrew
+  * page, "10,000+ sold" on an English one. From 100,000 up the number carries
+  * a K ("100K+ sold", measured 2026-09-25). Without [KkMm] the match failed
+  * and soldRaw came back null for the best sellers of the pool. */
+  const SOLD_RE = /([\d.,]+\s*[KkMm]?\s*\+?)\s*(?:נמכר|sold)/i;
+  /* @shared:soldRe:end */
+
   /* @shared:reviewBlock:start */
   /* Read a detail page's review counts from its rendered text.
    *
@@ -272,22 +284,65 @@ function wallVerdict(sig) {
    * so only the stem is matched. The NEAREST matching ancestor wins.
    *   product      main-image--wrap: the slider and the magnifier
    *   description  #nav-description / description--wrap (and its shadow tree)
-   *   carousel     slick-slide/-track/-list, "recommend": other products
+   *   carousel     slick-slide/-track/-list, "recommend", and the list under
+   *                "Related items": fusion-page-card--, productItem-- (measured
+   *                2026-10-31: "For Sunon DP200A ... 120*120*38MM" came back as
+   *                the size of a 120 x 25 mm fan, from productItem--itemInfoTitle
+   *                inside fusion-page-card--listItem, on two listings), and the
+   *                search tags at the page's foot: cross-link ("120x120x38mm fan
+   *                220v" as the size of a 25 mm fan, the same day). Also any link
+   *                to ANOTHER item: the store's own list has hashed class names
+   *                (_1nZuI inside card-out-wrapper) and gave "ACP14025 ... 140x140x25mm"
    *   footer       footer-copywrite: the business-licence badge
    *   menu         Categoey--: the category menu icons */
+  const itemIdOf = (u) => (String(u || '').match(/\/item\/(\d+)\.html/) || [])[1] || null;
   function zone(e) {
     let n = e, d = 0;
+    const self = itemIdOf(typeof location !== 'undefined' && location.href);
     while (n && d < 60) {
       const c = typeof n.className === 'string' ? n.className : '';
       const id = typeof n.id === 'string' ? n.id : '';
+      if (n.tagName === 'A' && n.getAttribute) {
+        const other = itemIdOf(n.getAttribute('href'));
+        if (other && other !== self) return 'carousel';
+      }
       if (/(^|\s)main-image--/.test(c)) return 'product';
       if (id === 'nav-description' || /(^|\s)description--wrap/.test(c)) return 'description';
-      if (/(^|\s)slick-(slide|track|list)\b|recommend/i.test(c)) return 'carousel';
+      if (/(^|\s)slick-(slide|track|list)\b|recommend|(^|\s)(fusion-page-card|productItem)--|(^|\s)(cross-link|card-out-wrapper)\b/i.test(c)) return 'carousel';
       if (/(^|\s)footer/i.test(c)) return 'footer';
       if (/(^|\s)Categoey--|(^|\s)category/i.test(c)) return 'menu';
       n = up(n); d++;
     }
     return 'other';
+  }
+
+  /* One option tile of the selector, and its name. */
+  const isTile = (cls) => /sku-item--(image|text)|sku-property-item/.test(cls);
+  const classOf = (e) => (e.className && e.className.toString ? e.className.toString() : '');
+  const tileName = (e) => {
+    const img = e.querySelector ? e.querySelector('img') : null;
+    return clean((img && img.getAttribute && (img.getAttribute('alt') || img.getAttribute('title'))) ||
+                 (e.getAttribute && e.getAttribute('title')) || e.textContent);
+  };
+
+  /* "US $8.99", "₪6.38", "1,234.50 €" as a number. The last separator is the
+   * decimal mark only when one or two digits follow it. */
+  function priceNumber(text) {
+    const m = String(text || '').match(/\d[\d.,]*/);
+    if (!m) return null;
+    const t = m[0].replace(/[.,]$/, '');
+    const d = t.match(/[.,](\d{1,2})$/);
+    const whole = (d ? t.slice(0, -d[0].length) : t).replace(/[.,]/g, '');
+    const n = Number(whole + (d ? '.' + d[1] : ''));
+    return Number.isFinite(n) ? n : null;
+  }
+  function priceCurrency(text) {
+    const t = String(text || '');
+    if (/\$/.test(t)) return 'USD';
+    if (/₪/.test(t)) return 'ILS';
+    if (/€/.test(t)) return 'EUR';
+    if (/£/.test(t)) return 'GBP';
+    return null;
   }
 
   /* The full-size asset behind a displayed image. The slider shows
@@ -392,6 +447,7 @@ function wallVerdict(sig) {
   // Zones that hold OTHER products: their titles are never this listing's
   // size lines (a carousel of "Mouse Pad Size 80x30cm" filled all 10 slots).
   const FOREIGN_ZONE = /^(carousel|footer|menu)$/;
+  const RECORD_PREFIX = '__aeDet:';
   function leavesOf(root, seenLeaf, out) {
     walk(root, (e) => {
       if (!isLine(e)) return;
@@ -798,6 +854,159 @@ function wallVerdict(sig) {
      * replaces it when the fetch settles. If read() times out (a stalled
      * fetch in a hidden tab), return fields from `__aeListing.last` in the
      * next call instead of losing the whole read. */
+    /* The price on screen, for the options selected NOW. JSON-LD holds the
+     * price of the option selected when the page loaded, which may not be the
+     * one the user needs. Measured 2026-10-31: COOLCIRC loaded on its 14 cm
+     * option at $8.99 and the 12 cm one was $6.42; the search grid also said
+     * $8.99, so the grid is not always the cheapest option either. */
+    price() {
+      let text = null;
+      walk(document, (e) => {
+        if (text) return;
+        const c = typeof e.className === 'string' ? e.className : '';
+        if (!/(^|\s)price(-default)?--current/.test(c) || FOREIGN_ZONE.test(zone(e))) return;
+        const t = clean(e.textContent);
+        if (t && t.length < 40 && /\d/.test(t)) text = t;
+      });
+      return { text, value: priceNumber(text), currency: priceCurrency(text) };
+    },
+
+    /* Every option tile: { name, selected, soldOut }. */
+    options() {
+      const out = [];
+      walk(document, (e) => {
+        const cls = classOf(e);
+        if (!isTile(cls)) return;
+        const name = tileName(e);
+        if (name) out.push({ name, selected: /sku-item--selected|\bselected\b|\bactive\b/i.test(cls), soldOut: /soldOut|sold-out|disabled/i.test(cls) });
+      });
+      return out;
+    },
+
+    /* Select one option by its EXACT name, then wait with
+     * computer{action:"wait"} (never a page timer) and call price() or
+     * capture(). A guess is never clicked: no exact match, or a name used by
+     * two tiles, clicks nothing and lists the names. A tile already selected
+     * is left alone: a second click can clear it. */
+    pick(name) {
+      const hits = [], names = [];
+      walk(document, (e) => {
+        const cls = classOf(e);
+        if (!isTile(cls)) return;
+        const n = tileName(e);
+        if (n) names.push(n);
+        if (n === name) hits.push({ e, cls });
+      });
+      const short = names.slice(0, 30).map((n) => n.slice(0, 24));
+      if (!hits.length) return { clicked: false, reason: 'no option has this exact name', options: short };
+      if (hits.length > 1) return { clicked: false, reason: 'two options have this name', options: short };
+      if (/sku-item--selected|\bselected\b|\bactive\b/i.test(hits[0].cls)) return { clicked: false, alreadySelected: true };
+      if (/soldOut|sold-out|disabled/i.test(hits[0].cls)) return { clicked: false, reason: 'sold out', soldOut: true };
+      hits[0].e.click();
+      return { clicked: true, name, next: 'wait with computer{action:"wait"}, then price() or capture()' };
+    },
+
+    /* read() plus the JSON-LD and the price on screen, saved in localStorage
+     * so it outlives navigation, as one record rank.mjs can read. Returns a
+     * short summary, under the Chrome connector's 1,000 characters. A wall
+     * saves nothing and says so (SKILL.md step 2). Capturing an item again
+     * replaces its record. */
+    async capture(opts) {
+      const r = await this.read(opts);
+      if (r.blocked || r.suspectedWall) {
+        return { saved: false, blocked: !!r.blocked, suspectedWall: !!r.suspectedWall, markers: r.wall && r.wall.markers, note: r.note };
+      }
+      let p = null;
+      for (const el of document.querySelectorAll('script[type="application/ld+json"]')) {
+        try { const a = JSON.parse(el.textContent); p = p || (Array.isArray(a) ? a : [a]).find((x) => x && x['@type'] === 'Product') || null; } catch (e) { /* not JSON */ }
+      }
+      const offer = (p && p.offers) || {}, ar = (p && p.aggregateRating) || {};
+      const shown = this.price();
+      const ldPrice = offer.price != null && Number.isFinite(Number(offer.price)) ? Number(offer.price) : null;
+      const body = String((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+      // Only the header counts: see the step-5 reader in SKILL.md.
+      const HEAD = new RegExp('(?:Reviews|חוות דעת)\\s*(?:[^\\s\\d]\\s*)?' +
+        SOLD_RE.source.replace('(?:נמכר|sold)', '(?:נמכר|sold|sales)'), 'i');
+      const sold = body.match(HEAD);
+      const id = (String(location.pathname || '').match(/(\d+)\.html/) || [])[1] || null;
+      const rec = {
+        id,
+        url: 'https://he.aliexpress.com/item/' + id + '.html',
+        title: (p && p.name) || clean(document.title),
+        price: shown.value != null ? shown.value : ldPrice,
+        priceFrom: shown.value != null ? 'screen' : (ldPrice != null ? 'json-ld' : 'none'),
+        jsonLdPrice: ldPrice,
+        currency: offer.priceCurrency || shown.currency,
+        selected: r.selectedVariants,
+        options: r.variants,
+        reviews: r.reviews.own,
+        ownRating: r.reviews.ownRating,
+        pooledReviews: ar.reviewCount != null && Number.isFinite(Number(ar.reviewCount)) ? Number(ar.reviewCount) : null,
+        rating: ar.ratingValue != null && Number.isFinite(Number(ar.ratingValue)) ? Number(ar.ratingValue) : null,
+        soldRaw: sold ? sold[1].replace(/\s/g, '') : null,
+        specs: r.specs,
+        specsSource: r.specsSource,
+        gallery: r.gallery,
+        descriptionImages: r.descriptionImages,
+        detail: r,
+      };
+      let saved = false, err = null;
+      try { window.localStorage.setItem(RECORD_PREFIX + id, JSON.stringify(rec)); saved = true; } catch (e) { err = String(e).slice(0, 100); }
+      /* AliExpress keeps a sold-out option clickable and shows its price, with
+       * sku-item--soldOut on the tile (measured 2026-10-31: COOLCIRC's 12 cm
+       * option read $6.42 and could not be bought). */
+      rec.soldOut = this.options().filter((o) => o.selected && o.soldOut).map((o) => o.name);
+      try { window.localStorage.setItem(RECORD_PREFIX + id, JSON.stringify(rec)); } catch (e) { /* err is set above */ }
+      const brief = { saved, id, price: rec.price, priceFrom: rec.priceFrom, currency: rec.currency,
+        reviews: rec.reviews, ownRating: rec.ownRating, pooledReviews: rec.pooledReviews, soldRaw: rec.soldRaw,
+        selected: rec.selected.map((v) => v.slice(0, 24)).slice(0, 4), optionCount: rec.options.length,
+        specRows: Object.keys(rec.specs).length, specsSource: rec.specsSource, description: r.description.source,
+        gallery: r.galleryCount, descriptionImages: r.descriptionImages.length, visibility: r.visibility,
+        warnings: r.warnings.map((w) => w.split(':')[0]) };
+      if (err) brief.err = err;
+      if (rec.soldOut.length) brief.soldOut = rec.soldOut.map((v) => v.slice(0, 24));
+      return brief;
+    },
+
+    /* The ids captured so far on this site. */
+    captured() {
+      const out = [];
+      try {
+        const ls = window.localStorage;
+        for (let i = 0; i < ls.length; i++) {
+          const k = ls.key(i);
+          if (k && k.indexOf(RECORD_PREFIX) === 0) out.push(k.slice(RECORD_PREFIX.length));
+        }
+      } catch (e) { /* no storage */ }
+      return out;
+    },
+
+    /* Post every captured record to receiver.mjs, as one file rank.mjs reads.
+     * The same top-level form as __aeHarvest.send(port, {via:'form'}), so it
+     * NAVIGATES, to a dead port too: curl the receiver first. The records stay
+     * in localStorage until dropCaptured(), so a failed post loses nothing. */
+    sendAll(port) {
+      const items = this.captured().map((id) => JSON.parse(window.localStorage.getItem(RECORD_PREFIX + id)));
+      if (!items.length) return 'NOT DELIVERED: nothing captured yet';
+      const body = JSON.stringify({ kind: 'details', source: 'listing', items });
+      const url = 'http://127.0.0.1:' + (port || 8765) + '/harvest';
+      const f = document.createElement('form');
+      f.method = 'POST'; f.action = url; f.enctype = 'text/plain';
+      const ta = document.createElement('textarea');
+      ta.name = 'payload'; ta.value = body;
+      f.appendChild(ta);
+      document.body.appendChild(f);
+      f.submit();
+      return 'UNCONFIRMED: form-posted ' + items.length + ' records (' + body.length + ' chars) to ' + url +
+             ' - delivered only if the receiver prints "saved <path>" in its own output. The records stay saved until dropCaptured()';
+    },
+
+    dropCaptured() {
+      const ids = this.captured();
+      ids.forEach((id) => { try { window.localStorage.removeItem(RECORD_PREFIX + id); } catch (e) { /* no storage */ } });
+      return 'dropped ' + ids.length + ' record(s)';
+    },
+
     last: null,
 
     /* async: `await __aeListing.read()`. It fetches the description when the
@@ -901,11 +1110,9 @@ function wallVerdict(sig) {
       const selectedVariants = [];
       let selectedVariant = null;
       walk(document, (e) => {
-        const cls = (e.className && e.className.toString ? e.className.toString() : '');
-        if (!/sku-item--(image|text)|sku-property-item/.test(cls)) return;
-        const img = e.querySelector ? e.querySelector('img') : null;
-        let v = clean((img && img.getAttribute && (img.getAttribute('alt') || img.getAttribute('title'))) ||
-                        (e.getAttribute && e.getAttribute('title')) || e.textContent);
+        const cls = classOf(e);
+        if (!isTile(cls)) return;
+        let v = tileName(e);
         // Long option names are cut, never dropped: a 68-char selected
         // option used to vanish, and with it the option the price is for.
         if (!v) return;

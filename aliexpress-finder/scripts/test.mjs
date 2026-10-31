@@ -4277,7 +4277,8 @@ await block('R-SPEC-MORE', async () => {
   const p1 = page();
   const g1 = s5(p1);
   eq('R-SPEC-MORE: step 5 reads the rows behind "View more"', g1.spec,
-    { 'Power Type': 'Rechargeable', 'Interface Type': 'Bluetooth', 'Battery Included': 'Yes', Type: 'Bluetooth Wireless' });
+    // Every row but SKIP since 2026-10-31, so "Number of Rollers" comes back too.
+    { 'Power Type': 'Rechargeable', 'Number of Rollers': '1 pcs', 'Interface Type': 'Bluetooth', 'Battery Included': 'Yes', Type: 'Bluetooth Wireless' });
   eq('R-SPEC-MORE: step 5 clicks the spec button once and says so', [p1.clicks.spec, g1.specMore], [1, 1]);
   eq('R-SPEC-MORE: step 5 does not click the reviews "View more"', p1.clicks.review, 0);
   const g1b = s5(p1);
@@ -4601,6 +4602,209 @@ await block('R-BRAND-3', async () => {
     ['type c earpods', fx.typeCEarphones.titles], ['usb c 2m', fx.iemCables.titles], ['type c 2m', mixPage(6)], ['alpha beta gamma delta', s2],
     ['type c widget', s1], ['usb ' + fx.pocoPhones.query, fx.pocoPhones.titles], [poolQ, pool], ['usb hdmi lightning thunderbolt', conOnly]];
   eq('R-BRAND-3: harvest.js queryRelevance agrees with lib.mjs on all of them', cases.filter(([q, ts]) => JSON.stringify(inl(q, ts)) !== JSON.stringify(qr(q, ts))).length, 0);
+});
+
+// ============================================================================
+// The PSU fan session, 2026-10-31.
+// ============================================================================
+console.log('\nF31-2: final mode names the finalists under the evidence floor');
+await block('F31-2', async () => {
+  const fin = (id, reviews, extra = {}) => ({ id, title: 'Fan ' + id, ownRating: 4.8, rating: 4.8, reviews, pooledReviews: reviews, sold: 500, ...extra });
+  const r = rankRun([fin('big', 100), fin('quiet', 9)], ['--mode', 'final']).out;
+  ok('F31-2: the warning names the dropped finalist and its count', r.warnings.some((w) => /^below-evidence-floor: 1 /.test(w) && w.includes('quiet') && w.includes(': 9') && w.includes('--min-evidence 1')), JSON.stringify(r.warnings));
+  eq('F31-2: droppedItems names it with the reason', r.droppedItems, [{ id: 'quiet', title: 'Fan quiet', why: 'evidence<10' }]);
+  const none = rankRun([fin('big', 100)], ['--mode', 'final']).out;
+  ok('F31-2: no warning when nobody is under the floor', !none.warnings.some((w) => /below-evidence-floor/.test(w)), JSON.stringify(none.warnings));
+  const low = rankRun([fin('big', 100), fin('quiet', 9)], ['--mode', 'final', '--min-evidence', '1']).out;
+  eq('F31-2: --min-evidence 1 keeps it', low.ranked.map((x) => x.id).sort(), ['big', 'quiet']);
+  const sl = rankRun([{ id: 'a', title: 'A', rating: 4.8, sold: 500 }, { id: 'b', title: 'B', rating: 4.8, sold: 5 }], ['--mode', 'shortlist']).out;
+  ok('F31-2: shortlist mode stays quiet: hundreds of drops are normal there', !('droppedItems' in sl) && !sl.warnings.some((w) => /below-evidence-floor/.test(w)), JSON.stringify(sl.warnings));
+});
+
+console.log('\nF31-3: --criterion ranks on what the user named');
+await block('F31-3', async () => {
+  const fin = (id, noise, airflow, reviews = 100, rating = 4.8) => ({ id, title: 'Fan ' + id, ownRating: rating, rating, reviews, pooledReviews: reviews, sold: 500, attrs: { noise, airflow } });
+  const pool = [fin('loud', 40, 88, 500, 4.9), fin('quiet', 18, 59, 100, 4.7), fin('mid', 26, 63, 100, 4.7)];
+  const plain = rankRun(pool, ['--mode', 'final']).out;
+  eq('F31-3: without the flag ratings decide, and no new field appears', [plain.ranked[0].id, 'baseScore' in plain.ranked[0], 'criteria' in plain], ['loud', false, false]);
+  const r = rankRun(pool, ['--mode', 'final', '--criterion', 'noise:low']).out;
+  eq('F31-3: noise:low puts the quiet one first and the loud one last', [r.ranked[0].id, r.ranked[2].id], ['quiet', 'loud']);
+  eq('F31-3: the scale is 0..1 across the pool', [r.ranked[0].criterionScore, r.ranked[2].criterionScore], [1, 0]);
+  eq('F31-3: the output says what ran', [r.criteria.map((c) => [c.name, c.dir, c.min, c.max]), r.criterionWeight], [[['noise', 'low', 18, 40]], 0.5]);
+  const hi = rankRun(pool, ['--mode', 'final', '--criterion', 'airflow:high', '--w-criterion', '1']).out;
+  eq('F31-3: airflow:high with all the weight sorts by airflow', hi.ranked.map((x) => x.id), ['loud', 'mid', 'quiet']);
+  const zero = rankRun(pool, ['--mode', 'final', '--criterion', 'noise:low', '--w-criterion', '0']).out;
+  eq('F31-3: weight 0 changes nothing', zero.ranked.map((x) => x.id), plain.ranked.map((x) => x.id));
+  const both = rankRun(pool, ['--mode', 'final', '--criterion', 'noise:low', '--criterion', 'airflow:high', '--w-criterion', '1']).out;
+  ok('F31-3: two criteria count equally', Math.abs(both.ranked.find((x) => x.id === 'loud').criterionScore - 0.5) < 1e-9, JSON.stringify(both.ranked.map((x) => [x.id, x.criterionScore])));
+  const same = rankRun([fin('a', 20, 50), fin('b', 20, 50)], ['--mode', 'final', '--criterion', 'noise:low']).out;
+  ok('F31-3: all equal is no NaN', same.ranked.every((x) => x.criterionScore === 0.5 && Number.isFinite(x.score)), JSON.stringify(same.ranked.map((x) => x.score)));
+  const un = { id: 'unk', title: 'Fan unk', ownRating: 4.9, rating: 4.9, reviews: 500, pooledReviews: 500, sold: 500 };
+  const miss = rankRun([...pool, un], ['--mode', 'final', '--criterion', 'noise:low']).out;
+  ok('F31-3: no number: set aside by name, never ranked', !miss.ranked.some((x) => x.id === 'unk') && miss.droppedReasons['criterion-unknown:noise'] === 1 &&
+    miss.warnings.some((w) => /^criterion-unknown: 1 /.test(w) && w.includes('unk')), JSON.stringify(miss.warnings));
+  const txt = rankRun([fin('a', '26', 50), { ...fin('b', 20, 50), attrs: { noise: '26dBA' } }], ['--mode', 'final', '--criterion', 'noise:low']).out;
+  eq('F31-3: a number in a string is read, "26dBA" is unknown', [txt.ranked.map((x) => x.id), txt.droppedReasons], [['a'], { 'criterion-unknown:noise': 1 }]);
+  for (const [args, re] of [[['--mode', 'final', '--criterion', 'noise'], /name:low or name:high/], [['--mode', 'final', '--criterion', 'noise:quiet'], /name:low or name:high/],
+    [['--criterion', 'noise:low'], /needs --mode final/], [['--mode', 'final', '--criterion', 'noise:low', '--criterion', 'noise:high'], /same attribute/],
+    [['--mode', 'final', '--criterion', 'noise:low', '--w-criterion', '2'], /0\.\.1/]]) {
+    const b = rankRun(pool, args);
+    ok('F31-3: bad flags exit 2: ' + args.slice(-2).join(' '), b.code === 2 && re.test(b.err), b.err);
+  }
+  const det = rankRun([{ ...fin('a', 20, 50), detail: { text: 'x'.repeat(100) } }], ['--mode', 'final']).out;
+  ok('F31-3: a capture record\'s detail is not echoed', !('detail' in det.ranked[0]));
+});
+
+console.log('\nF31-4: the list under "Related items" is not this product');
+await block('F31-4', async () => {
+  const card = leEl('DIV', { cls: 'fusion-page-card--listItem--w6SoVoy' });
+  const title = leEl('DIV', { cls: 'productItem--itemInfoTitle--dO5xPc4', text: 'For Sunon DP200A P/N 2123HBL 12038 120*120*38MM 120mm Cooling Fan', parent: card });
+  const item = leEl('DIV', { cls: 'productItem--fusionTradeProductItem--3jsGCNQ' });
+  const title2 = leEl('DIV', { text: 'Other fan 80*80*25MM', parent: item });
+  const own = leEl('P', { text: 'Size: 120 x 120 x 25 mm' });
+  const tag = leEl('DIV', { cls: 'comet-v2-tag-wrapper', text: '120x120x38mm fan 220v', parent: leEl('DIV', { cls: 'comet-v2-tag cross-link' }) });
+  // The store's list, by its stable class and, with hashed classes only, by its link.
+  const wrap = leEl('DIV', { text: 'ACP9225 92x92x25mm', parent: leEl('DIV', { cls: '_32W6t card-out-wrapper' }) });
+  const link = leEl('A', { cls: '_1nZuI', attrs: { href: '//he.aliexpress.com/item/1005002.html?spm=x' } });
+  const linked = leEl('H3', { cls: '_3nYCL', text: 'ACP14025 14cm 140mm Fan 140x140x25mm', parent: link });
+  const selfLink = leEl('A', { cls: '_1nZuI', attrs: { href: '/item/1.html' } });
+  const selfTitle = leEl('DIV', { text: 'Own title 120x120x25mm', parent: selfLink });
+  const r = await leListing([title, title2, tag, wrap, linked, selfTitle, own]);
+  eq('F31-4: only this product\'s size comes back', r.productSizeLines, ['Own title 120x120x25mm', 'Size: 120 x 120 x 25 mm']);
+});
+
+console.log('\nF31-5..7: price, options, pick, capture, sendAll');
+await block('F31-7', async () => {
+  const src = RUN('listing.js');
+  const tile = (name, extra = '') => { const t = leEl('DIV', { cls: 'sku-item--text--Qa1' + extra, text: name }); t.clicks = 0; t.click = () => { t.clicks++; }; return t; };
+  const mk = ({ els = [], ld = null, bodyText = 'x'.repeat(2500), path = '/item/1005008896134310.html', storage = fakeStorage() } = {}) => {
+    const made = [];
+    const scripts = ld ? [{ textContent: JSON.stringify(ld) }] : [];
+    const document = { title: 'Fan', body: { scrollHeight: 100, innerText: bodyText, appendChild: () => {} }, documentElement: { outerHTML: '' },
+      querySelectorAll: (sel) => (/ld\+json/.test(sel || '') ? scripts : els),
+      createElement: (tag) => { const e = { tag, appendChild() {}, submit() { made.push(e); } }; return e; } };
+    const L = new Function('window', 'document', 'location', `${src}; return window.__aeListing;`)({ scrollTo() {}, document, localStorage: storage }, document,
+      { href: 'https://he.aliexpress.com' + path, pathname: path, origin: 'https://he.aliexpress.com' });
+    return { L, made, storage };
+  };
+  const price = (text, cls = 'price-default--current--F8OlYIo') => leEl('DIV', { cls, text });
+  const v = (t) => mk({ els: [price(t)] }).L.price();
+  eq('F31-7: "US $6.42"', [v('US $6.42').value, v('US $6.42').currency], [6.42, 'USD']);
+  eq('F31-7: "₪6.38"', [v('₪6.38').value, v('₪6.38').currency], [6.38, 'ILS']);
+  eq('F31-7: "1,234.50 €"', [v('1,234.50 €').value, v('1,234.50 €').currency], [1234.5, 'EUR']);
+  eq('F31-7: "8,99 €" is a decimal comma', v('8,99 €').value, 8.99);
+  eq('F31-7: "1,234 €" is a thousands comma', v('1,234 €').value, 1234);
+  const card = leEl('DIV', { cls: 'fusion-page-card--listItem--w6' });
+  eq('F31-7: a related card\'s price is not this price', mk({ els: [leEl('DIV', { cls: 'price-default--current--X', text: 'US $1.00', parent: card }), price('US $6.42')] }).L.price().value, 6.42);
+  eq('F31-7: no price on screen', mk().L.price(), { text: null, value: null, currency: null });
+
+  const a = tile('PSU-14CM', ' sku-item--selected--I'), b = tile('PSU-12CM'), c = tile('Sold', ' sku-item--soldOut--Z');
+  const { L } = mk({ els: [a, b, c] });
+  eq('F31-7: options() names the tiles', L.options(), [{ name: 'PSU-14CM', selected: true, soldOut: false }, { name: 'PSU-12CM', selected: false, soldOut: false }, { name: 'Sold', selected: false, soldOut: true }]);
+  eq('F31-7: pick clicks the exact name once', [L.pick('PSU-12CM').clicked, b.clicks], [true, 1]);
+  const guess = L.pick('12CM');
+  eq('F31-7: a near name clicks nothing and lists the names', [guess.clicked, guess.options, a.clicks + b.clicks + c.clicks], [false, ['PSU-14CM', 'PSU-12CM', 'Sold'], 1]);
+  eq('F31-7: the selected one is left alone', [L.pick('PSU-14CM').alreadySelected, a.clicks], [true, 0]);
+  eq('F31-7: a sold-out one is not clicked', [L.pick('Sold').soldOut, c.clicks], [true, 0]);
+  const dup = [tile('Black'), tile('Black')];
+  eq('F31-7: a name used twice clicks nothing', [mk({ els: dup }).L.pick('Black').clicked, dup[0].clicks + dup[1].clicks], [false, 0]);
+
+  const LD = { '@type': 'Product', name: 'Coolcirc fan', aggregateRating: { ratingValue: '4.7', reviewCount: '59' }, offers: { price: '8.99', priceCurrency: 'USD' } };
+  const body = 'Fan Reviews 429 sold Noise 26dBA 4.7 58 ratings All from verified ' + 'x'.repeat(2500);
+  const specRow = (k, val) => { const kt = leEl('DIV', { cls: 'specification--title--S', text: k }), vt = leEl('DIV', { cls: 'specification--desc--D', text: val });
+    return leEl('DIV', { cls: 'specification--prop--J', children: [kt, vt], qsa: [kt, vt] }); };
+  const specs = specRow('Noise', '26dBA');
+  const storage = fakeStorage();
+  const page = mk({ els: [a, price('US $6.42'), specs], ld: LD, bodyText: body, storage });
+  const brief = await page.L.capture({ description: false });
+  ok('F31-5: the summary fits the 1,000 characters', JSON.stringify(brief).length < 1000, String(JSON.stringify(brief).length));
+  eq('F31-5: summary says it saved, with the screen price and the own counts', [brief.saved, brief.id, brief.price, brief.priceFrom, brief.reviews, brief.ownRating, brief.pooledReviews, brief.soldRaw],
+    [true, '1005008896134310', 6.42, 'screen', 58, 4.7, 59, '429']);
+  const rec = JSON.parse(storage.getItem('__aeDet:1005008896134310'));
+  eq('F31-5: the record keeps the JSON-LD price and the rows', [rec.jsonLdPrice, rec.currency, rec.specs.Noise, rec.selected], [8.99, 'USD', '26dBA', ['PSU-14CM']]);
+  ok('F31-5: no soldOut field when the selected option is in stock', !('soldOut' in brief), JSON.stringify(brief));
+  const out = tile('PSU-12CM', ' sku-item--selected--I sku-item--soldOut--Y');
+  const so = await mk({ els: [out, price('US $6.42')], ld: LD, bodyText: body, storage: fakeStorage() }).L.capture({ description: false });
+  eq('F31-5: a selected sold-out option is named', so.soldOut, ['PSU-12CM']);
+  const noScreen = await mk({ els: [], ld: LD, bodyText: body, storage: fakeStorage() }).L.capture({ description: false });
+  eq('F31-5: no price on screen falls back to JSON-LD, and says so', [noScreen.price, noScreen.priceFrom], [8.99, 'json-ld']);
+  const ranked = rankRun({ kind: 'details', items: [rec] }, ['--mode', 'final']).out;
+  eq('F31-5: rank.mjs reads a record as it is, with no off-query warning', [ranked.ranked.length, ranked.ranked[0].ratingUsed, ranked.warnings], [1, 4.7, []]);
+
+  const wall = await mk({ bodyText: 'Please slide to verify. unusual traffic', storage }).L.capture({ description: false });
+  eq('F31-5: a wall saves nothing and says so', [wall.saved, wall.blocked, storage.length], [false, true, 1]);
+  const full = fakeStorage(); full.setItem = () => { throw new Error('QuotaExceededError'); };
+  const fullR = await mk({ ld: LD, bodyText: body, storage: full }).L.capture({ description: false });
+  ok('F31-5: a full store is reported, never "saved"', fullR.saved === false && /Quota/.test(fullR.err), JSON.stringify(fullR));
+
+  const second = mk({ storage, path: '/item/1.html' });
+  eq('F31-6: records survive navigation', second.L.captured(), ['1005008896134310']);
+  const reply = second.L.sendAll(8765);
+  ok('F31-6: sendAll posts one form and answers UNCONFIRMED', second.made.length === 1 && /^UNCONFIRMED: form-posted 1 records/.test(reply) && !reply.includes('?'), reply);
+  eq('F31-6: and keeps the records', second.L.captured().length, 1);
+  eq('F31-6: dropCaptured clears them', [second.L.dropCaptured(), second.L.captured()], ['dropped 1 record(s)', []]);
+  const empty = mk({ storage: fakeStorage() });
+  ok('F31-6: nothing captured: no form, no navigation', /^NOT DELIVERED/.test(empty.L.sendAll(8765)) && empty.made.length === 0);
+
+  const { startReceiver } = await import('./receiver.mjs');
+  const { mkdtempSync, readdirSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'aef-'));
+  const recv = await startReceiver({ dir, port: 0, idle: 30 });
+  const res = await fetch('http://127.0.0.1:' + recv.port + '/harvest', { method: 'POST', body: 'payload=' + JSON.stringify({ kind: 'details', items: [rec] }) });
+  ok('F31-6: the receiver saves it under the kind', res.status === 200 && readdirSync(dir).some((f) => /^harvest-details-/.test(f)), readdirSync(dir).join(','));
+  await recv.close();
+});
+
+console.log('\nF31-8: the step-5 reader returns every spec row but SKIP');
+await block('F31-8', async () => {
+  const rows = [leSpec('Noise', '26dBA'), leSpec('Air Volume', '62.94'), leSpec('Power Interface', '2pin'), leSpec('Brand Name', 'TEUCER'), leSpec('Origin', 'Mainland China'),
+    leSpec('High-concerned chemical', 'none'), leSpec('Package', 'Yes'), leSpec('Type', 'Fan')];
+  const g = leStep5(rows, RV.gyro).out;
+  eq('F31-8: fan rows come back, wanted first in page order, the SKIP rows do not', g.spec, { Noise: '26dBA', 'Air Volume': '62.94', 'Power Interface': '2pin', Type: 'Fan' });
+  ok('F31-8: no cut when it fits', !('specCut' in g));
+  const many = Array.from({ length: 30 }, (_, i) => leSpec('Row name number ' + i, 'v'.repeat(30)));
+  const cut = leStep5([...many, leSpec('Type', 'Fan'), leSpec('Power Type', 'Wired')], RV.gyro);
+  ok('F31-8: over the cap the extra rows go, the wanted rows stay, and it says so', cut.raw.length <= 1000 && cut.out.specCut === true && cut.out.spec.Type === 'Fan' && cut.out.spec['Power Type'] === 'Wired', cut.raw.slice(0, 200));
+});
+
+console.log('\nF31-1: SKILL.md adds the use and brand passes');
+await block('F31-1', async () => {
+  ok('F31-1: step 1 says add passes, never replace', /Then add 2-4 short passes on the words of the USE and the BRANDS\. Add, never\s+replace\./.test(skillSrc));
+  ok('F31-1: the broad rule is still there', /BROADEN the query, do not narrow it/.test(skillSrc));
+  ok('F31-1: step 7 documents --criterion and the floor', /--criterion noise:low/.test(skillSrc) && /below-evidence-floor/.test(skillSrc));
+  ok('F31-1: the grid is no longer called the cheapest variant', !/the grid shows a\s+cheapest-variant or promo figure/.test(skillSrc));
+});
+
+console.log('\nF31-5: bootstrap-*.min.js: one paste, then one short line');
+await block('F31-boot', async () => {
+  const vm = await import('node:vm');
+  const { buildBootstrap, BOOTSTRAP } = await import('./build.mjs');
+  eq('F31-5: one file for each of the two scripts', BOOTSTRAP, ['harvest', 'listing']);
+  const ctx = (storage, opts) => {
+    const g = { localStorage: storage, performance: { getEntriesByType: () => [] } };
+    g.window = g;
+    return vm.createContext(g, opts);
+  };
+  for (const [name, api, method] of [['harvest', '__aeHarvest', 'start'], ['listing', '__aeListing', 'capture']]) {
+    const text = readFileSync(join(HERE, 'dist', 'bootstrap-' + name + '.min.js'), 'utf8');
+    eq('F31-5: ' + name + ': the file equals a fresh build', text === buildBootstrap(name), true);
+    // One file for both was 70 KB and 35,226 tokens: the Read tool refused it.
+    ok('F31-5: ' + name + ': small enough for one Read call', text.length < 45000, String(text.length));
+    const ls = fakeStorage();
+    const c1 = ctx(ls);
+    const reply = vm.runInContext(text, c1);
+    ok('F31-5: ' + name + ': it installs and says where it saved', typeof c1[api][method] === 'function' && reply.includes('saved as __aeSrc:' + name) && !reply.includes('?') && reply.length < 1000, reply);
+    const c2 = ctx(ls);
+    vm.runInContext("(0,eval)(localStorage.getItem('__aeSrc:" + name + "'))", c2);
+    ok('F31-5: ' + name + ': on a new page the short line reinstalls', typeof c2[api][method] === 'function');
+    const c3 = ctx(fakeStorage(), { codeGeneration: { strings: false, wasm: false } });
+    ok('F31-5: ' + name + ': a page that refuses eval still installs from the paste', typeof (vm.runInContext(text, c3), c3[api])[method] === 'function');
+    const broken = fakeStorage(); broken.setItem = () => { throw new Error('denied'); };
+    const c4 = ctx(broken);
+    const r4 = vm.runInContext(text, c4);
+    ok('F31-5: ' + name + ': no storage still installs, and says to paste again', typeof c4[api][method] === 'function' && /NOT saved/.test(r4), r4);
+  }
 });
 
 // ---------------------------------------------- the whole suite on dist/

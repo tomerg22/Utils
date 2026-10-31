@@ -182,6 +182,32 @@ export function sameProgram(a, b) {
   return r.stdout === 'same';
 }
 
+/* One paste per script per run (measured 2026-10-31, signed-in Chrome). A form
+ * POST navigates, and every navigation loses the installed code, so a five-query
+ * run with 12 detail pages meant pasting 35 KB and 32 KB again and again. Each
+ * bootstrap file is the min copy wrapped so it also saves its own text in
+ * localStorage. On any later page of the same site one short line reinstalls:
+ *   (0,eval)(localStorage.getItem('__aeSrc:listing'))
+ * AliExpress's CSP allowed that indirect eval through javascript_tool. A script
+ * tag or an iframe pointing at loopback did not reach the server. One file for
+ * both was tried first: 70 KB, 35,226 tokens, and the Read tool refused it, so
+ * nobody could paste it. Hence one file per script, and no JSON escaping. */
+export const BOOTSTRAP = ['harvest', 'listing'];
+export function buildBootstrap(name) {
+  const min = build(name + '.js').trim();
+  const m = min.match(/^\(([\s\S]*)\)\(\)$/);
+  if (!m) throw new Error(name + ': the min copy is not one (() => {...})() call');
+  const out = '(() => {\n' +
+    'const run = ' + m[1] + ';\n' +
+    "let saved = '';\n" +
+    "try { window.localStorage.setItem('__aeSrc:" + name + "', '(' + run.toString() + ')()'); saved = 'saved as __aeSrc:" + name + ". On a later page of this site run: (0,eval)(localStorage.getItem(\"__aeSrc:" + name + "\"))'; }\n" +
+    "catch (e) { saved = 'NOT saved (' + String(e).slice(0, 60) + '): paste this file again after a navigation'; }\n" +
+    "return String(run()).slice(0, 500) + ' | ' + saved;\n" +
+    '})()\n';
+  new Function(out);
+  return out;
+}
+
 const isMain = process.argv[1] && /build\.mjs$/.test(process.argv[1]);
 if (isMain) {
   const check = process.argv.includes('--check');
@@ -199,6 +225,19 @@ if (isMain) {
     } else {
       writeFileSync(target, min);
       console.log('wrote ' + target + ' (' + min.length + ' of ' + readFileSync(join(HERE, name), 'utf8').length + ' chars)');
+    }
+  }
+  for (const name of BOOTSTRAP) {
+    const bootTarget = join(dist, 'bootstrap-' + name + '.min.js');
+    const boot = buildBootstrap(name);
+    if (check) {
+      let cur = null;
+      try { cur = readFileSync(bootTarget, 'utf8'); } catch (e) { /* missing */ }
+      if (cur !== boot) { stale++; console.log('STALE ' + bootTarget); }
+      else console.log('ok    ' + bootTarget + ' (' + boot.length + ' chars)');
+    } else {
+      writeFileSync(bootTarget, boot);
+      console.log('wrote ' + bootTarget + ' (' + boot.length + ' chars)');
     }
   }
   if (check && stale) process.exit(1);

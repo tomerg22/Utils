@@ -18,7 +18,9 @@
  *   await __aeListing.read({ description: false })  // never fetch
  *   __aeListing.changed(fp)   // did the page change since fingerprint fp?
  *   await __aeListing.capture() // read() + price + JSON-LD, saved in localStorage; short reply
- *   __aeListing.options()     // the option tiles; pick('12CM') selects one by exact name
+ *   r.selectedImages          // { name, image } per selected image tile
+ *   __aeListing.options()     // the option tiles, with `image` on an image tile;
+ *                             // pick('12CM') selects one by exact name
  *   __aeListing.price()       // the price on screen, for the options selected now
  *   __aeListing.sendAll(8765) // every captured record to receiver.mjs (navigates)
  *
@@ -324,6 +326,53 @@ function wallVerdict(sig) {
     return clean((img && img.getAttribute && (img.getAttribute('alt') || img.getAttribute('title'))) ||
                  (e.getAttribute && e.getAttribute('title')) || e.textContent);
   };
+  /* The tile's own image, full size, or null for a text tile. It is often that
+   * option's spec sheet (measured 2026-11-01: "12V Fluid 1800RPM" shows current,
+   * airflow and plug), and nothing else links an option to its image. */
+  const tileImage = (e) => {
+    const img = e.querySelector ? e.querySelector('img') : null;
+    const raw = img && (img.currentSrc || img.src || (img.getAttribute && img.getAttribute('data-src')));
+    return raw ? fullSize(raw) : null;
+  };
+
+  /* Selected options that disagree with a spec row on a number. The table is one
+   * set of rows for the whole listing. Measured 2026-11-01: the selected option
+   * was "12V Fluid 1800RPM" and the table said Voltage 5V, Power Interface USB,
+   * Air Volume 104; its last row said "Real Parameters pls confirm the detail
+   * pages". Only rows named for the same quantity and stating the same unit are
+   * compared, so a bare "Power (W): 3" or a row in another language says nothing. */
+  const SPEC_QUANTITIES = [
+    { unit: 'V', row: /volt/i },
+    { unit: 'W', row: /power|watt/i },
+    { unit: 'A', row: /current|amper/i },
+    { unit: 'RPM', row: /speed|rpm/i },
+    { unit: 'mAh', row: /capacity|battery/i },
+  ];
+  /* Every amount of `unit` in a text, as [low, high]: "110V-240V", "1500 - 3500rpm", "5V/12V". */
+  function amountsOf(text, unit) {
+    const NUM = '(\\d+(?:\\.\\d+)?)';
+    const out = [];
+    const rest = String(text || '').replace(
+      new RegExp(NUM + '\\s*(?:' + unit + ')?\\s*(?:[-~\\u2013]|\\bto\\b)\\s*' + NUM + '\\s*' + unit + '(?![a-z])', 'gi'),
+      (m, a, b) => { out.push([Math.min(+a, +b), Math.max(+a, +b)]); return ' '; });
+    for (const m of rest.matchAll(new RegExp('(?<![\\d.])' + NUM + '\\s*' + unit + '(?![a-z])', 'gi'))) out.push([+m[1], +m[1]]);
+    return out;
+  }
+  function specOptionConflicts(selected, rows) {
+    const out = [];
+    for (const option of selected || []) {
+      for (const q of SPEC_QUANTITIES) {
+        const mine = amountsOf(option, q.unit);
+        if (!mine.length) continue;
+        for (const [row, value] of Object.entries(rows || {})) {
+          if (!q.row.test(row)) continue;
+          const theirs = amountsOf(value, q.unit);
+          if (theirs.length && !mine.some(([a, b]) => theirs.some(([c, d]) => a <= d && c <= b))) out.push({ option, row, value });
+        }
+      }
+    }
+    return out;
+  }
 
   /* "US $8.99", "₪6.38", "1,234.50 €" as a number. The last separator is the
    * decimal mark only when one or two digits follow it. */
@@ -871,14 +920,18 @@ function wallVerdict(sig) {
       return { text, value: priceNumber(text), currency: priceCurrency(text) };
     },
 
-    /* Every option tile: { name, selected, soldOut }. */
+    /* Every option tile: { name, selected, soldOut }, plus `image` on an image tile. */
     options() {
       const out = [];
       walk(document, (e) => {
         const cls = classOf(e);
         if (!isTile(cls)) return;
         const name = tileName(e);
-        if (name) out.push({ name, selected: /sku-item--selected|\bselected\b|\bactive\b/i.test(cls), soldOut: /soldOut|sold-out|disabled/i.test(cls) });
+        if (!name) return;
+        const o = { name, selected: /sku-item--selected|\bselected\b|\bactive\b/i.test(cls), soldOut: /soldOut|sold-out|disabled/i.test(cls) };
+        const image = tileImage(e);
+        if (image) o.image = image;
+        out.push(o);
       });
       return out;
     },
@@ -898,8 +951,8 @@ function wallVerdict(sig) {
         if (n === name) hits.push({ e, cls });
       });
       const short = names.slice(0, 30).map((n) => n.slice(0, 24));
-      if (!hits.length) return { clicked: false, reason: 'no option has this exact name', options: short };
-      if (hits.length > 1) return { clicked: false, reason: 'two options have this name', options: short };
+      if (!hits.length) return { clicked: false, reason: 'no option has this exact name', options: short, optionCount: names.length };
+      if (hits.length > 1) return { clicked: false, reason: 'two options have this name', options: short, optionCount: names.length };
       if (/sku-item--selected|\bselected\b|\bactive\b/i.test(hits[0].cls)) return { clicked: false, alreadySelected: true };
       if (/soldOut|sold-out|disabled/i.test(hits[0].cls)) return { clicked: false, reason: 'sold out', soldOut: true };
       hits[0].e.click();
@@ -938,6 +991,7 @@ function wallVerdict(sig) {
         jsonLdPrice: ldPrice,
         currency: offer.priceCurrency || shown.currency,
         selected: r.selectedVariants,
+        selectedImages: r.selectedImages,
         options: r.variants,
         reviews: r.reviews.own,
         ownRating: r.reviews.ownRating,
@@ -965,6 +1019,8 @@ function wallVerdict(sig) {
         warnings: r.warnings.map((w) => w.split(':')[0]) };
       if (err) brief.err = err;
       if (rec.soldOut.length) brief.soldOut = rec.soldOut.map((v) => v.slice(0, 24));
+      // The first two: more than that would pass the 1,000 characters. All are in the record.
+      if (rec.selectedImages.length) brief.selectedImages = rec.selectedImages.slice(0, 2).map((s) => s.image);
       return brief;
     },
 
@@ -1108,6 +1164,7 @@ function wallVerdict(sig) {
        * sku-item--text--<hash>, sku-item--selected--<hash> on the same node. */
       const variants = [];
       const selectedVariants = [];
+      const selectedImages = [];
       let selectedVariant = null;
       walk(document, (e) => {
         const cls = classOf(e);
@@ -1123,7 +1180,11 @@ function wallVerdict(sig) {
          * used to be kept, so "Wired" vs "Wireless" could be lost. */
         if (/sku-item--selected|\bselected\b|\bactive\b/i.test(cls)) {
           if (!selectedVariant) selectedVariant = v;
-          if (!selectedVariants.includes(v)) selectedVariants.push(v);
+          if (!selectedVariants.includes(v)) {
+            selectedVariants.push(v);
+            const image = tileImage(e);
+            if (image) selectedImages.push({ name: v, image });
+          }
         }
       });
 
@@ -1208,6 +1269,22 @@ function wallVerdict(sig) {
           warnings.push('specs-from-text: the rows were matched by NAME from the page text, not read from the spec ' +
                         'table. Before setting a hard requirement from one, confirm it in `specsText` or a screenshot.');
         }
+        const conflicts = specOptionConflicts(selectedVariants, specs.rows);
+        conflicts.slice(0, 5).forEach((c) => {
+          warnings.push('specs-vs-option: the selected option "' + c.option.slice(0, 40) + '" disagrees with spec row "' +
+                        c.row.slice(0, 40) + '": ' + String(c.value).slice(0, 40) + '. The table is one set of rows for the ' +
+                        'whole listing and may describe another option. Read the option\'s own image (`selectedImages`).');
+        });
+        /* A list that is cut says so. `gallery` stopped at 20 with no warning, and
+         * on 2026-11-01 a 22-image listing lost two option images. Images and
+         * options are now returned whole; these line lists keep their caps. */
+        const productLines = sizeLines.filter((s) => !s.isPackage).map((s) => s.text);
+        const packageLines = sizeLines.filter((s) => s.isPackage).map((s) => s.text);
+        const LINE_CAPS = [['sizeLines', sizeLines.length, 25], ['productSizeLines', productLines.length, 10],
+                           ['packageSizeLines', packageLines.length, 10], ['ratingLines', ratingLines.length, 40]];
+        LINE_CAPS.filter(([, n, cap]) => n > cap).forEach(([name, n, cap]) => {
+          warnings.push('list-cut: `' + name + '` kept ' + cap + ' of ' + n + ' lines. The rest are in `text`.');
+        });
         let top = { blocked: false };
         if (galleryScope === 'unscoped') {
           warnings.push('gallery-unscoped: no product-image container was found, so `gallery` holds ' +
@@ -1243,9 +1320,11 @@ function wallVerdict(sig) {
           fingerprintBefore: before,
           fingerprint: after,
           pageGrew: after.height !== before.height || after.textLen !== before.textLen,
-          variants: [...new Set(variants)].slice(0, 40),
+          variants: [...new Set(variants)],
           selectedVariant,
           selectedVariants,
+          // { name, image } per selected image tile: often that option's spec sheet.
+          selectedImages,
           // The Specifications table as { name: value }. `specsSource` says
           // where it came from: 'dom' (the spec rows), 'text' (the lines
           // after the "Specifications" heading) or 'none' (not found: then
@@ -1261,17 +1340,17 @@ function wallVerdict(sig) {
           // Each entry: { text, isPackage, context? }. A `isPackage: true` line is
           // the SHIPPING CARTON, not the product — never report it as the size.
           sizeLines: sizeLines.slice(0, 25),
-          productSizeLines: sizeLines.filter((s) => !s.isPackage).map((s) => s.text).slice(0, 10),
-          packageSizeLines: sizeLines.filter((s) => s.isPackage).map((s) => s.text).slice(0, 10),
+          productSizeLines: productLines.slice(0, 10),
+          packageSizeLines: packageLines.slice(0, 10),
           ratingLines: ratingLines.slice(0, 40),
           // The product's own photos, full size, slider order. `galleryScope`
           // 'unscoped' means the fallback ran: see `warnings`.
           galleryScope,
           galleryCount: gallery.length,
-          gallery: gallery.slice(0, 20),
+          gallery,
           // Images inside the description: dimension drawings and spec tables
           // usually live here, not in the gallery.
-          descriptionImages: descriptionImages.slice(0, 30),
+          descriptionImages,
           // Big images that are NOT this product, counted by where they sat.
           excludedImages: excluded,
           description: { source: desc.source, textLen: desc.text.length, imageCount: descriptionImages.length },

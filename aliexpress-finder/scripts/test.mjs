@@ -4776,6 +4776,91 @@ await block('F31-1', async () => {
   ok('F31-1: the grid is no longer called the cheapest variant', !/the grid shows a\s+cheapest-variant or promo figure/.test(skillSrc));
 });
 
+console.log('\nN1: one listing: no silent cuts, option images, specs against the option');
+await block('N1', async () => {
+  const CDN = 'https://ae-pic-a1.aliexpress-media.com/kf/';
+  const wrap = leEl('DIV', { cls: 'main-image--wrap--x' });
+  const photo = (i) => ({ ...leEl('IMG', { parent: wrap }), src: CDN + 'S' + String(i).padStart(3, '0') + 'a'.repeat(30) + '.jpg_220x220q75.jpg_.avif', naturalWidth: 800, naturalHeight: 800 });
+  const imgTile = (name, file, extra = '') => {
+    const img = { ...leEl('IMG', { attrs: { alt: name } }), src: CDN + file + '.jpg_220x220q75.jpg_.avif?x=1' };
+    return { ...leEl('DIV', { cls: 'sku-item--image--Q' + extra }), querySelector: () => img };
+  };
+  const textTile = (name, extra = '') => leEl('DIV', { cls: 'sku-item--text--Q' + extra, text: name });
+
+  // The 2026-11-01 listing: 22 images, and `gallery` returned 20 with no warning.
+  const g = await leListing(Array.from({ length: 22 }, (_, i) => photo(i)));
+  eq('N1-1: every gallery image comes back', [g.gallery.length, g.galleryCount], [22, 22]);
+  ok('N1-1: an image list is never cut, so no cut warning', !g.warnings.some((w) => /list-cut/.test(w)), JSON.stringify(g.warnings));
+  const d = await leListing([], { desc: { body: 'Text', images: Array.from({ length: 35 }, (_, i) => CDN + 'S' + String(i).padStart(3, '0') + 'b'.repeat(30) + '.jpg') } });
+  eq('N1-1: every description image comes back', d.descriptionImages.length, 35);
+  const many = await leListing(Array.from({ length: 45 }, (_, i) => textTile('Option ' + i)));
+  eq('N1-1: every option comes back', many.variants.length, 45);
+  const lines = await leListing(Array.from({ length: 30 }, (_, i) => leEl('LI', { text: 'Size: ' + (i + 10) + ' x 5 x 3 cm' })));
+  eq('N1-1: a cut line list is capped', [lines.sizeLines.length, lines.productSizeLines.length], [25, 10]);
+  ok('N1-1: and each cut is named with its count', ['`sizeLines` kept 25 of 30', '`productSizeLines` kept 10 of 30'].every((t) => lines.warnings.some((w) => w.startsWith('list-cut') && w.includes(t))), JSON.stringify(lines.warnings));
+  const under = await leListing([leEl('LI', { text: 'Size: 10 x 5 x 3 cm' })]);
+  ok('N1-1: no cut, no warning', !under.warnings.some((w) => /list-cut/.test(w)), JSON.stringify(under.warnings));
+
+  // An option links to its image, full size and with no query string.
+  const sel = imgTile('12V Fluid 1800RPM', 'Sopt1', ' sku-item--selected--I'), other = imgTile('12V Fluid 2500RPM', 'Sopt2');
+  const mkL = (els, storage) => {
+    const document = { title: 'Fan', body: { scrollHeight: 100, innerText: 'x'.repeat(2500) }, documentElement: { outerHTML: '' }, querySelectorAll: (s) => (/ld\+json/.test(s || '') ? [] : els) };
+    return new Function('window', 'document', 'location', `${RUN('listing.js')}; return window.__aeListing;`)({ scrollTo() {}, document, localStorage: storage || fakeStorage() }, document,
+      { href: 'https://he.aliexpress.com/item/7.html', pathname: '/item/7.html', origin: 'https://he.aliexpress.com' });
+  };
+  eq('N1-3: options() gives each image tile its image', mkL([sel, other, textTile('NO RGB')]).options(), [
+    { name: '12V Fluid 1800RPM', selected: true, soldOut: false, image: CDN + 'Sopt1.jpg' },
+    { name: '12V Fluid 2500RPM', selected: false, soldOut: false, image: CDN + 'Sopt2.jpg' },
+    { name: 'NO RGB', selected: false, soldOut: false }]);
+  const si = await leListing([sel, other, textTile('NO RGB', ' sku-item--selected--I')]);
+  eq('N1-3: read() names the selected option\'s image only, and a text tile has none', si.selectedImages, [{ name: '12V Fluid 1800RPM', image: CDN + 'Sopt1.jpg' }]);
+  const storage = fakeStorage();
+  const brief = await mkL([sel, other], storage).capture({ description: false });
+  eq('N1-3: capture() reports it and saves it', [brief.selectedImages, JSON.parse(storage.getItem('__aeDet:7')).selectedImages], [[CDN + 'Sopt1.jpg'], [{ name: '12V Fluid 1800RPM', image: CDN + 'Sopt1.jpg' }]]);
+  const twoSel = await mkL([sel, imgTile('Long option name number two', 'Sopt3', ' sku-item--selected--I'), imgTile('Long option name number three', 'Sopt4', ' sku-item--selected--I')]).capture({ description: false });
+  ok('N1-3: the summary keeps 2 images and fits the 1,000 characters', twoSel.selectedImages.length === 2 && JSON.stringify(twoSel).length < 1000, String(JSON.stringify(twoSel).length));
+  eq('N1-3: a bad name in pick() says how many options exist', mkL([sel, other]).pick('nope').optionCount, 2);
+
+  // The spec table against the selected option.
+  const specRow = (k, val) => { const kt = leEl('DIV', { cls: 'specification--title--S', text: k }), vt = leEl('DIV', { cls: 'specification--desc--D', text: val });
+    return leEl('DIV', { cls: 'specification--prop--J', children: [kt, vt], qsa: [kt, vt] }); };
+  const specWarn = async (name, rows) => (await leListing([textTile(name, ' sku-item--selected--I'), ...rows.map(([k, v]) => specRow(k, v))])).warnings.filter((w) => w.startsWith('specs-vs-option'));
+  const live = await specWarn('12V Fluid 1800RPM', [['Voltage', '5V'], ['Fan Speed', '1500 - 3500rpm'], ['VOLTAGE', 'DC 5V/DC 12V/DC 48V/AC 110V-240V'], ['FAN SPEED', '1500RPM/1800RPM/2500RPM'], ['Power (W)', '3']]);
+  eq('N1-3: the live listing: only the 5V row disagrees', live.length, 1);
+  ok('N1-3: the warning names the option, the row and the value', live[0].includes('"12V Fluid 1800RPM"') && live[0].includes('"Voltage"') && live[0].includes('5V') && live[0].includes('selectedImages'), live[0]);
+  const none = [
+    ['12V', [['Voltage', '12V']], 'the same value'],
+    ['12V', [['Voltage', 'DC 12 V']], 'a space before the unit'],
+    ['12v', [['Voltage', '12V']], 'lower case'],
+    ['AC 110V-240V', [['Voltage', '220V']], 'a value inside the option\'s range'],
+    ['1800RPM', [['Speed', '1500-3500RPM']], 'a value inside the row\'s range'],
+    ['1800RPM', [['Speed', '1500 to 3500 rpm']], 'a range written with "to"'],
+    ['12V', [['Voltage', '12']], 'a row with no unit'],
+    ['12V', [['Noise', '5V']], 'a row named for something else'],
+    ['12V', [['מתח', '5V']], 'a row in another language'],
+    ['Black', [['Voltage', '5V']], 'an option with no number'],
+    ['12V', [['Power', '3W']], 'another unit in the row'],
+    ['5V', [['Current', '500mA']], 'mA is not A'],
+  ];
+  for (const [name, rows, why] of none) eq('N1-3: no warning: ' + why, await specWarn(name, rows), []);
+  eq('N1-3: a speed outside the row warns', (await specWarn('3000RPM', [['Fan Speed', '1800RPM']])).length, 1);
+  eq('N1-3: a range with no overlap warns', (await specWarn('AC 110V-240V', [['Voltage', '12V']])).length, 1);
+  eq('N1-3: watts are compared', (await specWarn('5W', [['Power', '3W']])).length, 1);
+  eq('N1-3: amps are compared', (await specWarn('1A', [['Current', '2A']])).length, 1);
+  eq('N1-3: mAh is compared', (await specWarn('5000mAh', [['Battery Capacity', '10000mAh']])).length, 1);
+  eq('N1-3: at most 5 warnings', (await specWarn('12V', Array.from({ length: 9 }, (_, i) => ['Voltage ' + i, '5V']))).length, 5);
+  const off = await leListing([specRow('Voltage', '5V')]);
+  ok('N1-3: nothing selected, nothing to compare', !off.warnings.some((w) => /specs-vs-option/.test(w)), JSON.stringify(off.warnings));
+
+  // SKILL.md: a given link is a run of its own.
+  ok('N1-2: the description names a single listing', /^description:.*(single|one) listing/im.test(skillSrc), skillSrc.slice(0, 200));
+  ok('N1-2: the section exists, with the steps it runs and skips', /^## One given listing/m.test(skillSrc) && /capture\(\)/.test(skillSrc.split(/^## One given listing/m)[1].split(/^## /m)[0]));
+  const section = skillSrc.split(/^## One given listing/m)[1].split(/^## /m)[0];
+  ok('N1-2: every image, and the count read, are required', /every image/i.test(section) && /of M/.test(section), section.slice(0, 200));
+  ok('N1-2: skipped steps must be reported', /not compared with other listings/.test(section), section.slice(0, 200));
+  ok('N1-2: two photos that disagree are unknown', /unknown/i.test(section) && /disagree/i.test(section), section.slice(0, 200));
+});
+
 console.log('\nF31-5: bootstrap-*.min.js: one paste, then one short line');
 await block('F31-boot', async () => {
   const vm = await import('node:vm');

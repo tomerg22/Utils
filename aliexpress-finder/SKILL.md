@@ -1,6 +1,6 @@
 ---
 name: aliexpress-finder
-description: Take a free-text product description and return the top listings with evidence, by paging AliExpress search and ranking on shrunk ratings + review counts.
+description: Take a free-text product description and return the top listings with evidence, by paging AliExpress search and ranking on shrunk ratings + review counts. Also reads one listing from a link and checks it against a stated need.
 ---
 
 # AliExpress product finder
@@ -88,6 +88,51 @@ something about titles, not about the world. `rank.mjs` now emits an
 `absence-is-not-evidence` warning when a `--require` regex collapses the pool;
 when you see it, go look at images and descriptions before writing a word
 about absence.
+
+## One given listing — a link, not a search
+
+When the user gives an item link and asks about that item ("read this", "does
+it fit X"), run this instead of the search. Measured 2026-11-01: with no such
+section the steps were chosen by hand, the spec table was never seen, and most
+photos were not read. A conflict on the recommended option stayed hidden until
+the user asked whether the skill had worked.
+
+**Runs:** step 0 (browser and sign-in), step 2 (the wall rules), the third rule.
+
+1. Open the link and install `listing.js` (step 3 shows how).
+2. Select the option the user named: `options()`, `pick()`, then
+   `computer{action:"wait"}`. A signed-in link can open on another option.
+3. `await __aeListing.capture()`. Use its `price`, `reviews`, `ownRating` and
+   `soldRaw`. Never search the page text for a sold count: other products'
+   cards are on the page.
+4. `const r = __aeListing.last`, then read `r.warnings` and `r.specs`, **one
+   field per call**. Chrome cuts a result at 1,000 characters, so a joined field
+   can vanish past the cut. Check the length of what came back.
+5. Download `r.gallery`, `r.descriptionImages` and `r.selectedImages` with
+   `labels.sh` and read **every image**. Report the count as "N of M read". An
+   image you did not read is unknown, never "the listing does not say".
+6. Compare the three sources: the option's own image (`selectedImages`, or
+   `image` in `options()`), the description images, and the spec table.
+   - A `specs-vs-option` warning means the table may describe another option.
+     It compares only voltage, power, current, RPM and mAh. Compare the plug,
+     the bearing and the airflow yourself.
+   - The product photo outranks a text row (the third rule).
+   - **Two photos that disagree leave that value unknown.** Report both values
+     and do not pick one.
+   - Do the same for every option you recommend, including one the user did not
+     ask about. Read that option's image and its column in the tables first.
+7. Check the user's need against the item, using the need's own source for the
+   other side (the old part's label, a teardown, a datasheet). Name that source.
+8. Do step 6 for the brand, in one line.
+
+**Skips:** steps 1, 3, 4 and 7. Nothing was ranked, so the report must say:
+"not compared with other listings". If the user wants alternatives, run the
+search.
+
+**Report:** the option, its price (and a gap to the price in the user's link),
+own rating and count, sold, the need-by-need comparison with a source for each
+number, every disagreement, images "N of M read", the brand line, and what was
+skipped.
 
 ## Step 0 — Pick the browser: signed-in Chrome first, in-app browser as fallback
 
@@ -1214,12 +1259,17 @@ window.__r = await __aeListing.read()   // async since 2026-09-29: top-level awa
 It expands every "show more" first (and the Specifications table's own
 "View more", by its class, reported as `specExpanded`), then returns **text and images together**:
 `sizeLines`, `ratingLines`, `variants`, `selectedVariant` (the first) and
-`selectedVariants` (one per option property), `specs` / `specsSource` (the
+`selectedVariants` (one per option property), `selectedImages` (`{ name, image }`
+per selected image tile), `specs` / `specsSource` (the
 whole Specifications table), `reviews`, `gallery`, `descriptionImages`,
 `description`, `text`, `textCut`, `visibility`, `warnings`, plus a
 `fingerprint`. One call, both channels, deliberately —
 see the defect below. In Chrome the whole result is far over 1,000
 characters: keep it on `window` and return the fields you need in pieces.
+
+`gallery`, `descriptionImages` and `variants` come back whole. The size and
+rating line lists keep their caps, and a `list-cut` warning names any cut with
+its count.
 
 - **`gallery` is the product's own photos only**, full size, in slider order.
   Other products on the page (related items, the footer licence badge, menu
@@ -1508,6 +1558,29 @@ matches `lib.mjs` on every fixture — keep them in sync, the test will catch yo
 if you don't. A drifted `wallVerdict` means one entry point silently stops
 detecting walls; a drifted `SOLD_RE` means best sellers silently lose their
 sold count.
+
+### Defects fixed 2026-11-01 (the CX430 fan session)
+
+Found when the user asked if the skill had worked on one fan listing. Each has
+a test (`N1`) that fails on the code before the fix.
+
+1. **Images were cut with no warning.** `gallery` stopped at 20,
+   `descriptionImages` at 30 and `variants` at 40. A 22-image listing lost two
+   option images while `warnings` stayed empty. Guard: all three come back whole,
+   and `list-cut` names a cut in the line lists that keep a cap.
+2. **A given link had no procedure.** The skill covered only a free-text search.
+   Guard: the "One given listing" section. Doc only: no code can make the
+   operator read the images. A test checks that the section exists.
+3. **Nothing linked an option to its image, or warned when the spec table
+   disagreed with the option.** The table said Voltage 5V and Power Interface USB
+   for a selected "12V Fluid 1800RPM". Guard: `image` in `options()`,
+   `selectedImages` in `read()` and `capture()`, and `specs-vs-option`.
+
+The operator's own misses in that run are why the section exists. The spec table
+was cut off by a joined result. 6 of 20 gallery images and 0 of 14 description
+images were read, so the 12V Fluid 2500 RPM conflict went unseen (option image
+2-pin, 0.15A; description table 4-pin, 0.25A). The sold count came from a page
+search.
 
 ### Defects fixed 2026-10-31 (the PSU fan session)
 

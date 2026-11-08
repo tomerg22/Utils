@@ -3,6 +3,12 @@
 #
 #   labels.sh fetch <outdir> <url> [url...]     # download + convert to PNG
 #   labels.sh crop  <file.png> <top> <left> <h> <w> [longEdge]
+#   labels.sh sheet <dir> [per-sheet=12] [cell=500]   # numbered contact sheets
+#   labels.sh same  <dir> <dir> [dir...]        # which listings are one product
+#
+# For `same`, fetch each listing into its own directory named by its id
+# (labels.sh fetch <out>/<id> ...): see same.mjs. For `sheet`, read every
+# sheet: the red number on a tile is its img<N>.png, the file to crop.
 #
 # WHY THIS EXISTS (measured 2026-08-21)
 # A RUIHONG RH-15W listing states its output current NOWHERE in text — not in
@@ -28,6 +34,8 @@
 set -euo pipefail
 
 REFERER="https://he.aliexpress.com/"
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 die() { echo "labels.sh: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -74,8 +82,61 @@ cmd_crop() {
   echo "$out  ($(sips -g pixelWidth -g pixelHeight "$out" | awk '/pixel/{printf "%s ", $2}'))"
 }
 
+# Contact sheets: every img<N>.png of <dir> on numbered sheets of <per> images.
+# WHY (measured 2026-11-08): reading every image one Read call at a time meant
+# 434 calls in one session; ffmpeg here could not start (a missing libjxl
+# library). sheet.swift uses AppKit, which ships with macOS. It is compiled
+# once and kept in ~/.cache/aliexpress-finder, keyed by its own md5.
+cmd_sheet() {
+  [ $# -ge 1 ] || die "usage: labels.sh sheet <dir> [per-sheet=12] [cell=500]"
+  local dir="$1" per="${2:-12}" cell="${3:-500}"
+  [ -d "$dir" ] || die "no such directory: $dir"
+  case "$per$cell" in *[!0-9]*) die "per-sheet and cell must be whole numbers, got $per and $cell" ;; esac
+  [ "$per" -ge 1 ] && [ "$cell" -ge 16 ] || die "per-sheet must be 1 or more and cell 16 or more"
+  have swiftc || die "swiftc not found: install the Xcode command line tools (xcode-select --install)"
+  local src="$HERE/sheet.swift" cache="${XDG_CACHE_HOME:-$HOME/.cache}/aliexpress-finder" sum bin
+  sum="$(md5 -q "$src" 2>/dev/null || md5sum "$src" | cut -c1-32)"
+  bin="$cache/sheet-$sum"
+  if [ ! -x "$bin" ]; then
+    mkdir -p "$cache"
+    swiftc -O "$src" -o "$bin.tmp.$$" >/dev/null 2>&1 || { rm -f "$bin.tmp.$$"; die "sheet.swift did not compile: swiftc -O $src"; }
+    mv "$bin.tmp.$$" "$bin"
+  fi
+  local nums
+  nums="$(ls "$dir" | sed -n 's/^img\([0-9][0-9]*\)\.png$/\1/p' | sort -n)"
+  [ -n "$nums" ] || die "no img<N>.png in $dir: run labels.sh fetch into it first"
+  local n part=1 count=0 total=0 batch=""
+  # One sheet per <per> numbers. A plain string, not an array: an empty array
+  # under `set -u` is an error in the bash 3.2 macOS ships.
+  for n in $nums; do
+    batch="$batch $n"; count=$((count + 1)); total=$((total + 1))
+    if [ "$count" -eq "$per" ]; then sheet_one "$dir" "$cell" "$bin" "$part" $batch; part=$((part + 1)); count=0; batch=""; fi
+  done
+  [ -z "$batch" ] || sheet_one "$dir" "$cell" "$bin" "$part" $batch
+  echo
+  echo "$total images on the sheets above. Read every sheet. The red number on a tile is its"
+  echo "img<N>.png: crop that file to read small print (labels.sh crop $dir/img<N>.png ...)."
+}
+
+# One sheet: the numbers after the first four arguments, never none.
+sheet_one() {
+  local dir="$1" cell="$2" bin="$3" part="$4"; shift 4
+  local out="$dir/sheet-$part.png" first="$1" last n
+  local -a args
+  for n in "$@"; do args+=("$n:$dir/img$n.png"); last="$n"; done
+  "$bin" "$out" "$cell" "${args[@]}" >/dev/null || die "could not write $out"
+  echo "$out  ($# images: img$first to img$last)"
+}
+
+cmd_same() {
+  have node || die "node not found"
+  exec node "$HERE/same.mjs" "$@"
+}
+
 case "${1:-}" in
   fetch) shift; cmd_fetch "$@" ;;
   crop)  shift; cmd_crop  "$@" ;;
-  *) die "usage: labels.sh {fetch|crop} ..." ;;
+  sheet) shift; cmd_sheet "$@" ;;
+  same)  shift; cmd_same  "$@" ;;
+  *) die "usage: labels.sh {fetch|crop|sheet|same} ..." ;;
 esac

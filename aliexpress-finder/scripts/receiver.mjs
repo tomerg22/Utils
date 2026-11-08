@@ -10,13 +10,17 @@
  * was refused by both browsers on 2026-10-18; see SKILL.md step 3). The body is
  * validated as a harvest payload and written to
  *   <dir>/harvest-<query-slug>-<timestamp>.json
+ * or, for a payload that names its `kind` (the detail records of
+ * __aeListing.sendAll() are kind 'details'), to
+ *   <dir>/<kind>-<timestamp>.json
  * and the receiver prints `saved <path>` in its own output. With the form,
  * that line is the only proof of delivery: send() answers UNCONFIRMED, and
  * the reply page the tab navigates to cannot be read in a hidden tab. A
  * fetch gets the same `saved <path>` line back as its reply.
  * Exits after --idle seconds without a request (default 3600), or after
  * --count payloads when --count is above 0 (default 0: no limit), so a
- * forgotten receiver does not outlive the session.
+ * forgotten receiver does not outlive the session. `curl -s
+ * http://127.0.0.1:<port>/stop` ends it at once, with exit 0.
  *
  * WHY THESE DEFAULTS (measured 2026-10-17): the defaults used to be one
  * payload and 900 s. The hidden-tab recovery needs TWO sends (the stuck tab,
@@ -111,6 +115,17 @@ export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () 
   const server = http.createServer((req, res) => {
     arm();
     if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
+    /* GET /stop ends it with exit 0. The only other way out was the 60-minute
+     * idle timer or a kill, and a killed receiver shows as a FAILED background
+     * task (exit 144, measured 2026-11-08). */
+    if (req.method === 'GET' && /^\/stop\/?(\?|$)/.test(req.url || '')) {
+      res.writeHead(200, cors);
+      res.end('stopping: ' + received + ' saved');
+      log('stopped by GET /stop after ' + received + ' payload(s)');
+      if (timer) clearTimeout(timer);
+      setTimeout(() => server.close(), 50);
+      return;
+    }
     if (req.method === 'GET') {
       res.writeHead(200, cors);
       res.end('ok ' + received + (count > 0 ? '/' + count : '') + ' saved, idle ' + idle + ' s from now');
@@ -126,7 +141,14 @@ export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () 
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
       // Two payloads in one millisecond used to share a name, and the second
       // overwrote the first while both were answered "saved".
-      const base = join(dir, 'harvest-' + slugify(v.payload.query || v.payload.kind).slice(0, 80) + '-' + stamp);
+      /* A payload with a `kind` is not a search payload. The detail records
+       * of sendAll() were saved as harvest-details-<stamp>.json, so the
+       * `decode.mjs harvest-*.json` of SKILL.md merged them into the search
+       * pool with exit 0 and no warning: a stream with no query, and detail
+       * prices over grid prices (measured 2026-11-08). */
+      const base = join(dir, (v.payload.kind
+        ? slugify(v.payload.kind).slice(0, 40)
+        : 'harvest-' + slugify(v.payload.query).slice(0, 80)) + '-' + stamp);
       let file = base + '.json';
       for (let n = 2; existsSync(file); n++) file = base + '-' + n + '.json';
       // A write error (dir removed, disk full) answers 500 and keeps the

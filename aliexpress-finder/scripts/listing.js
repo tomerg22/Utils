@@ -335,6 +335,23 @@ function wallVerdict(sig) {
     return raw ? fullSize(raw) : null;
   };
 
+  /* The seller's store, from the page text. A brand name on AliExpress is not
+   * a genuine product (SKILL.md step 6); who sells it, "Ugreen Official Store"
+   * or a reseller, is part of that check, and it had to be dug out of `text`
+   * by hand. Measured 2026-11-08 on 20 detail pages (signed-in Chrome,
+   * English): the name ended in "Store" every time, after "Sold By " beside
+   * the price or after "The seller of this item is ". Not found (a Hebrew
+   * page has not been seen) is null: unknown, never "no store". */
+  const STORE_RES = [/\bSold By (\S.{0,60}?\bStore)\b/, /\bThe seller of this item is (\S.{0,60}?\bStore)\b/];
+  const storeOf = (text) => {
+    const t = String(text || '').replace(/\s+/g, ' ');
+    for (const re of STORE_RES) {
+      const m = t.match(re);
+      if (m) { const name = clean(m[1]); return { name, official: /\bOfficial Store$/i.test(name) }; }
+    }
+    return null;
+  };
+
   /* Selected options that disagree with a spec row on a number. The table is one
    * set of rows for the whole listing. Measured 2026-11-01: the selected option
    * was "12V Fluid 1800RPM" and the table said Voltage 5V, Power Interface USB,
@@ -920,7 +937,11 @@ function wallVerdict(sig) {
       return { text, value: priceNumber(text), currency: priceCurrency(text) };
     },
 
-    /* Every option tile: { name, selected, soldOut }, plus `image` on an image tile. */
+    /* Every option tile: { name, selected, soldOut }, plus `image` on an image
+     * tile, and `n` (1, 2, …) on a tile whose name another tile also uses:
+     * pick(name, n) selects that one. Measured 2026-11-08: UGREEN Nexode Air
+     * had 3 tiles named "EU Plug Add Cable" (cables of other colours, one sold
+     * out), and the price with the cable could not be read at all. */
     options() {
       const out = [];
       walk(document, (e) => {
@@ -933,30 +954,49 @@ function wallVerdict(sig) {
         if (image) o.image = image;
         out.push(o);
       });
+      const uses = new Map();
+      out.forEach((o) => uses.set(o.name, (uses.get(o.name) || 0) + 1));
+      const seen = new Map();
+      out.forEach((o) => {
+        if (uses.get(o.name) < 2) return;
+        seen.set(o.name, (seen.get(o.name) || 0) + 1);
+        o.n = seen.get(o.name);
+      });
       return out;
     },
 
     /* Select one option by its EXACT name, then wait with
      * computer{action:"wait"} (never a page timer) and call price() or
-     * capture(). A guess is never clicked: no exact match, or a name used by
-     * two tiles, clicks nothing and lists the names. A tile already selected
-     * is left alone: a second click can clear it. */
-    pick(name) {
+     * capture(). A guess is never clicked: no exact match clicks nothing and
+     * lists the names. A name used by several tiles needs `n`, the tile's
+     * number in options() (1, 2, …): without it nothing is clicked, and the
+     * reply lists those tiles. A tile already selected is left alone: a second
+     * click can clear it. */
+    pick(name, n) {
       const hits = [], names = [];
       walk(document, (e) => {
         const cls = classOf(e);
         if (!isTile(cls)) return;
-        const n = tileName(e);
-        if (n) names.push(n);
-        if (n === name) hits.push({ e, cls });
+        const t = tileName(e);
+        if (t) names.push(t);
+        if (t === name) hits.push({ e, cls });
       });
-      const short = names.slice(0, 30).map((n) => n.slice(0, 24));
+      const short = names.slice(0, 30).map((x) => x.slice(0, 24));
       if (!hits.length) return { clicked: false, reason: 'no option has this exact name', options: short, optionCount: names.length };
-      if (hits.length > 1) return { clicked: false, reason: 'two options have this name', options: short, optionCount: names.length };
-      if (/sku-item--selected|\bselected\b|\bactive\b/i.test(hits[0].cls)) return { clicked: false, alreadySelected: true };
-      if (/soldOut|sold-out|disabled/i.test(hits[0].cls)) return { clicked: false, reason: 'sold out', soldOut: true };
-      hits[0].e.click();
-      return { clicked: true, name, next: 'wait with computer{action:"wait"}, then price() or capture()' };
+      const state = (h) => ({ selected: /sku-item--selected|\bselected\b|\bactive\b/i.test(h.cls), soldOut: /soldOut|sold-out|disabled/i.test(h.cls) });
+      if (n != null && !(Number.isInteger(n) && n >= 1 && n <= hits.length)) {
+        return { clicked: false, reason: 'n must be a whole number from 1 to ' + hits.length + ' for this name', tiles: hits.length };
+      }
+      if (hits.length > 1 && n == null) {
+        return { clicked: false, reason: hits.length + ' options have this name: pick(name, n) with n from options() (1 to ' + hits.length + ')',
+          same: hits.slice(0, 12).map((h, k) => Object.assign({ n: k + 1 }, state(h))) };
+      }
+      const hit = hits[(n || 1) - 1];
+      if (state(hit).selected) return { clicked: false, alreadySelected: true };
+      if (state(hit).soldOut) return { clicked: false, reason: 'sold out', soldOut: true };
+      hit.e.click();
+      return Object.assign({ clicked: true, name }, hits.length > 1 ? { n } : {},
+        { next: 'wait with computer{action:"wait"}, then price() or capture()' });
     },
 
     /* read() plus the JSON-LD and the price on screen, saved in localStorage
@@ -993,6 +1033,10 @@ function wallVerdict(sig) {
         selected: r.selectedVariants,
         selectedImages: r.selectedImages,
         options: r.variants,
+        optionTiles: r.optionTiles,
+        // The seller's store (SKILL.md step 6): null means not found, unknown.
+        store: r.store ? r.store.name : null,
+        storeOfficial: r.store ? r.store.official : null,
         reviews: r.reviews.own,
         ownRating: r.reviews.ownRating,
         pooledReviews: ar.reviewCount != null && Number.isFinite(Number(ar.reviewCount)) ? Number(ar.reviewCount) : null,
@@ -1014,10 +1058,13 @@ function wallVerdict(sig) {
       const brief = { saved, id, price: rec.price, priceFrom: rec.priceFrom, currency: rec.currency,
         reviews: rec.reviews, ownRating: rec.ownRating, pooledReviews: rec.pooledReviews, soldRaw: rec.soldRaw,
         selected: rec.selected.map((v) => v.slice(0, 24)).slice(0, 4), optionCount: rec.options.length,
+        store: rec.store ? rec.store.slice(0, 40) : null,
         specRows: Object.keys(rec.specs).length, specsSource: rec.specsSource, description: r.description.source,
         gallery: r.galleryCount, descriptionImages: r.descriptionImages.length, visibility: r.visibility,
         warnings: r.warnings.map((w) => w.split(':')[0]) };
       if (err) brief.err = err;
+      // More tiles than names: some share a name (see options() and pick(name, n)).
+      if (rec.optionTiles !== rec.options.length) brief.optionTiles = rec.optionTiles;
       if (rec.soldOut.length) brief.soldOut = rec.soldOut.map((v) => v.slice(0, 24));
       // The first two: more than that would pass the 1,000 characters. All are in the record.
       if (rec.selectedImages.length) brief.selectedImages = rec.selectedImages.slice(0, 2).map((s) => s.image);
@@ -1053,8 +1100,11 @@ function wallVerdict(sig) {
       f.appendChild(ta);
       document.body.appendChild(f);
       f.submit();
+      // The tab follows the form to the receiver, another origin: the cleanup
+      // run there removed nothing (measured 2026-11-08). Hence the last line.
       return 'UNCONFIRMED: form-posted ' + items.length + ' records (' + body.length + ' chars) to ' + url +
-             ' - delivered only if the receiver prints "saved <path>" in its own output. The records stay saved until dropCaptured()';
+             ' - delivered only if the receiver prints "saved <path>" (a details-<stamp>.json, for rank.mjs, never decode.mjs) in its own output.' +
+             ' The records stay saved until dropCaptured(). This tab is now on the receiver: navigate back to AliExpress before the next read or the cleanup.';
     },
 
     dropCaptured() {
@@ -1199,6 +1249,7 @@ function wallVerdict(sig) {
       // Review counts, read AFTER expanding: the review block renders lazily.
       const reviews = parseReviewBlock((document.body && document.body.innerText) || '');
       const pageText = (document.body.innerText || '').replace(/\s+/g, ' ');
+      const store = storeOf(pageText);
 
       // Everything that depends on the description, built twice: once with
       // a 'pending' description (stored in `last` before the fetch), once
@@ -1269,6 +1320,14 @@ function wallVerdict(sig) {
           warnings.push('specs-from-text: the rows were matched by NAME from the page text, not read from the spec ' +
                         'table. Before setting a hard requirement from one, confirm it in `specsText` or a screenshot.');
         }
+        // Several tiles with one name: `variants` keeps the name once (see options()).
+        const nameUses = new Map();
+        variants.forEach((v) => nameUses.set(v, (nameUses.get(v) || 0) + 1));
+        const repeated = [...nameUses].filter(([, k]) => k > 1);
+        if (repeated.length) {
+          warnings.push('same-name-options: ' + repeated.slice(0, 3).map(([v, k]) => k + ' tiles are named "' + v.slice(0, 40) + '"').join(', ') +
+                        '. `variants` lists each name once; pick(name, n) with n from options() selects one tile.');
+        }
         const conflicts = specOptionConflicts(selectedVariants, specs.rows);
         conflicts.slice(0, 5).forEach((c) => {
           warnings.push('specs-vs-option: the selected option "' + c.option.slice(0, 40) + '" disagrees with spec row "' +
@@ -1321,6 +1380,10 @@ function wallVerdict(sig) {
           fingerprint: after,
           pageGrew: after.height !== before.height || after.textLen !== before.textLen,
           variants: [...new Set(variants)],
+          // Option tiles, counted before the names were made unique.
+          optionTiles: variants.length,
+          // { name, official } or null (not found: unknown).
+          store,
           selectedVariant,
           selectedVariants,
           // { name, image } per selected image tile: often that option's spec sheet.

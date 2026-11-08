@@ -1339,6 +1339,13 @@ function queryRelevance(query, titles) {
            * 180), so it counts what was served, not what exists. */
           if (fresh === 0) { s.stop = 'exhausted'; s.endSignal = 'no-new-ids'; break; }
         }
+        /* The caps are checked at the top of each pass, so a call that read
+         * exactly the last allowed page used to end with stop null and done
+         * false, and one more step() was needed to say so (measured
+         * 2026-11-08: maxPages 6 and step(6), twice). Checked once more here,
+         * in the same order as above. */
+        if (!s.stop && (s.page >= s.maxPages || s.page >= LAST_PAGE)) s.stop = 'page-cap';
+        else if (!s.stop && s.requests >= s.maxRequests) s.stop = 'request-budget';
       } catch (e) {
         // Never a silent skip: an unexpected shape stops the run, named.
         s.lastErr = noQ('step:' + String(e).slice(0, 100));

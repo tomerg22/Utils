@@ -46,6 +46,14 @@
  * be. A part whose titles do not match its query is 'off-query' even when it
  * came from a harvest.js too old to say so. A stream counts as blocked only
  * when its LAST page read hit the wall.
+ *
+ * A FILE WITH A `kind` IS REFUSED (exit 2, naming the file). The detail
+ * records of __aeListing.sendAll() are { kind: 'details', items }, and
+ * receiver.mjs saved them as harvest-details-<stamp>.json, so the
+ * `decode.mjs harvest-*.json` of SKILL.md took them in. Measured 2026-11-08:
+ * exit 0, no warning, a stream with no query (counted as a 4-star one), and
+ * 20 search items carrying detail-page prices and own counts beside 1,245
+ * that did not. Detail records go to rank.mjs as they are.
  */
 import { readFileSync } from 'node:fs';
 import { queryRelevance, fourStarWarning } from './lib.mjs';
@@ -322,6 +330,14 @@ export function chunksOf(texts) {
   return gs.length ? { found: gs[0].found, total: gs[0].total } : { found: new Map(), total: null };
 }
 
+/** Why a payload with a `kind` is not decoded: see the header. */
+export function kindError(j) {
+  const n = Array.isArray(j.items) ? j.items.length : 0;
+  return `a ${String(j.kind).slice(0, 20)} file (kind "${String(j.kind).slice(0, 20)}", ${n} record(s)` +
+    (j.kind === 'details' ? ' from __aeListing.sendAll()' : '') + ') is not a search payload, so it is never ' +
+    'merged into one. It goes to rank.mjs as it is (--mode final). Leave it out of the decode.mjs call.';
+}
+
 export function assemble(texts) {
   const found = []; // [{ payload, via }]
   for (const p of fromInAppFiles(texts)) found.push({ payload: p, via: 'in-app-file' });
@@ -350,10 +366,11 @@ export function assemble(texts) {
 
   for (const t of texts) {
     if (!/^\s*\{/.test(t)) continue;
-    try {
-      const j = JSON.parse(t);
-      if (j && typeof j === 'object' && (Array.isArray(j.items) || j.source)) found.push({ payload: j, via: 'plain-json' });
-    } catch (e) { /* next */ }
+    let j = null;
+    try { j = JSON.parse(t); } catch (e) { continue; }
+    // Outside the try: a throw inside it would be skipped as "not JSON".
+    if (j && typeof j === 'object' && j.kind) throw new Error(kindError(j));
+    if (j && typeof j === 'object' && (Array.isArray(j.items) || j.source)) found.push({ payload: j, via: 'plain-json' });
   }
   if (!found.length) throw new Error('no payload found: expected an in-app saved result, AEPAYLOAD chunks, or a payload JSON');
   if (found.length === 1) return found[0];
@@ -366,7 +383,17 @@ if (isMain) {
   const check = args.includes('--check');
   const files = args.filter((a) => a !== '--check');
   if (!files.length) { console.error('usage: node decode.mjs [--check] <file...>'); process.exit(2); }
-  const texts = files.flatMap((f) => textsOf(readFileSync(f, 'utf8')));
+  const raws = files.map((f) => [f, readFileSync(f, 'utf8')]);
+  // A details file is named here, so the operator knows which one to leave out.
+  for (const [f, raw] of raws) {
+    for (const t of textsOf(raw)) {
+      if (!/^\s*\{/.test(t)) continue;
+      let j = null;
+      try { j = JSON.parse(t); } catch (e) { continue; }
+      if (j && typeof j === 'object' && j.kind) { console.error('decode: ' + f + ': ' + kindError(j)); process.exit(2); }
+    }
+  }
+  const texts = raws.flatMap(([, raw]) => textsOf(raw));
   let res;
   try { res = assemble(texts); } catch (e) { console.error('decode: ' + e.message); process.exit(1); }
   const p = res.payload;

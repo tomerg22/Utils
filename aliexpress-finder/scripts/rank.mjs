@@ -369,13 +369,29 @@ for (const i of all) {
  *
  * The warning is emitted in-band, at the exact moment the false conclusion
  * gets drawn, because prose in a doc did not stop it.
+ *
+ * WHEN AND WHAT (fixed 2026-11-08). It fired whenever the regex dropped 90%
+ * or more, and always said "a title regex found nothing". A class split of a
+ * pool merged from several searches drops that much by design: it kept 32 of
+ * 884 (USB-C chargers that name Dell) and 39 of 1,265 (GaN laptop chargers),
+ * and both times the warning said "found nothing". A warning that is false on
+ * normal use stops being read. It now fires when the regex matched no title,
+ * or dropped 90% or more AND matched fewer than ABSENCE_FLOOR titles, and it
+ * states the counts.
  */
 const warnings = [];
-const ABSENCE = 'absence-is-not-evidence: a title regex found nothing. Titles omit physical ' +
-  'attributes (wires, connectors, mounting, enclosure, dimensions). Do NOT report that the ' +
-  'product does not exist. Verify on the IMAGES and description of >=3 candidates first ' +
-  '(listing.js + labels.sh).';
-if (reqRe && all.length >= 10 && requireDropped >= 0.9 * all.length) warnings.push(ABSENCE);
+const ABSENCE_FLOOR = 10;
+const requireMatched = reqRe ? all.filter((i) => reqRe.test(i.title || '')).length : null;
+const absenceWarning = (matched, total) => 'absence-is-not-evidence: the --require regex matched ' +
+  (matched ? 'only ' + matched + ' of ' + total + ' titles' : 'none of the ' + total + ' titles') +
+  '. Titles omit physical attributes (wires, connectors, mounting, enclosure, dimensions). Do NOT report ' +
+  (matched ? 'that the other ' + (total - matched) + ' lack the attribute, or that only ' + matched + ' exist,'
+           : 'that the product does not exist') +
+  ' from titles alone. Verify on the IMAGES and description of >=3 candidates first (listing.js + labels.sh).';
+if (reqRe && all.length && (requireMatched === 0 ||
+    (all.length >= 10 && requireDropped >= 0.9 * all.length && requireMatched < ABSENCE_FLOOR))) {
+  warnings.push(absenceWarning(requireMatched, all.length));
+}
 /* Off-query stream (measured 2026-10-17): "wired usb mouse" was served as
  * craft wire, 281 of 282 titles, and ranked without a word. Checked per
  * payload that names its query, whatever the harvester said. */
@@ -460,11 +476,11 @@ if (!all.length) {
 }
 
 if (!kept.length) {
-  /* Only when the REGEX emptied the pool. It used to fire whenever kept was
-   * empty and --require was given, so a regex that matched every title (all
-   * drops were constraint violations) was blamed: "a title regex found
-   * nothing", sending the operator to fix a regex that worked. */
-  if (reqRe && all.length && requireDropped === all.length && !warnings.includes(ABSENCE)) warnings.push(ABSENCE);
+  /* The absence warning above fires only when the REGEX matched no title (or
+   * nearly none). It used to fire whenever kept was empty and --require was
+   * given, so a regex that matched every title (all drops were constraint
+   * violations) was blamed: "a title regex found nothing", sending the
+   * operator to fix a regex that worked. */
   /* Say WHY the ranking is empty. "No candidate satisfies the stated
    * constraints" used to be printed whatever emptied it: items unchecked on
    * the constraint, or dropped for no own count, were reported as failing
@@ -576,6 +592,47 @@ const scored = kept
   })
   .sort((a, b) => b.score - a.score);
 
+/* SAME PRODUCT, SEVERAL LISTINGS (measured 2026-11-08). Three Reletech
+ * listings had byte-identical photos (one product at three prices) and took
+ * rows 1-3 of a top-4 table; two more products were listed twice each. Only
+ * an md5 check by hand found it. `labels.sh same` groups listings by their
+ * photos; a finalist that carries its group as `product` is ranked once, on
+ * its best-scoring listing. The others are named, with their prices, in
+ * `sameProduct`, in `otherListings` on the ranked one, and in a warning: the
+ * cheapest listing is not always the one ranked. */
+const productKey = (i) => {
+  const v = i.product;
+  if (typeof v !== 'string' && typeof v !== 'number') return null;
+  const k = String(v).trim();
+  return k || null;
+};
+const firstOfProduct = new Map();
+const sameProduct = [];
+const pickable = [];
+for (const i of scored) {
+  const k = productKey(i);
+  const first = k == null ? null : firstOfProduct.get(k);
+  if (!first) { if (k != null) firstOfProduct.set(k, i); pickable.push(i); continue; }
+  sameProduct.push({ id: i.id, product: k, rankedAs: first.id, price: i.price ?? null, currency: i.currency ?? null, score: i.score });
+}
+const sameGroups = [];
+for (const [k, rep] of firstOfProduct) {
+  const others = sameProduct.filter((s) => s.product === k);
+  if (!others.length) continue;
+  rep.otherListings = others.map((s) => ({ id: s.id, price: s.price }));
+  rep.flags.push('other-listings');
+  const priced = [{ id: rep.id, price: rep.price }, ...others].filter((x) => typeof x.price === 'number');
+  const cheapest = priced.sort((a, b) => a.price - b.price)[0];
+  sameGroups.push(`${rep.id} (price ${rep.price ?? '?'}) is also listed as ` +
+    others.map((s) => `${s.id} (price ${s.price ?? '?'})`).join(', ') +
+    (cheapest && cheapest.id !== rep.id ? `, and ${cheapest.id} is the cheapest` : ''));
+}
+if (sameProduct.length) {
+  warnings.push(`same-product: ${sameProduct.length} listing(s) of a product already ranked were left out of the ` +
+    `ranking: ${sameGroups.slice(0, 4).join('; ')}${sameGroups.length > 4 ? '; …' : ''}. The table lists products: ` +
+    'name the other listings and their prices.');
+}
+
 /* Selection. Without --spread this is exactly the old behaviour: top N by
  * score. With --spread K, the last K slots are filled by walking sold tiers
  * from the LOWEST upward and taking the best-scoring unpicked item in each,
@@ -583,7 +640,7 @@ const scored = kept
  * labelled so the report can say which picks were stratified.
  */
 const headCount = Math.max(1, TOP - Math.min(SPREAD, Math.max(0, TOP - 1)));
-const head = scored.slice(0, headCount).map((i) => ({ ...i, pick: 'score' }));
+const head = pickable.slice(0, headCount).map((i) => ({ ...i, pick: 'score' }));
 const chosen = [...head];
 
 
@@ -591,7 +648,7 @@ const chosen = [...head];
 if (SPREAD > 0) {
   const taken = new Set(head.map((i) => i.id));
   const buckets = new Map();
-  for (const i of scored) {
+  for (const i of pickable) {
     if (taken.has(i.id)) continue;
     const t = soldTier(evidenceOf(i));
     if (!buckets.has(t.key)) buckets.set(t.key, { floor: t.floor, items: [] });
@@ -631,10 +688,10 @@ const ranked = chosen;
  * other end, with no word. The order is still input order, but the cut is
  * now named, with the tied items it left out. Checked AFTER the spread
  * picks, which may take some of the tied items back in. */
-if (scored.length > headCount && scored[headCount - 1].score === scored[headCount].score) {
-  const cut = scored[headCount - 1].score;
+if (pickable.length > headCount && pickable[headCount - 1].score === pickable[headCount].score) {
+  const cut = pickable[headCount - 1].score;
   const inIds = new Set(ranked.map((i) => i.id));
-  const tied = scored.filter((i) => i.score === cut);
+  const tied = pickable.filter((i) => i.score === cut);
   const out = tied.filter((i) => !inIds.has(i.id));
   if (out.length) {
     warnings.push(`tie-at-cutoff: ${tied.length} items share score ${cut} across the cut; ${out.length} of them ` +
@@ -665,6 +722,8 @@ console.log(
       warnings,
       considered: all.length,
       kept: kept.length,
+      // Listings of a product already ranked (see SAME PRODUCT above).
+      sameProduct,
       droppedCount: dropped.length,
       droppedReasons: dropped.reduce((a, d) => ({ ...a, [d.why]: (a[d.why] || 0) + 1 }), {}),
       // Final mode names them: each one was read in step 5.

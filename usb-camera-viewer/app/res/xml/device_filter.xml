@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Any device with a USB video class (UVC) interface. -->
+    <usb-device class="14" />
+</resources>

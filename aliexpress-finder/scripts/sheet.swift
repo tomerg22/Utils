@@ -4,11 +4,13 @@
 //
 // Built and run by `labels.sh sheet <dir>`, which compiles this file once into
 // ~/.cache/aliexpress-finder. WHY (measured 2026-11-08, the Dell charger
-// session): "read every image" meant 434 images over 18 listings, one Read
+// session): "read every image" meant 434 images over 20 listings, one Read
 // call each. ffmpeg on this Mac could not start (a missing libjxl library),
 // PIL is not installed, and sips cannot place images side by side. AppKit can,
 // and it ships with macOS. 12 images per sheet made it 27 Read calls for 273
-// images. The red number on a tile is its img<N>.png, for the follow-up crop.
+// images. The red label on a tile names its file (3 is img3.png, d3 is
+// desc3.png), for the follow-up crop. An image that cannot be decoded is a
+// blank tile, so its label is printed after "unreadable:" for labels.sh.
 import AppKit
 
 let args = CommandLine.arguments
@@ -33,7 +35,7 @@ NSGraphicsContext.saveGraphicsState()
 NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
 NSColor.white.setFill()
 NSRect(x: 0, y: 0, width: width, height: height).fill()
-var missing = 0
+var missing: [String] = []
 for (i, item) in items.enumerated() {
   // AppKit counts y from the bottom: row 0 is the top row.
   let x = CGFloat(i % cols) * cell
@@ -43,7 +45,7 @@ for (i, item) in items.enumerated() {
     let w = img.size.width * k, h = img.size.height * k
     img.draw(in: NSRect(x: x + (cell - w) / 2, y: y + (cell - h) / 2, width: w, height: h))
   } else {
-    missing += 1
+    missing.append(item.0)
   }
   let size = max(12, cell * 0.068)
   let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.boldSystemFont(ofSize: size), .foregroundColor: NSColor.red,
@@ -55,4 +57,4 @@ for (i, item) in items.enumerated() {
 NSGraphicsContext.restoreGraphicsState()
 guard let png = rep.representation(using: .png, properties: [:]) else { exit(1) }
 do { try png.write(to: URL(fileURLWithPath: out)) } catch { exit(1) }
-print(out + " " + String(items.count) + (missing > 0 ? " (" + String(missing) + " could not be read)" : ""))
+print(out + " " + String(items.count) + (missing.isEmpty ? "" : " unreadable:" + missing.joined(separator: ",")))

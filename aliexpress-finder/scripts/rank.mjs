@@ -5,6 +5,7 @@
  *   node rank.mjs --mode shortlist --top 10  < harvest.json
  *   node rank.mjs --mode final     --top 4   < finalists.json
  *   node rank.mjs --mode final --require 'מקציף|קצף' < finalists.json
+ *   node rank.mjs --mode shortlist --class 'gan' --require 'wire' < harvest.json
  *   node rank.mjs --mode final --criterion noise:low --criterion airflow:high < finalists.json
  *
  * stdin: a JSON array of items, or {items:[...]}, or an array of extractor
@@ -56,7 +57,7 @@ import { median, parseSold, queryRelevance, fourStarWarning } from './lib.mjs';
  * skipped with exit 0, and the hard requirement was dropped (recheck,
  * 2026-10-19). */
 const FLAGS = ['mode', 'top', 'min-rating', 'min-evidence', 'w-quality', 'w-volume', 'w-brand', 'prior',
-  'brand-default', 'require', 'spread', 'constraint', 'criterion', 'w-criterion'];
+  'brand-default', 'class', 'require', 'spread', 'constraint', 'criterion', 'w-criterion'];
 /* A flag with no value (last on the line, or followed by another --flag)
  * is an error, never a silent NaN. Measured 2026-10-18: `--spread x`, a bare
  * `--spread` or `--top abc` made headCount NaN, slice(0, NaN) returned [],
@@ -108,8 +109,15 @@ const W_BRAND = numArg('w-brand', 0.15, { min: 0 });
 const PRIOR = numArg('prior', MODE === 'final' ? 50 : 300, { min: 0 });
 const BRAND_DEFAULT = numArg('brand-default', 0.5, { min: 0 });
 const REQUIRE = arg('require', null); // regex on title — drops off-category items
+/* --class is a title regex too, for a CLASS SPLIT: one product class out of
+ * a pool merged from several searches (the chargers that name Dell, the GaN
+ * ones). It drops most of such a pool by design, so it warns only when it
+ * matches no title. --require stays the attribute filter, with the absence
+ * warning (see WHEN AND WHAT below). Added 2026-11-08 (review of 58c8a00). */
+const CLASS = arg('class', null);
 // A blank regex (an unset $VAR) would filter nothing, with no word.
 if (REQUIRE != null && !/\S/.test(REQUIRE)) die('--require needs a regex, got a blank value');
+if (CLASS != null && !/\S/.test(CLASS)) die('--class needs a regex, got a blank value');
 const SPREAD = numArg('spread', 0, { min: 0, int: true });
 
 /* All occurrences of a repeatable flag, e.g. --constraint wires --constraint 9v */
@@ -320,22 +328,26 @@ const ratingOf = (i) => (MODE === 'final' && typeof i.ownRating === 'number' ? i
 
 const evidenceOf = (i) => (MODE === 'final' ? i.reviews : i.sold);
 // A bad regex is a bad flag value: exit 2, never a stack trace (exit 1).
-let reqRe = null;
-try { reqRe = REQUIRE ? new RegExp(REQUIRE, 'i') : null; } catch (e) {
-  die(`--require is not a valid regular expression: ${JSON.stringify(REQUIRE)} (${String(e.message).replace(/^Invalid regular expression: /, '')})`);
-}
+const titleRegex = (name, src) => {
+  if (src == null) return null;
+  try { return new RegExp(src, 'i'); } catch (e) {
+    return die(`--${name} is not a valid regular expression: ${JSON.stringify(src)} (${String(e.message).replace(/^Invalid regular expression: /, '')})`);
+  }
+};
+const classRe = titleRegex('class', CLASS);
+const reqRe = titleRegex('require', REQUIRE);
 
 const kept = [];
 const dropped = [];
 const unverified = [];
-let requireDropped = 0;
 for (const i of all) {
   const ev = evidenceOf(i);
   const violated = CONSTRAINTS.filter((n) => constraintStatus(i, n) === 'fail');
   const unknown = CONSTRAINTS.filter((n) => constraintStatus(i, n) === 'unknown');
   if (i.notANumber) dropped.push({ ...i, why: 'not-a-number:' + i.notANumber.join('+') });
   else if (badBrands.includes(i)) dropped.push({ ...i, why: 'brandScore-out-of-range' });
-  else if (reqRe && !reqRe.test(i.title || '')) { dropped.push({ ...i, why: 'off-category' }); requireDropped++; }
+  else if (classRe && !classRe.test(i.title || '')) dropped.push({ ...i, why: 'off-class' });
+  else if (reqRe && !reqRe.test(i.title || '')) dropped.push({ ...i, why: 'off-category' });
   else if (violated.length) dropped.push({ ...i, why: `violates:${violated.join('+')}` });
   /* With no own count the only rating is the pooled one, so it is not
    * judged on it: set aside as unknown, never "rating<4" (review,
@@ -370,27 +382,39 @@ for (const i of all) {
  * The warning is emitted in-band, at the exact moment the false conclusion
  * gets drawn, because prose in a doc did not stop it.
  *
- * WHEN AND WHAT (fixed 2026-11-08). It fired whenever the regex dropped 90%
- * or more, and always said "a title regex found nothing". A class split of a
- * pool merged from several searches drops that much by design: it kept 32 of
- * 884 (USB-C chargers that name Dell) and 39 of 1,265 (GaN laptop chargers),
- * and both times the warning said "found nothing". A warning that is false on
- * normal use stops being read. It now fires when the regex matched no title,
- * or dropped 90% or more AND matched fewer than ABSENCE_FLOOR titles, and it
- * states the counts.
+ * WHEN AND WHAT (fixed 2026-11-08). It fired whenever the --require regex
+ * matched 10% of the titles or fewer, and always said "a title regex found
+ * nothing". A class split of a pool merged from several searches matches that
+ * few by design: it kept 32 of 884 (USB-C chargers that name Dell) and 39 of
+ * 1,265 (GaN laptop chargers), and both times the warning said "found
+ * nothing". A first fix stayed quiet at 10 matches or more; that silenced the
+ * case this warning exists for too (an attribute regex matching 12 of 900
+ * titles), and it compared a count of all titles with a count of the items
+ * this regex alone dropped (review of 58c8a00). Now a class split goes in
+ * --class, which warns only when it matches no title. --require keeps the
+ * 10% rule, counted over the titles --class kept, plus a match of none in a
+ * pool under 10. Both warnings state the counts.
  */
 const warnings = [];
-const ABSENCE_FLOOR = 10;
-const requireMatched = reqRe ? all.filter((i) => reqRe.test(i.title || '')).length : null;
+const titled = (re, list) => list.filter((i) => re.test(i.title || ''));
+const classKept = classRe ? titled(classRe, all) : all;
+if (classRe && all.length && !classKept.length) {
+  warnings.push(`absence-is-not-evidence: the --class regex matched none of the ${all.length} titles. Check the ` +
+    'regex and the language the titles came back in. Do NOT report that the class does not exist from titles alone.');
+}
 const absenceWarning = (matched, total) => 'absence-is-not-evidence: the --require regex matched ' +
   (matched ? 'only ' + matched + ' of ' + total + ' titles' : 'none of the ' + total + ' titles') +
+  (classRe ? ' that --class kept' : '') +
   '. Titles omit physical attributes (wires, connectors, mounting, enclosure, dimensions). Do NOT report ' +
   (matched ? 'that the other ' + (total - matched) + ' lack the attribute, or that only ' + matched + ' exist,'
            : 'that the product does not exist') +
-  ' from titles alone. Verify on the IMAGES and description of >=3 candidates first (listing.js + labels.sh).';
-if (reqRe && all.length && (requireMatched === 0 ||
-    (all.length >= 10 && requireDropped >= 0.9 * all.length && requireMatched < ABSENCE_FLOOR))) {
-  warnings.push(absenceWarning(requireMatched, all.length));
+  ' from titles alone. Verify on the IMAGES and description of >=3 candidates first (listing.js + labels.sh).' +
+  ' A regex that picks one product class (a brand, a type) out of a merged pool goes in --class instead.';
+if (reqRe && classKept.length) {
+  const matched = titled(reqRe, classKept).length;
+  if (matched === 0 || (classKept.length >= 10 && matched <= 0.1 * classKept.length)) {
+    warnings.push(absenceWarning(matched, classKept.length));
+  }
 }
 /* Off-query stream (measured 2026-10-17): "wired usb mouse" was served as
  * craft wire, 281 of 282 titles, and ranked without a word. Checked per
@@ -476,11 +500,10 @@ if (!all.length) {
 }
 
 if (!kept.length) {
-  /* The absence warning above fires only when the REGEX matched no title (or
-   * nearly none). It used to fire whenever kept was empty and --require was
-   * given, so a regex that matched every title (all drops were constraint
-   * violations) was blamed: "a title regex found nothing", sending the
-   * operator to fix a regex that worked. */
+  /* The absence warnings above go by the REGEX's own counts. It used to fire
+   * whenever kept was empty and --require was given, so a regex that matched
+   * every title (all drops were constraint violations) was blamed: "a title
+   * regex found nothing", sending the operator to fix a regex that worked. */
   /* Say WHY the ranking is empty. "No candidate satisfies the stated
    * constraints" used to be printed whatever emptied it: items unchecked on
    * the constraint, or dropped for no own count, were reported as failing
@@ -599,39 +622,22 @@ const scored = kept
  * photos; a finalist that carries its group as `product` is ranked once, on
  * its best-scoring listing. The others are named, with their prices, in
  * `sameProduct`, in `otherListings` on the ranked one, and in a warning: the
- * cheapest listing is not always the one ranked. */
+ * cheapest listing is not always the one ranked. That is done after the
+ * --top cut, below. */
 const productKey = (i) => {
   const v = i.product;
   if (typeof v !== 'string' && typeof v !== 'number') return null;
   const k = String(v).trim();
   return k || null;
 };
-const firstOfProduct = new Map();
-const sameProduct = [];
-const pickable = [];
-for (const i of scored) {
+const seenProduct = new Set();
+const pickable = scored.filter((i) => {
   const k = productKey(i);
-  const first = k == null ? null : firstOfProduct.get(k);
-  if (!first) { if (k != null) firstOfProduct.set(k, i); pickable.push(i); continue; }
-  sameProduct.push({ id: i.id, product: k, rankedAs: first.id, price: i.price ?? null, currency: i.currency ?? null, score: i.score });
-}
-const sameGroups = [];
-for (const [k, rep] of firstOfProduct) {
-  const others = sameProduct.filter((s) => s.product === k);
-  if (!others.length) continue;
-  rep.otherListings = others.map((s) => ({ id: s.id, price: s.price }));
-  rep.flags.push('other-listings');
-  const priced = [{ id: rep.id, price: rep.price }, ...others].filter((x) => typeof x.price === 'number');
-  const cheapest = priced.sort((a, b) => a.price - b.price)[0];
-  sameGroups.push(`${rep.id} (price ${rep.price ?? '?'}) is also listed as ` +
-    others.map((s) => `${s.id} (price ${s.price ?? '?'})`).join(', ') +
-    (cheapest && cheapest.id !== rep.id ? `, and ${cheapest.id} is the cheapest` : ''));
-}
-if (sameProduct.length) {
-  warnings.push(`same-product: ${sameProduct.length} listing(s) of a product already ranked were left out of the ` +
-    `ranking: ${sameGroups.slice(0, 4).join('; ')}${sameGroups.length > 4 ? '; …' : ''}. The table lists products: ` +
-    'name the other listings and their prices.');
-}
+  if (k == null) return true;
+  if (seenProduct.has(k)) return false;
+  seenProduct.add(k);
+  return true;
+});
 
 /* Selection. Without --spread this is exactly the old behaviour: top N by
  * score. With --spread K, the last K slots are filled by walking sold tiers
@@ -698,6 +704,49 @@ if (pickable.length > headCount && pickable[headCount - 1].score === pickable[he
       `were left out by input order (${out.slice(0, 5).map((i) => i.id).join(', ')}` +
       `${out.length > 5 ? ', …' : ''}). Raise --top to include them, or say the shortlist split a tie.`);
   }
+}
+
+/* The other listings of each RANKED product (see SAME PRODUCT above). Fixed
+ * 2026-11-08 (review of 58c8a00): it was done before the --top cut, so a
+ * product below the cut was named "already ranked"; it looked only at the
+ * listings kept, so a cheaper listing set aside for thin evidence was never
+ * named; and it named a cheapest when a price was missing or the prices were
+ * in two currencies. Now every listing of the product is named, a set-aside
+ * one with its reason, and a cheapest only when every price is known and in
+ * one currency. */
+const whyOf = new Map([...dropped, ...unverified].map((d) => [d.id, d.why]));
+const listingOf = (i) => ({ id: i.id, price: typeof i.price === 'number' ? i.price : null, currency: i.currency ?? null,
+  ...(whyOf.has(i.id) ? { why: whyOf.get(i.id) } : {}) });
+const priceText = (x) => (x.price == null ? '?' : x.price + (x.currency ? ' ' + x.currency : ''));
+const cheapestText = (group) => {
+  const noPrice = group.filter((x) => x.price == null).map((x) => x.id);
+  if (noPrice.length) return ` (no cheapest named: no price for ${noPrice.join(', ')})`;
+  const currencies = [...new Set(group.map((x) => x.currency || '?'))];
+  if (currencies.length > 1) return ` (no cheapest named: the prices are in ${currencies.join(' and ')})`;
+  const low = Math.min(...group.map((x) => x.price));
+  const cheap = group.filter((x) => x.price === low);
+  if (cheap.some((x) => x.id === group[0].id)) return '';
+  return `, and ${cheap.map((x) => x.id + (x.why ? ' (set aside)' : '')).join(' and ')} ` +
+    `${cheap.length > 1 ? 'are' : 'is'} the cheapest`;
+};
+const sameProduct = [];
+const sameGroups = [];
+for (const r of ranked) {
+  const k = productKey(r);
+  if (k == null) continue;
+  const others = all.filter((i) => i.id !== r.id && productKey(i) === k).map(listingOf);
+  if (!others.length) continue;
+  r.otherListings = others;
+  r.flags = [...r.flags, 'other-listings'];
+  for (const o of others) sameProduct.push({ ...o, product: k, rankedAs: r.id });
+  sameGroups.push(`${r.id} (price ${priceText(listingOf(r))}) is also listed as ` +
+    others.map((o) => `${o.id} (price ${priceText(o)}${o.why ? ', set aside: ' + o.why : ''})`).join(', ') +
+    cheapestText([listingOf(r), ...others]));
+}
+if (sameProduct.length) {
+  warnings.push(`same-product: ${sameProduct.length} other listing(s) of ${sameGroups.length} ranked product(s) are not ` +
+    `in the ranking: ${sameGroups.slice(0, 4).join('; ')}${sameGroups.length > 4 ? '; …' : ''}. The table lists products: ` +
+    'name the other listings and their prices.');
 }
 
 console.log(

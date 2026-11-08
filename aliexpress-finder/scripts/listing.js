@@ -10,7 +10,8 @@
  *   r.descriptionImages       // images inside the description (drawings, spec tables)
  *   r.description.source      // 'rendered' | 'fetched' | 'missing' | 'fetch-failed' | 'blocked'
  *   r.reviews                 // { own, ownRating, header, pooledNote }
- *   r.variants                // the option selector only; selectedVariants too
+ *   r.variants                // the option selector only; selectedVariants too, and
+ *                             // selectedTiles: { name, n } when tiles share a name
  *   r.specs                   // the Specifications rows: { 'Power Type': 'Wired', … }
  *   r.warnings, r.visibility  // read these first
  *   __aeListing.last          // the latest result, stored BEFORE the description
@@ -325,6 +326,34 @@ function wallVerdict(sig) {
     const img = e.querySelector ? e.querySelector('img') : null;
     return clean((img && img.getAttribute && (img.getAttribute('alt') || img.getAttribute('title'))) ||
                  (e.getAttribute && e.getAttribute('title')) || e.textContent);
+  };
+  const SELECTED_RE = /sku-item--selected|\bselected\b|\bactive\b/i;
+  const SOLDOUT_RE = /soldOut|sold-out|disabled/i;
+  /* Every named option tile in page order: { e, name, selected, soldOut },
+   * plus `n` (1, 2, …) and `of` on a tile whose WHOLE name other tiles also
+   * use. options(), pick() and read() all count with this, so an n means one
+   * tile everywhere. read() used to cut names to 80 characters first, so two
+   * long names that differ after character 80 were "one name" there and two
+   * in options(), and capture() saved only the name of the picked tile
+   * (review of 58c8a00). */
+  const tiles = () => {
+    const out = [];
+    walk(document, (e) => {
+      const cls = classOf(e);
+      if (!isTile(cls)) return;
+      const name = tileName(e);
+      if (name) out.push({ e, name, selected: SELECTED_RE.test(cls), soldOut: SOLDOUT_RE.test(cls) });
+    });
+    const uses = new Map();
+    out.forEach((t) => uses.set(t.name, (uses.get(t.name) || 0) + 1));
+    const seen = new Map();
+    out.forEach((t) => {
+      if (uses.get(t.name) < 2) return;
+      seen.set(t.name, (seen.get(t.name) || 0) + 1);
+      t.n = seen.get(t.name);
+      t.of = uses.get(t.name);
+    });
+    return out;
   };
   /* The tile's own image, full size, or null for a text tile. It is often that
    * option's spec sheet (measured 2026-11-01: "12V Fluid 1800RPM" shows current,
@@ -943,26 +972,13 @@ function wallVerdict(sig) {
      * had 3 tiles named "EU Plug Add Cable" (cables of other colours, one sold
      * out), and the price with the cable could not be read at all. */
     options() {
-      const out = [];
-      walk(document, (e) => {
-        const cls = classOf(e);
-        if (!isTile(cls)) return;
-        const name = tileName(e);
-        if (!name) return;
-        const o = { name, selected: /sku-item--selected|\bselected\b|\bactive\b/i.test(cls), soldOut: /soldOut|sold-out|disabled/i.test(cls) };
-        const image = tileImage(e);
+      return tiles().map((t) => {
+        const o = { name: t.name, selected: t.selected, soldOut: t.soldOut };
+        const image = tileImage(t.e);
         if (image) o.image = image;
-        out.push(o);
+        if (t.n) o.n = t.n;
+        return o;
       });
-      const uses = new Map();
-      out.forEach((o) => uses.set(o.name, (uses.get(o.name) || 0) + 1));
-      const seen = new Map();
-      out.forEach((o) => {
-        if (uses.get(o.name) < 2) return;
-        seen.set(o.name, (seen.get(o.name) || 0) + 1);
-        o.n = seen.get(o.name);
-      });
-      return out;
     },
 
     /* Select one option by its EXACT name, then wait with
@@ -973,17 +989,11 @@ function wallVerdict(sig) {
      * reply lists those tiles. A tile already selected is left alone: a second
      * click can clear it. */
     pick(name, n) {
-      const hits = [], names = [];
-      walk(document, (e) => {
-        const cls = classOf(e);
-        if (!isTile(cls)) return;
-        const t = tileName(e);
-        if (t) names.push(t);
-        if (t === name) hits.push({ e, cls });
-      });
-      const short = names.slice(0, 30).map((x) => x.slice(0, 24));
-      if (!hits.length) return { clicked: false, reason: 'no option has this exact name', options: short, optionCount: names.length };
-      const state = (h) => ({ selected: /sku-item--selected|\bselected\b|\bactive\b/i.test(h.cls), soldOut: /soldOut|sold-out|disabled/i.test(h.cls) });
+      const all = tiles();
+      const hits = all.filter((t) => t.name === name);
+      const short = all.slice(0, 30).map((t) => t.name.slice(0, 24));
+      if (!hits.length) return { clicked: false, reason: 'no option has this exact name', options: short, optionCount: all.length };
+      const state = (h) => ({ selected: h.selected, soldOut: h.soldOut });
       if (n != null && !(Number.isInteger(n) && n >= 1 && n <= hits.length)) {
         return { clicked: false, reason: 'n must be a whole number from 1 to ' + hits.length + ' for this name', tiles: hits.length };
       }
@@ -1031,6 +1041,8 @@ function wallVerdict(sig) {
         jsonLdPrice: ldPrice,
         currency: offer.priceCurrency || shown.currency,
         selected: r.selectedVariants,
+        // { name, n? } per selected tile: which of the tiles that share a name.
+        selectedTiles: r.selectedTiles,
         selectedImages: r.selectedImages,
         options: r.variants,
         optionTiles: r.optionTiles,
@@ -1065,6 +1077,9 @@ function wallVerdict(sig) {
       if (err) brief.err = err;
       // More tiles than names: some share a name (see options() and pick(name, n)).
       if (rec.optionTiles !== rec.options.length) brief.optionTiles = rec.optionTiles;
+      // A selected tile that shares its name: its n, the one pick(name, n) took.
+      const selN = rec.selectedTiles.filter((t) => t.n);
+      if (selN.length) brief.selectedN = selN.slice(0, 4).map((t) => ({ name: t.name.slice(0, 24), n: t.n }));
       if (rec.soldOut.length) brief.soldOut = rec.soldOut.map((v) => v.slice(0, 24));
       // The first two: more than that would pass the 1,000 characters. All are in the record.
       if (rec.selectedImages.length) brief.selectedImages = rec.selectedImages.slice(0, 2).map((s) => s.image);
@@ -1104,7 +1119,8 @@ function wallVerdict(sig) {
       // run there removed nothing (measured 2026-11-08). Hence the last line.
       return 'UNCONFIRMED: form-posted ' + items.length + ' records (' + body.length + ' chars) to ' + url +
              ' - delivered only if the receiver prints "saved <path>" (a details-<stamp>.json, for rank.mjs, never decode.mjs) in its own output.' +
-             ' The records stay saved until dropCaptured(). This tab is now on the receiver: navigate back to AliExpress before the next read or the cleanup.';
+             ' The records stay saved until dropCaptured(). This tab is now on the receiver: navigate back to https://he.aliexpress.com/' +
+             ' (the records are in that site\'s storage) before the next read or the cleanup.';
     },
 
     dropCaptured() {
@@ -1212,31 +1228,33 @@ function wallVerdict(sig) {
        * is selected matters: a $2.14 "keychain" was the 1-key one, not the
        * 9-key pad in the title. Live class names: sku-item--image--<hash>,
        * sku-item--text--<hash>, sku-item--selected--<hash> on the same node. */
-      const variants = [];
+      const tileList = tiles();
+      // Long option names are cut, never dropped: a 68-char selected option
+      // used to vanish, and with it the option the price is for. Names are
+      // made unique BEFORE the cut, so two names that differ past character
+      // 80 stay two options.
+      const cut80 = (v) => (v.length > 80 ? v.slice(0, 80) : v);
+      const variants = [...new Set(tileList.map((t) => t.name))].map(cut80);
       const selectedVariants = [];
+      // { name, n? } per selected tile: n says WHICH tile, when tiles share the name.
+      const selectedTiles = [];
       const selectedImages = [];
       let selectedVariant = null;
-      walk(document, (e) => {
-        const cls = classOf(e);
-        if (!isTile(cls)) return;
-        let v = tileName(e);
-        // Long option names are cut, never dropped: a 68-char selected
-        // option used to vanish, and with it the option the price is for.
-        if (!v) return;
-        if (v.length > 80) v = v.slice(0, 80);
-        variants.push(v);
-        /* One selected tile per option property (Color AND Type): all of
-         * them name the option the JSON-LD price belongs to. Only the first
-         * used to be kept, so "Wired" vs "Wireless" could be lost. */
-        if (/sku-item--selected|\bselected\b|\bactive\b/i.test(cls)) {
-          if (!selectedVariant) selectedVariant = v;
-          if (!selectedVariants.includes(v)) {
-            selectedVariants.push(v);
-            const image = tileImage(e);
-            if (image) selectedImages.push({ name: v, image });
-          }
-        }
-      });
+      /* One selected tile per option property (Color AND Type): all of them
+       * name the option the JSON-LD price belongs to. Only the first used to
+       * be kept, so "Wired" vs "Wireless" could be lost. */
+      const selectedNames = new Set();
+      for (const t of tileList) {
+        if (!t.selected) continue;
+        const v = cut80(t.name);
+        if (!selectedVariant) selectedVariant = v;
+        selectedTiles.push(t.n ? { name: v, n: t.n } : { name: v });
+        if (selectedNames.has(t.name)) continue;
+        selectedNames.add(t.name);
+        selectedVariants.push(v);
+        const image = tileImage(t.e);
+        if (image) selectedImages.push(t.n ? { name: v, n: t.n, image } : { name: v, image });
+      }
 
       // ---- specification rows ------------------------------------------
       // The table shows about 6 rows until its own "View more" button is
@@ -1321,12 +1339,11 @@ function wallVerdict(sig) {
                         'table. Before setting a hard requirement from one, confirm it in `specsText` or a screenshot.');
         }
         // Several tiles with one name: `variants` keeps the name once (see options()).
-        const nameUses = new Map();
-        variants.forEach((v) => nameUses.set(v, (nameUses.get(v) || 0) + 1));
-        const repeated = [...nameUses].filter(([, k]) => k > 1);
+        const repeated = tileList.filter((t) => t.n === 1);
         if (repeated.length) {
-          warnings.push('same-name-options: ' + repeated.slice(0, 3).map(([v, k]) => k + ' tiles are named "' + v.slice(0, 40) + '"').join(', ') +
-                        '. `variants` lists each name once; pick(name, n) with n from options() selects one tile.');
+          warnings.push('same-name-options: ' + repeated.slice(0, 3).map((t) => t.of + ' tiles are named "' + t.name.slice(0, 40) + '"').join(', ') +
+                        '. `variants` lists each name once; pick(name, n) with n from options() selects one tile, and ' +
+                        '`selectedTiles` says which n is selected.');
         }
         const conflicts = specOptionConflicts(selectedVariants, specs.rows);
         conflicts.slice(0, 5).forEach((c) => {
@@ -1379,13 +1396,14 @@ function wallVerdict(sig) {
           fingerprintBefore: before,
           fingerprint: after,
           pageGrew: after.height !== before.height || after.textLen !== before.textLen,
-          variants: [...new Set(variants)],
+          variants,
           // Option tiles, counted before the names were made unique.
-          optionTiles: variants.length,
+          optionTiles: tileList.length,
           // { name, official } or null (not found: unknown).
           store,
           selectedVariant,
           selectedVariants,
+          selectedTiles,
           // { name, image } per selected image tile: often that option's spec sheet.
           selectedImages,
           // The Specifications table as { name: value }. `specsSource` says

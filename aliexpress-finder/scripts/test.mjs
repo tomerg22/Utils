@@ -8,7 +8,8 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { parseSold, SOLD_RE, parseReviewBlock, median, clean, wallVerdict } from './lib.mjs';
@@ -30,6 +31,16 @@ const ok = (name, cond, detail = '') => {
 };
 const eq = (name, got, want) =>
   ok(name, JSON.stringify(got) === JSON.stringify(want), `got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+
+/* Every temp folder the suite makes is removed when it exits. They were left
+ * in the system temp folder, one set per run (review of 58c8a00, N9-13). */
+const madeDirs = [];
+const tmpDir = (prefix) => { const d = mkdtempSync(join(tmpdir(), prefix)); madeDirs.push(d); return d; };
+process.on('exit', () => { for (const d of madeDirs) { try { rmSync(d, { recursive: true, force: true }); } catch (e) { /* gone */ } } });
+/* labels.sh sheet compiles sheet.swift once into ${XDG_CACHE_HOME}/aliexpress-finder.
+ * The suite points it at this folder, never the user's ~/.cache. It is kept
+ * between runs, so the compile is paid once; N8-10 removes older builds. */
+const SWIFT_CACHE = join(tmpdir(), 'aef-test-swift-cache');
 
 const rank = (items, args = []) => {
   const out = execFileSync('node', [RANK, ...args], {
@@ -1408,9 +1419,8 @@ console.log('\nharvest.js — expose() chunks the payload into the page for get_
 console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both ends real');
 {
   const { startReceiver, validate } = await import('./receiver.mjs');
-  const { mkdtempSync, readdirSync, readFileSync: rf } = await import('node:fs');
-  const { tmpdir } = await import('node:os');
-  const dir = mkdtempSync(join(tmpdir(), 'ae-recv-'));
+  const { readdirSync, readFileSync: rf } = await import('node:fs');
+  const dir = tmpDir('ae-recv-');
   const logs = [];
   const recv = await startReceiver({ dir, port: 0, count: 1, idle: 30, log: (m) => logs.push(m) });
   ok('receiver picks an ephemeral port', recv.port > 0, String(recv.port));
@@ -1741,7 +1751,7 @@ const block = async (name, fn) => {
 const { startReceiver: startRx } = await import('./receiver.mjs');
 const fsx = await import('node:fs');
 const osx = await import('node:os');
-const tmp = (p) => fsx.mkdtempSync(join(osx.tmpdir(), p));
+const tmp = tmpDir;
 const freePort = async () => {
   const net = await import('node:net');
   return new Promise((res) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); }); });
@@ -4747,9 +4757,8 @@ await block('F31-7', async () => {
   ok('F31-6: nothing captured: no form, no navigation', /^NOT DELIVERED/.test(empty.L.sendAll(8765)) && empty.made.length === 0);
 
   const { startReceiver } = await import('./receiver.mjs');
-  const { mkdtempSync, readdirSync } = await import('node:fs');
-  const { tmpdir } = await import('node:os');
-  const dir = mkdtempSync(join(tmpdir(), 'aef-'));
+  const { readdirSync } = await import('node:fs');
+  const dir = tmpDir('aef-');
   const recv = await startReceiver({ dir, port: 0, idle: 30 });
   const res = await fetch('http://127.0.0.1:' + recv.port + '/harvest', { method: 'POST', body: 'payload=' + JSON.stringify({ kind: 'details', items: [rec] }) });
   // details-<stamp>.json since 2026-11-08: harvest-details-* was caught by `decode.mjs harvest-*.json` (N8-1).
@@ -4932,8 +4941,8 @@ await block('N8-1', async () => {
 console.log('\nN8-2: the absence warning is true, and quiet on a class split');
 await block('N8-2', async () => {
   const pool = (n, match) => Array.from({ length: n }, (_, i) => ({ id: 'a' + i, title: i < match ? 'usb c laptop charger 65w' : 'round barrel charger 90w', rating: 4.8, sold: 500 }));
-  const split = rank(pool(300, 20), ['--require', 'usb c']);
-  ok('N8-2: a class split that keeps 20 of 300 does not warn', !split.warnings.some((w) => /^absence-is-not-evidence/.test(w)), JSON.stringify(split.warnings));
+  const split = rank(pool(300, 20), ['--class', 'usb c']);
+  ok('N8-2: a class split (--class) that keeps 20 of 300 does not warn', !split.warnings.some((w) => /^absence-is-not-evidence/.test(w)), JSON.stringify(split.warnings));
   const few = rank(pool(300, 5), ['--require', 'usb c']);
   const w5 = few.warnings.find((w) => /^absence-is-not-evidence/.test(w)) || '';
   ok('N8-2: 5 of 300 still warns', !!w5, JSON.stringify(few.warnings));
@@ -4943,8 +4952,8 @@ await block('N8-2', async () => {
   const w0 = none.warnings.find((w) => /^absence-is-not-evidence/.test(w)) || '';
   ok('N8-2: a regex that matched nothing says so with the count', /matched none of the 30 titles/.test(w0), w0);
   eq('N8-2: one absence warning, not two', none.warnings.filter((w) => /^absence-is-not-evidence/.test(w)).length, 1);
-  const real = rank(pool(884, 32), ['--require', 'usb c']);
-  ok('N8-2: the measured split (32 of 884) does not warn', !real.warnings.some((w) => /^absence-is-not-evidence/.test(w)), JSON.stringify(real.warnings));
+  const real = rank(pool(884, 32), ['--class', 'usb c']);
+  ok('N8-2: the measured split (32 of 884), as --class, does not warn', !real.warnings.some((w) => /^absence-is-not-evidence/.test(w)), JSON.stringify(real.warnings));
 });
 
 const n8Page = ({ els = [], bodyText = 'x'.repeat(2500), storage = fakeStorage(), path = '/item/1005012274502051.html' } = {}) => {
@@ -5005,8 +5014,8 @@ await block('N8-4', async () => {
     { name: 'C', hashes: ['h1', 'x1', 'x2', 'x3'] }, { name: 'D', hashes: ['y1', 'y2'] }]);
   eq('N8-4: listings sharing their photos are one group', g.groups, [['A', 'B']]);
   eq('N8-4: one shared banner is reported, not grouped', g.pairs.filter((p) => !p.same).map((p) => [p.a, p.b, p.shared]), [['A', 'C', 1], ['B', 'C', 1]]);
-  eq('N8-4: a chain joins one group', photoGroups([{ name: 'A', hashes: ['1', '2'] }, { name: 'B', hashes: ['1', '2', '3', '4'] },
-    { name: 'C', hashes: ['3', '4'] }]).groups, [['A', 'B', 'C']]);
+  const chain = photoGroups([{ name: 'A', hashes: ['1', '2'] }, { name: 'B', hashes: ['1', '2', '3', '4'] }, { name: 'C', hashes: ['3', '4'] }]);
+  eq('N8-4: a chain is not one group, it is a chain (N9-2)', [chain.groups, chain.chains], [[], [['A', 'B', 'C']]]);
   eq('N8-4: one shared photo of two is not enough', photoGroups([{ name: 'A', hashes: ['1', '2'] }, { name: 'B', hashes: ['1', '9'] }]).groups, []);
   // The CLI and labels.sh on real files.
   const root = tmp('aef-n8-4-');
@@ -5034,7 +5043,7 @@ await block('N8-4', async () => {
   const r = rank(fin, ['--mode', 'final', '--top', '4']);
   eq('N8-4: the product is ranked once, and the table has room for the next one', r.ranked.map((x) => x.id), ['1005005994454495', '1005007096941590']);
   const byId = (a, b) => (a.id < b.id ? -1 : 1);
-  eq('N8-4: the ranked one names its other listings and their prices', [...r.ranked[0].otherListings].sort(byId), [{ id: '1005005994445557', price: 11.68 }, { id: '1005006904627335', price: 14.02 }]);
+  eq('N8-4: the ranked one names its other listings and their prices', [...r.ranked[0].otherListings].sort(byId), [{ id: '1005005994445557', price: 11.68, currency: null }, { id: '1005006904627335', price: 14.02, currency: null }]);
   eq('N8-4: sameProduct lists them', [...r.sameProduct].sort(byId).map((s) => [s.id, s.rankedAs]), [['1005005994445557', '1005005994454495'], ['1005006904627335', '1005005994454495']]);
   const w = r.warnings.find((x) => /^same-product:/.test(x)) || '';
   ok('N8-4: the warning names the cheapest listing when it is not the one ranked', /1005005994445557 is the cheapest/.test(w), w);
@@ -5065,18 +5074,18 @@ await block('N8-7', async () => {
   ok('N8-7: SKILL.md carries the cleanup snippet between its markers', !!code);
   if (!code) return;
   const run = (hostname, ls) => new Function('location', 'localStorage', 'return (' + code + '\n)')({ hostname }, ls);
-  const seed = () => { const ls = fakeStorage(); ['__aeSrc:harvest', '__aeSrc:listing', '__aeHarvest:dell-charger:mw7tnf2b', '__aeHarvest:x:1', '__aeDet:1005003416182958', 'aep_usuc_f', 'other'].forEach((k) => ls.setItem(k, '1')); return ls; };
+  const seed = () => { const ls = fakeStorage(); ['__aeSrc:harvest', '__aeSrc:listing', '__aeHarvest:dell-charger:mw7tnf2b', '__aeHarvest:x:1', '__aeDet:1005003416182958', '__aeUserPrefs', 'aep_usuc_f', 'other'].forEach((k) => ls.setItem(k, '1')); return ls; };
   const ls = seed();
   const msg = run('he.aliexpress.com', ls);
-  ok('N8-7: on AliExpress it removes all 5 skill keys and says so', /^removed 5 key\(s\) \{"__aeSrc":2,"__aeHarvest":2,"__aeDet":1\}; none left$/.test(msg), msg);
-  eq('N8-7: the site\'s own keys stay', [...ls._m.keys()].sort(), ['aep_usuc_f', 'other']);
+  ok('N8-7: on AliExpress it removes all 5 skill keys and says so', /^removed 5 key\(s\) on he\.aliexpress\.com \{"__aeSrc":2,"__aeHarvest":2,"__aeDet":1\}; none left on he\.aliexpress\.com$/.test(msg), msg);
+  eq('N8-7: the site\'s own keys stay, an __ae key of another tool too (N9-7)', [...ls._m.keys()].sort(), ['__aeUserPrefs', 'aep_usuc_f', 'other']);
   const off = seed();
   const msg2 = run('127.0.0.1', off);
-  ok('N8-7: on the receiver page it removes nothing and says to go back', /^NOT CLEANED: this tab is on 127\.0\.0\.1/.test(msg2) && off.length === 7, msg2);
+  ok('N8-7: on the receiver page it removes nothing and says to go back', /^NOT CLEANED: this tab is on 127\.0\.0\.1/.test(msg2) && off.length === 8, msg2);
   ok('N8-7: the replies fit the Chrome cap and hold no "?"', [msg, msg2].every((m) => m.length < 1000 && !m.includes('?')));
   ok('N8-7: the old one-key instruction is gone', !/At the end of the run remove the saved code too/.test(skillSrc));
   const reply = n8Page({ storage: (() => { const s = fakeStorage(); s.setItem('__aeDet:1', JSON.stringify({ id: '1' })); return s; })() }).sendAll(8765);
-  ok('N8-7: sendAll() says the tab left AliExpress and where the file goes', /navigate back to AliExpress/.test(reply) && /details-<stamp>\.json, for rank\.mjs/.test(reply) && reply.length < 1000 && !reply.includes('?'), reply);
+  ok('N8-7: sendAll() says the tab left AliExpress and where the file goes', /navigate back to https:\/\/he\.aliexpress\.com\//.test(reply) && /details-<stamp>\.json, for rank\.mjs/.test(reply) && reply.length < 1000 && !reply.includes('?'), reply);
 });
 
 console.log('\nN8-8: a step() that reads the last allowed page is done');
@@ -5098,34 +5107,60 @@ await block('N8-8', async () => {
   eq('N8-8: and the call that reads page 5 is', [s4.stop, s4.done, s4.requests], ['page-cap', true, 5]);
 });
 
-console.log('\nN8-10: labels.sh sheet puts many images on numbered sheets');
-await block('N8-10', async () => {
+/* PNG files for the labels.sh tests. A CRC of its own: zlib.crc32 is in
+ * Node 22.2 and 20.15 only, and an older Node made the whole block fail. */
+const CRC_TABLE = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+const crc32 = (buf) => { let c = 0xffffffff; for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+const pngOf = async (w, h, rgb) => {
   const zlib = await import('node:zlib');
   const chunk = (type, data) => {
     const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
     const body = Buffer.concat([Buffer.from(type, 'latin1'), data]);
-    const crc = Buffer.alloc(4); crc.writeUInt32BE(zlib.crc32(body) >>> 0);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(body));
     return Buffer.concat([len, body, crc]);
   };
-  const png = (w, h, rgb) => {
-    const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
-    const raw = Buffer.alloc((w * 3 + 1) * h);
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) rgb.forEach((v, k) => { raw[y * (w * 3 + 1) + 1 + x * 3 + k] = v; });
-    return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
-  };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const raw = Buffer.alloc((w * 3 + 1) * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) rgb.forEach((v, k) => { raw[y * (w * 3 + 1) + 1 + x * 3 + k] = v; });
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+};
+/* labels.sh with the suite's own sheet cache (see SWIFT_CACHE); `env` adds to it. */
+const labelsEnv = (env = {}) => ({ ...process.env, XDG_CACHE_HOME: SWIFT_CACHE, ...env });
+const labelsRun = async (args, env) => {
+  const { spawnSync } = await import('node:child_process');
+  const r = spawnSync('bash', [join(HERE, 'labels.sh'), ...args], { encoding: 'utf8', env: labelsEnv(env) });
+  return { code: r.status, out: r.stdout || '', err: r.stderr || '' };
+};
+
+console.log('\nN8-10: labels.sh sheet puts many images on numbered sheets');
+await block('N8-10', async () => {
+  // Builds of an older sheet.swift are removed from the suite's cache.
+  const { createHash } = await import('node:crypto');
+  const sum = createHash('md5').update(fsx.readFileSync(join(HERE, 'sheet.swift'))).digest('hex');
+  const cacheDir = join(SWIFT_CACHE, 'aliexpress-finder');
+  if (fsx.existsSync(cacheDir)) {
+    for (const f of fsx.readdirSync(cacheDir)) if (f !== 'sheet-' + sum) fsx.rmSync(join(cacheDir, f), { force: true, recursive: true });
+  }
   const size = (f) => { const b = fsx.readFileSync(f); return [b.readUInt32BE(16), b.readUInt32BE(20)]; };
   const dir = tmp('aef-n8-10-');
-  [[255, 0, 0], [0, 255, 0], [0, 0, 255]].forEach((c, i) => fsx.writeFileSync(join(dir, 'img' + (i + 1) + '.png'), png(4, 3, c)));
-  fsx.writeFileSync(join(dir, 'img2-crop.png'), png(2, 2, [9, 9, 9]));
-  const out = execFileSync('bash', [join(HERE, 'labels.sh'), 'sheet', dir, '2', '50'], { encoding: 'utf8' });
+  for (const [i, c] of [[255, 0, 0], [0, 255, 0], [0, 0, 255]].entries()) fsx.writeFileSync(join(dir, 'img' + (i + 1) + '.png'), await pngOf(4, 3, c));
+  fsx.writeFileSync(join(dir, 'img2-crop.png'), await pngOf(2, 2, [9, 9, 9]));
+  const out = execFileSync('bash', [join(HERE, 'labels.sh'), 'sheet', dir, '2', '50'], { encoding: 'utf8', env: labelsEnv() });
   eq('N8-10: 3 images at 2 per sheet make 2 sheets, crops left out', fsx.readdirSync(dir).filter((f) => /^sheet-/.test(f)).sort(), ['sheet-1.png', 'sheet-2.png']);
   eq('N8-10: a sheet is 4 cells wide and one row high per 4 images', [size(join(dir, 'sheet-1.png')), size(join(dir, 'sheet-2.png'))], [[200, 50], [200, 50]]);
   ok('N8-10: the reply names each sheet and its images', /sheet-1\.png {2}\(2 images: img1 to img2\)/.test(out) && /sheet-2\.png {2}\(1 images: img3 to img3\)/.test(out), out);
-  const { spawnSync } = await import('node:child_process');
-  const bad = spawnSync('bash', [join(HERE, 'labels.sh'), 'sheet', dir, 'x'], { encoding: 'utf8' });
-  ok('N8-10: a bad number is refused', bad.status !== 0 && /whole numbers/.test(bad.stderr), bad.stderr);
+  ok('N8-10: the build went to the suite\'s cache', fsx.existsSync(join(cacheDir, 'sheet-' + sum)));
+  const bad = await labelsRun(['sheet', dir, 'x']);
+  ok('N8-10: a bad number is refused', bad.code !== 0 && /whole numbers/.test(bad.err), bad.err);
   ok('N8-10: SKILL.md shows the sheet command', /labels\.sh sheet <out>\/<id>/.test(skillSrc));
 });
+
+/* A promise, or `late()` after ms. The timer is cleared either way: a 2-3 s
+ * timer left running kept the suite alive after its last line (V19). */
+const within = (p, ms, late) => {
+  let t;
+  return Promise.race([p, new Promise((res) => { t = setTimeout(() => res(late()), ms); })]).finally(() => clearTimeout(t));
+};
 
 console.log('\nN8-11: the receiver stops on GET /stop, with exit 0');
 await block('N8-11', async () => {
@@ -5134,18 +5169,267 @@ await block('N8-11', async () => {
   const closed = new Promise((res) => recv.server.on('close', () => res(true)));
   const txt = await fetch('http://127.0.0.1:' + recv.port + '/stop').then((r) => r.text());
   eq('N8-11: /stop answers with the count', txt, 'stopping: 0 saved');
-  eq('N8-11: and the server closes', await Promise.race([closed, new Promise((res) => setTimeout(() => res(false), 2000))]), true);
-  const { spawnSync } = await import('node:child_process');
+  eq('N8-11: and the server closes', await within(closed, 2000, () => false), true);
   const port = await freePort();
   const child = (await import('node:child_process')).spawn(process.execPath, [join(HERE, 'receiver.mjs'), '--dir', dir, '--port', String(port)], { stdio: 'pipe' });
   await new Promise((res) => child.stdout.once('data', res));
   await fetch('http://127.0.0.1:' + port + '/stop').then((r) => r.text());
   // A receiver without /stop never exits: wait 3 s, then kill it, so the suite does not hang.
-  const code = await Promise.race([new Promise((res) => child.on('exit', (c) => res(c))),
-    new Promise((res) => setTimeout(() => { child.kill(); res('still running after 3 s'); }, 3000))]);
+  const code = await within(new Promise((res) => child.on('exit', (c) => res(c))), 3000, () => { child.kill(); return 'still running after 3 s'; });
   eq('N8-11: the process exits 0', code, 0);
   ok('N8-11: SKILL.md says how to stop it', /`curl -s http:\/\/127\.0\.0\.1:8765\/stop`/.test(skillSrc));
-  void spawnSync;
+});
+
+// ============================================================================
+// N9: the review of 58c8a00 (2026-11-08). Each block fails on that commit.
+// ============================================================================
+const fileUrls = async (dir, colors) => {
+  const out = [];
+  for (const [i, c] of colors.entries()) { const f = join(dir, 'p' + i + '.png'); fsx.writeFileSync(f, await pngOf(3, 2, c)); out.push('file://' + f); }
+  return out;
+};
+
+console.log('\nN9-1: labels.sh fetch numbers on, one folder per listing');
+await block('N9-1', async () => {
+  const urls = await fileUrls(tmp('aef-n9-1-src-'), [[200, 10, 10], [10, 200, 10], [10, 10, 200]]);
+  const dir = join(tmp('aef-n9-1-'), '1005005994445557');
+  const files = () => fsx.readdirSync(dir).sort();
+  const a = await labelsRun(['fetch', dir, urls[0], urls[1]]);
+  ok('N9-1: the first fetch writes img1 and img2', a.code === 0 && JSON.stringify(files()) === '["img1.png","img2.png"]', a.out + a.err);
+  const first = fsx.readFileSync(join(dir, 'img1.png'));
+  const b = await labelsRun(['fetch', dir, urls[2]]);
+  eq('N9-1: a second fetch goes on at img3', files(), ['img1.png', 'img2.png', 'img3.png']);
+  ok('N9-1: it does not overwrite img1, and says where it went on', fsx.readFileSync(join(dir, 'img1.png')).equals(first) && /going on after img2/.test(b.out), b.out);
+  const d = await labelsRun(['fetch', '--desc', dir, urls[0]]);
+  ok('N9-1: --desc writes desc1.png beside them', d.code === 0 && files().includes('desc1.png') && !files().includes('img4.png'), files().join(',') + ' ' + d.err);
+  fsx.writeFileSync(join(dir, 'sheet-1.png'), 'old');
+  fsx.writeFileSync(join(dir, 'notes.txt'), 'mine');
+  const f = await labelsRun(['fetch', '--fresh', dir, urls[1]]);
+  eq('N9-1: --fresh starts over, and keeps a file it did not write', [f.code, files()], [0, ['img1.png', 'notes.txt']]);
+  const bad = await labelsRun(['fetch', '--sideways', dir, urls[0]]);
+  ok('N9-1: an unknown option is refused', bad.code !== 0 && /unknown fetch option --sideways/.test(bad.err), bad.err);
+  ok('N9-1: SKILL.md fetches into <out>/<id>, never a shared /tmp/labels',
+    !/labels\.sh fetch \/tmp\/labels/.test(skillSrc) && /labels\.sh fetch <out>\/<id>/.test(skillSrc) && /labels\.sh fetch --desc <out>\/<id>/.test(skillSrc));
+});
+
+console.log('\nN9-2/3/14: labels.sh same: whole groups, gallery photos only, stray entries skipped');
+await block('N9-2', async () => {
+  const { photoGroups } = await import('./same.mjs');
+  const chain = photoGroups([{ name: 'A', hashes: ['1', '2'] }, { name: 'B', hashes: ['1', '2', '3', '4'] }, { name: 'C', hashes: ['3', '4'] }]);
+  eq('N9-2: A = B and B = C, but A and C share nothing: a chain, not a group', [chain.groups, chain.chains], [[], [['A', 'B', 'C']]]);
+  const all3 = photoGroups([{ name: 'A', hashes: ['1', '2', '3'] }, { name: 'B', hashes: ['1', '2', '3'] }, { name: 'C', hashes: ['1', '2', '3', '4'] }]);
+  eq('N9-2: three listings that all share their photos are one group', [all3.groups, all3.chains], [[['A', 'B', 'C']], []]);
+  const croot = tmp('aef-n9-2-');
+  const put = (root, d, files) => { fsx.mkdirSync(join(root, d)); for (const [f, t] of Object.entries(files)) fsx.writeFileSync(join(root, d, f), t); };
+  put(croot, 'A', { 'img1.png': 'p1', 'img2.png': 'p2' });
+  put(croot, 'B', { 'img1.png': 'p1', 'img2.png': 'p2', 'img3.png': 'p3', 'img4.png': 'p4' });
+  put(croot, 'C', { 'img1.png': 'p3', 'img2.png': 'p4' });
+  const { spawnSync } = await import('node:child_process');
+  const sameRun = (args) => spawnSync(process.execPath, [join(HERE, 'same.mjs'), ...args], { encoding: 'utf8' });
+  const ct = sameRun(['A', 'B', 'C'].map((d) => join(croot, d)));
+  ok('N9-2: the CLI prints the chain as NOT one product, with no product key', /^NOT one product: A B C: /m.test(ct.stdout) && !/^same product/m.test(ct.stdout), ct.stdout);
+  // Two products of one store: their own photos differ, the description banners are the same.
+  const root = tmp('aef-n9-3-');
+  const urls = await fileUrls(tmp('aef-n9-3-src-'), [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [200, 0, 0], [0, 200, 0], [0, 0, 200]]);
+  const banners = urls.slice(4);
+  for (const [id, own] of [['1005000000000001', urls.slice(0, 2)], ['1005000000000002', urls.slice(2, 4)]]) {
+    const r1 = await labelsRun(['fetch', join(root, id), ...own]);
+    const r2 = await labelsRun(['fetch', '--desc', join(root, id), ...banners]);
+    if (r1.code || r2.code) throw new Error('fetch failed: ' + r1.err + r2.err);
+  }
+  const t = await labelsRun(['same', join(root, '1005000000000001'), join(root, '1005000000000002')]);
+  ok('N9-3: shared description banners do not make two products one', t.code === 0 && !/^same product/m.test(t.out) && /no photo in common/.test(t.out), t.out + t.err);
+  // A file and an empty folder in <out>/* are skipped, by name.
+  put(root, '1005000000000003', {});
+  fsx.writeFileSync(join(root, 'finalists.json'), '[]');
+  fsx.mkdirSync(join(root, '1005000000000004'));
+  fsx.copyFileSync(join(root, '1005000000000001', 'img1.png'), join(root, '1005000000000004', 'img1.png'));
+  fsx.copyFileSync(join(root, '1005000000000001', 'img2.png'), join(root, '1005000000000004', 'img2.png'));
+  const args = fsx.readdirSync(root).sort().map((d) => join(root, d));
+  const r = sameRun(['--json', ...args]);
+  const j = r.status === 0 ? JSON.parse(r.stdout) : null;
+  ok('N9-14: a file and an empty folder in <out>/* do not stop it', r.status === 0, `exit ${r.status}: ${(r.stderr || '').slice(0, 160)}`);
+  eq('N9-14: they are named as skipped', j && j.skipped.map((x) => x.name.split('/').pop()), ['1005000000000003', 'finalists.json']);
+  eq('N9-14: and the rest is compared', j && j.groups, [['1005000000000001', '1005000000000004']]);
+  ok('N9-2: SKILL.md explains a chain and the gallery-only rule', /`NOT one product: A B C` is a chain/.test(skillSrc) && /Only gallery photos \(`img<N>\.png`\) are compared/.test(skillSrc));
+});
+
+console.log('\nN9-4: --class splits a class, --require keeps the absence warning');
+await block('N9-4', async () => {
+  const pool = (n, match) => Array.from({ length: n }, (_, i) => ({ id: 'c' + i, title: i < match ? 'usb c laptop charger 65w' : 'round barrel charger 90w', rating: 4.8, sold: 500 }));
+  const r12 = rank(pool(900, 12), ['--require', 'usb c']);
+  const w12 = r12.warnings.find((w) => /^absence-is-not-evidence/.test(w)) || '';
+  ok('N9-4: an attribute regex that matched 12 of 900 titles warns again', /matched only 12 of 900 titles/.test(w12), JSON.stringify(r12.warnings).slice(0, 300));
+  ok('N9-4: and says a class split goes in --class', /goes in --class/.test(w12), w12);
+  const cls = rank(pool(900, 12), ['--class', 'usb c']);
+  ok('N9-4: the same regex as --class is a class split: no warning', !cls.warnings.some((w) => /^absence-is-not-evidence/.test(w)), JSON.stringify(cls.warnings).slice(0, 300));
+  eq('N9-4: --class drops as off-class', cls.droppedReasons, { 'off-class': 888 });
+  const mixed = [...Array.from({ length: 40 }, (_, i) => ({ id: 'g' + i, title: i < 2 ? 'gan wire charger' : 'gan charger', rating: 4.8, sold: 500 })),
+    ...Array.from({ length: 400 }, (_, i) => ({ id: 'o' + i, title: 'wire charger plain', rating: 4.8, sold: 500 }))];
+  const both = rank(mixed, ['--class', 'gan', '--require', 'wire']);
+  const wb = both.warnings.find((w) => /^absence-is-not-evidence/.test(w)) || '';
+  ok('N9-4: --require is counted over the titles --class kept', /matched only 2 of 40 titles that --class kept/.test(wb), wb || JSON.stringify(both.warnings).slice(0, 200));
+  // Titles set aside for another reason first (a brandScore of 8) still count as not matched.
+  const odd = [{ id: 'm0', title: 'usb c laptop charger', rating: 4.8, sold: 500 },
+    ...Array.from({ length: 16 }, (_, i) => ({ id: 'p' + i, title: 'round barrel charger', rating: 4.8, sold: 500 })),
+    ...Array.from({ length: 3 }, (_, i) => ({ id: 'b' + i, title: 'round barrel charger', rating: 4.8, sold: 500, brandScore: 8 }))];
+  const wo = rank(odd, ['--require', 'usb c']).warnings.find((w) => /^absence-is-not-evidence/.test(w)) || '';
+  ok('N9-4: titles set aside for another reason still count: 1 of 20 warns', /matched only 1 of 20 titles/.test(wo), wo);
+  const none = rank(pool(30, 0), ['--class', 'usb c']);
+  ok('N9-4: a --class that matches no title warns, with the count', none.warnings.some((w) => /^absence-is-not-evidence: the --class regex matched none of the 30 titles/.test(w)), JSON.stringify(none.warnings).slice(0, 300));
+  const one = [{ id: 'm', title: 'x', rating: 4.8, sold: 5000 }];
+  const bad = rankRun(one, ['--class', '(']);
+  ok('N9-4: a bad --class regex exits 2 and names --class', bad.code === 2 && /--class is not a valid regular expression/.test(bad.err), bad.err.slice(0, 160));
+  const blank = rankRun(one, ['--class', ' ']);
+  ok('N9-4: a blank --class exits 2', blank.code === 2 && /--class needs a regex/.test(blank.err), blank.err.slice(0, 160));
+  ok('N9-4: SKILL.md step 4 splits classes with --class', /\.\.\. --class 'handle\|hand \|inch'/.test(skillSrc) && /\*\*`--class` for a class, `--require` for an attribute\.\*\*/.test(skillSrc));
+});
+
+console.log('\nN9-5/6: the other listings of a ranked product: all of them, after the cut, a cheapest only when it is true');
+await block('N9-5', async () => {
+  const L = (id, reviews, price, extra = {}) => ({ id, title: 'Reletech 65W', ownRating: 4.8, rating: 4.8, reviews, price, currency: 'USD', product: 'P', ...extra });
+  const other = { id: 'O', title: 'Other 65W', ownRating: 4.9, rating: 4.9, reviews: 21, price: 11.59, currency: 'USD' };
+  const fin = [L('R1', 684, 12.09), L('R2', 462, 14.02), L('R4', 3, 9.5), other];
+  const r = rank(fin, ['--mode', 'final', '--top', '4']);
+  const rep = r.ranked.find((x) => x.id === 'R1');
+  eq('N9-5: a listing set aside for thin evidence is named, with its why', rep && (rep.otherListings || []).find((o) => o.id === 'R4'), { id: 'R4', price: 9.5, currency: 'USD', why: 'evidence<10' });
+  const w = r.warnings.find((x) => /^same-product:/.test(x)) || '';
+  ok('N9-5: and it is named the cheapest, marked set aside', /R4 \(set aside\) is the cheapest/.test(w), w);
+  const ils = rank([L('R1', 684, 12.09), L('R2', 462, 40, { currency: 'ILS' }), other], ['--mode', 'final', '--top', '4']);
+  const wi = ils.warnings.find((x) => /^same-product:/.test(x)) || '';
+  ok('N9-5: prices in two currencies: no cheapest is named, and it says why', /no cheapest named: the prices are in USD and ILS/.test(wi) && !/is the cheapest/.test(wi), wi);
+  const np = rank([L('R1', 684, null), L('R2', 462, 14.02), other], ['--mode', 'final', '--top', '4']);
+  const wn = np.warnings.find((x) => /^same-product:/.test(x)) || '';
+  ok('N9-5: the ranked listing has no price: no cheapest is named', /no cheapest named: no price for R1/.test(wn) && !/is the cheapest/.test(wn), wn);
+  const cut = rank([{ id: 'X', title: 't', ownRating: 5, rating: 5, reviews: 5000, price: 1, currency: 'USD' }, ...fin], ['--mode', 'final', '--top', '1']);
+  eq('N9-6: a product below the --top cut is not named as ranked', [cut.ranked.map((x) => x.id), cut.sameProduct, cut.warnings.some((x) => /same-product/.test(x))], [['X'], [], false]);
+  ok('N9-5: SKILL.md step 7 says when a cheapest is named', /only when every price is known and in one currency/.test(skillSrc));
+});
+
+console.log('\nN9-7: the cleanup removes only the skill\'s keys, and says "none left" only where it looked');
+await block('N9-7', async () => {
+  const code = (skillSrc.match(/<!-- @snippet:cleanup:start -->\s*```js\n([\s\S]*?)\n```\s*<!-- @snippet:cleanup:end -->/) || [])[1] || '';
+  const run = (hostname, ls) => new Function('location', 'localStorage', 'return (' + code + '\n)')({ hostname }, ls);
+  const seed = (keys) => { const ls = fakeStorage(); keys.forEach((k) => ls.setItem(k, '1')); return ls; };
+  const www = run('www.aliexpress.com', seed(['aep_usuc_f']));
+  ok('N9-7: another AliExpress host with none of the keys is NOT CLEANED, naming the host', /^NOT CLEANED: no key of this skill on www\.aliexpress\.com\./.test(www) && /open https:\/\/he\.aliexpress\.com\//.test(www), www);
+  const wk = seed(['__aeSrc:listing', 'x']);
+  const m = run('www.aliexpress.com', wk);
+  ok('N9-7: keys on another host are removed, and it says to run it on he.aliexpress.com too', /^removed 1 key\(s\) on www\.aliexpress\.com/.test(m) && /Run it on https:\/\/he\.aliexpress\.com\/ too$/.test(m) && wk.length === 1, m);
+  const prefs = seed(['__aeUserPrefs', '__aeDet:1', '__aeSrcBackup']);
+  const mp = run('he.aliexpress.com', prefs);
+  eq('N9-7: only __aeSrc:, __aeHarvest: and __aeDet: keys go', [...prefs._m.keys()].sort(), ['__aeSrcBackup', '__aeUserPrefs']);
+  ok('N9-7: the replies hold no "?"', [www, m, mp].every((x) => !x.includes('?')), [www, m, mp].join(' | '));
+});
+
+console.log('\nN9-8: capture() keeps which of the same-named tiles is selected');
+await block('N9-8', async () => {
+  const tiles = () => [n8Tile('Mini 65W-EU Plug'), n8Tile('EU Plug Add Cable'), n8Tile('EU Plug Add Cable', ' sku-item--selected--I'), n8Tile('EU Plug Add Cable')];
+  const storage = fakeStorage();
+  const brief = await n8Page({ els: tiles(), storage }).capture({ description: false });
+  const rec = JSON.parse(storage.getItem('__aeDet:1005012274502051'));
+  eq('N9-8: the record says tile 2 of that name is selected', rec.selectedTiles, [{ name: 'EU Plug Add Cable', n: 2 }]);
+  eq('N9-8: and the summary says it too', brief.selectedN, [{ name: 'EU Plug Add Cable', n: 2 }]);
+  ok('N9-8: the summary fits the Chrome cap', JSON.stringify(brief).length < 1000);
+  const r = await n8Page({ els: tiles() }).read({ description: false });
+  eq('N9-8: read() returns selectedTiles', r.selectedTiles, [{ name: 'EU Plug Add Cable', n: 2 }]);
+  ok('N9-8: the same-name warning points at selectedTiles', r.warnings.some((x) => /^same-name-options:/.test(x) && /selectedTiles/.test(x)), JSON.stringify(r.warnings));
+  const one = await n8Page({ els: [n8Tile('Mini 65W-EU Plug', ' sku-item--selected--I')], storage: fakeStorage() }).capture({ description: false });
+  ok('N9-8: a name of its own needs no n', !('selectedN' in one), JSON.stringify(one));
+  const long = 'X'.repeat(80);
+  const r2 = await n8Page({ els: [n8Tile(long + ' Black'), n8Tile(long + ' White')] }).read({ description: false });
+  eq('N9-8: names that differ past character 80 are two options, with no same-name warning', [r2.variants.length, r2.optionTiles, r2.warnings.some((x) => /^same-name-options/.test(x))], [2, 2, false]);
+  ok('N9-8: SKILL.md names selectedTiles and selectedN', /`selectedTiles`/.test(skillSrc) && /`selectedN`/.test(skillSrc));
+});
+
+console.log('\nN9-9: the step-5 reader shows every tile of a shared name, numbered');
+await block('N9-9', async () => {
+  const optEl = (name, sel) => ({ className: 'sku-item--text--Qa1' + (sel ? ' sku-item--selected--I' : ''), querySelector: () => null, textContent: name, shadowRoot: null });
+  const ldj = [{ textContent: JSON.stringify({ '@type': 'Product', aggregateRating: { ratingValue: '4.9', reviewCount: '5479' }, offers: { price: '3.1', priceCurrency: 'USD' } }) }];
+  const els = [optEl('Mini 65W-EU Plug'), optEl('EU Plug Add Cable'), optEl('EU Plug Add Cable', true), optEl('EU Plug Add Cable')];
+  const g = JSON.parse(new Function('document', 'location', 'return (' + step5 + '\n)')(
+    { title: 'Charger', body: { innerText: RV.gyro }, querySelectorAll: (sel) => (/ld\+json/.test(sel) ? ldj : els) }, { pathname: '/item/1005012274502051.html' }));
+  eq('N9-9: one entry per tile, the shared name numbered as in options()', g.options, ['Mini 65W-EU Plug', 'EU Plug Add Cable #1', 'EU Plug Add Cable #2*', 'EU Plug Add Cable #3']);
+  eq('N9-9: optionCount counts the tiles', g.optionCount, 4);
+  ok('N9-9: SKILL.md says what #n means', /`EU Plug Add Cable #2\*` is the second tile of that name/.test(skillSrc));
+});
+
+console.log('\nN9-10: a page of extract.js is never a harvest file, and decode.mjs refuses it');
+await block('N9-10', async () => {
+  const { refusalOf, assemble } = await import('./decode.mjs');
+  const dir = tmp('aef-n9-10-');
+  const recv = await startRx({ dir, port: 0, idle: 30 });
+  const post = (body) => fetch('http://127.0.0.1:' + recv.port + '/harvest', { method: 'POST', body: 'payload=' + JSON.stringify(body) }).then((x) => x.text());
+  const page = { url: 'https://he.aliexpress.com/w/wholesale-dell-charger.html', page: 1, source: 'dom', blocked: false, cardCount: 1, items: [{ id: '1', title: 'dell charger', price: 9 }] };
+  const search = { query: 'dell charger', source: 'harvest-paged', fourStar: false, pages: [{ page: 1, n: 1 }], coverage: { verdict: 'exhausted-all-results' }, items: [{ id: '2', title: 'dell charger', price: 8 }] };
+  const r1 = await post(page);
+  const r2 = await post(search);
+  await recv.close();
+  const names = fsx.readdirSync(dir).sort();
+  ok('N9-10: the receiver saves a page of extract.js as page-<stamp>.json', /^saved .*\/page-[0-9T-]+Z\.json /.test(r1), r1);
+  ok('N9-10: a search payload is still harvest-<query>-<stamp>.json', /^saved .*\/harvest-dell-charger-/.test(r2), r2);
+  eq('N9-10: so harvest-*.json holds the search payload only', names.filter((f) => /^harvest-/.test(f)).length, 1);
+  const why = refusalOf(page) || '';
+  ok('N9-10: decode.mjs refuses a page of extract.js, and says where it goes', /single-page payload \(source "dom", 1 item\(s\), from extract\.js\)/.test(why) && /rank\.mjs as it is/.test(why), why);
+  let thrown = '';
+  try { assemble([JSON.stringify(search), JSON.stringify(page)]); } catch (e) { thrown = String(e.message); }
+  ok('N9-10: assemble() throws instead of merging it', /not a search stream/.test(thrown), thrown || 'merged');
+  const oldMerge = { query: 'dell charger', source: 'merged', items: [],
+    parts: [{ query: 'dell charger', source: 'harvest-paged', pages: [], filterKey: 'a' }, { query: null, source: 'listing', pages: [], filterKey: 'b' }] };
+  ok('N9-10: and an old merged file that holds a detail part', /merged file holds 1 part\(s\) that are not a search stream \(source listing\)/.test(refusalOf(oldMerge) || ''), refusalOf(oldMerge));
+  eq('N9-10: a search payload, a merge of them and an old one with no source pass',
+    [refusalOf(search), refusalOf({ ...search, source: 'merged', parts: [{ source: 'harvest-paged' }] }), refusalOf({ query: 'x', items: [] })], [null, null, null]);
+  const pFile = join(dir, names.find((f) => /^page-/.test(f)) || 'none');
+  const hFile = join(dir, names.find((f) => /^harvest-/.test(f)) || 'none');
+  const { spawnSync } = await import('node:child_process');
+  const cli = spawnSync(process.execPath, [join(HERE, 'decode.mjs'), hFile, pFile], { encoding: 'utf8' });
+  ok('N9-10: the decode.mjs CLI exits 2 and names the page file', cli.status === 2 && cli.stderr.includes(pFile) && cli.stdout === '', `exit ${cli.status}: ${cli.stderr.slice(0, 160)}`);
+  ok('N9-10: SKILL.md names page-<stamp>.json', /lands as\s+`page-<stamp>\.json`/.test(skillSrc));
+});
+
+console.log('\nN9-11: the link flow cleans up, and keeps one folder per listing');
+await block('N9-11', async () => {
+  const flow = skillSrc.slice(skillSrc.indexOf('## One given listing'), skillSrc.indexOf('## Step 0'));
+  ok('N9-11: "Runs:" names the cleanup', /\*\*Runs:\*\*[^*]*end-of-run cleanup/.test(flow), flow.slice(0, 300));
+  ok('N9-11: a numbered step runs the cleanup snippet on he.aliexpress.com',
+    /\n9\. Clean up: run the snippet of "End of the run: clean up"/.test(flow) && /`https:\/\/he\.aliexpress\.com\/`/.test(flow));
+  ok('N9-11: step 5 fetches into the listing\'s own folder', /labels\.sh fetch <out>\/<id>/.test(flow) && /labels\.sh fetch --desc <out>\/<id>/.test(flow));
+});
+
+console.log('\nN9-12: labels.sh sheet names what it could not read');
+await block('N9-12', async () => {
+  const dir = tmp('aef-n9-12-');
+  fsx.writeFileSync(join(dir, 'img1.png'), await pngOf(4, 3, [255, 0, 0]));
+  fsx.writeFileSync(join(dir, 'img2.png'), 'not a picture');
+  fsx.writeFileSync(join(dir, 'desc1.png'), await pngOf(4, 3, [0, 0, 255]));
+  fsx.writeFileSync(join(dir, 'sheet-7.png'), 'from an older run');
+  const r = await labelsRun(['sheet', dir, '2', '50']);
+  eq('N9-12: an image it cannot decode makes exit 3', r.code, 3);
+  ok('N9-12: and is named, on its sheet line and at the end', /sheet-1\.png {2}\(2 images: img1 to img2; COULD NOT READ: img2\)/.test(r.out) && /COULD NOT READ: img2\. Their tiles are blank/.test(r.err), r.out + r.err);
+  ok('N9-12: description images go on the sheets as d<N>', /sheet-2\.png {2}\(1 images: desc1 to desc1\)/.test(r.out), r.out);
+  eq('N9-12: an older run\'s sheet is removed first', fsx.readdirSync(dir).filter((f) => /^sheet-/.test(f)).sort(), ['sheet-1.png', 'sheet-2.png']);
+  // A compiler that fails: its own words reach the operator.
+  const bin = tmp('aef-n9-12-bin-');
+  fsx.writeFileSync(join(bin, 'swiftc'), '#!/bin/sh\necho "error: no such module AppKit (fake swiftc)" >&2\nexit 1\n', { mode: 0o755 });
+  const f = await labelsRun(['sheet', dir], { PATH: bin + ':' + process.env.PATH, XDG_CACHE_HOME: tmp('aef-n9-12-cache-') });
+  ok('N9-12: a failed build prints what swiftc said', f.code === 1 && /could not build sheet\.swift into .*swiftc said: error: no such module AppKit \(fake swiftc\)/.test(f.err), f.err);
+  ok('N9-12: SKILL.md says an unreadable image is NOT read', /`sheet` names it \(`COULD NOT\s+READ: img4`\) and exits 3/.test(skillSrc));
+});
+
+console.log('\nN9-15: a web page cannot stop the receiver');
+await block('N9-15', async () => {
+  const recv = await startRx({ dir: tmp('aef-n9-15-'), port: 0, idle: 30 });
+  const http = await import('node:http');
+  const get = (headers) => new Promise((res, rej) => http.get({ host: '127.0.0.1', port: recv.port, path: '/stop', headers }, (x) => {
+    let b = ''; x.on('data', (c) => (b += c)); x.on('end', () => res([x.statusCode, b]));
+  }).on('error', rej));
+  eq('N9-15: a /stop with Origin (a fetch from a page) is refused with 403', await get({ Origin: 'https://example.com', 'Sec-Fetch-Site': 'cross-site' }),
+    [403, 'stop refused: it must come from a terminal (curl), not a web page']);
+  eq('N9-15: so is an image load (Sec-Fetch-Site cross-site, no Origin)', (await get({ 'Sec-Fetch-Site': 'cross-site' }))[0], 403);
+  const up = await fetch('http://127.0.0.1:' + recv.port + '/').then((x) => x.text());
+  ok('N9-15: and the receiver is still up', /^ok 0 saved/.test(up), up);
+  eq('N9-15: an address typed in the browser (Sec-Fetch-Site none) stops it', await get({ 'Sec-Fetch-Site': 'none' }), [200, 'stopping: 0 saved']);
+  ok('N9-15: SKILL.md says a web page cannot stop it', /A `\/stop` from a web\s+page/.test(skillSrc));
 });
 
 // ---------------------------------------------- the whole suite on dist/
@@ -5155,9 +5439,16 @@ await block('N8-11', async () => {
 if (!DIST) {
   console.log('\nthe whole suite again, on the dist/*.min.js copies');
   const { spawnSync } = await import('node:child_process');
-  const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], { env: { ...process.env, AEF_DIST: '1' }, encoding: 'utf8', maxBuffer: 1 << 26 });
+  /* N9-13: the child gets a HOME of its own, so a test that writes $HOME/.cache
+   * shows up there, and the temp folders it made must be gone when it ends. */
+  const home = tmpDir('aef-home-');
+  const ours = () => fsx.readdirSync(tmpdir()).filter((f) => /^aef?-/.test(f));
+  const before = new Set(ours());
+  const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], { env: { ...process.env, AEF_DIST: '1', HOME: home }, encoding: 'utf8', maxBuffer: 1 << 26 });
   const last = (child.stdout || '').trim().split('\n').pop();
   ok('every assertion passes on dist/ too', child.status === 0 && /^PASSED/.test(last), last + ' ' + (child.stderr || '').slice(0, 200));
+  eq('N9-13: the run on dist/ left no temp folder behind', ours().filter((f) => !before.has(f)), []);
+  ok('N9-13: and wrote no ~/.cache: labels.sh built into the suite\'s own cache', !fsx.existsSync(join(home, '.cache')), fsx.readdirSync(home).join(','));
   // The README states the exact count (this check included).
   const readmeN = Number((SRC('../README.md').match(/Test suite: (\d+) assertions/) || [])[1]);
   const total = pass + fails.length + 1;

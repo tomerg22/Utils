@@ -54,6 +54,13 @@
  * exit 0, no warning, a stream with no query (counted as a 4-star one), and
  * 20 search items carrying detail-page prices and own counts beside 1,245
  * that did not. Detail records go to rank.mjs as they are.
+ *
+ * SO IS EVERY OTHER PAYLOAD THAT IS NOT A SEARCH STREAM (review of 58c8a00):
+ * the one page of extract.js (source 'init-data' or 'dom', no query), which
+ * receiver.mjs saved as harvest-payload-<stamp>.json, any other source, and a
+ * merged file that holds such a part (merged before the refusal existed).
+ * Each one made a stream with no query and pulled the merged verdict to
+ * 'truncated'. See refusalOf().
  */
 import { readFileSync } from 'node:fs';
 import { queryRelevance, fourStarWarning } from './lib.mjs';
@@ -338,6 +345,32 @@ export function kindError(j) {
     'merged into one. It goes to rank.mjs as it is (--mode final). Leave it out of the decode.mjs call.';
 }
 
+/* The sources of a search stream: harvest.js, a decode.mjs merge, and none
+ * (an old payload, or a part of one). */
+const SEARCH_SOURCES = ['harvest-paged', 'merged'];
+const isSearchSource = (s) => s == null || SEARCH_SOURCES.includes(s);
+
+/** Why a payload is not decoded, or null when it is a search payload. */
+export function refusalOf(j) {
+  if (!j || typeof j !== 'object') return null;
+  if (j.kind) return kindError(j);
+  const n = Array.isArray(j.items) ? j.items.length : 0;
+  if (!isSearchSource(j.source)) {
+    const page = j.source === 'init-data' || j.source === 'dom';
+    return `a ${page ? 'single-page' : JSON.stringify(String(j.source).slice(0, 20))} payload (source "${String(j.source).slice(0, 20)}", ` +
+      `${n} item(s)${page ? ', from extract.js' : ''}) is not a search stream, so it is never merged into one. It goes to ` +
+      'rank.mjs as it is. Leave it out of the decode.mjs call.';
+  }
+  if (j.source === 'merged' && Array.isArray(j.parts)) {
+    const bad = j.parts.filter((x) => x && typeof x === 'object' && !isSearchSource(x.source)).map((x) => String(x.source).slice(0, 20));
+    if (bad.length) {
+      return `a merged file holds ${bad.length} part(s) that are not a search stream (source ${[...new Set(bad)].join(', ')}), ` +
+        'so its pages and verdict are wrong. Merge again from the original search payloads, without those parts.';
+    }
+  }
+  return null;
+}
+
 export function assemble(texts) {
   const found = []; // [{ payload, via }]
   for (const p of fromInAppFiles(texts)) found.push({ payload: p, via: 'in-app-file' });
@@ -369,8 +402,14 @@ export function assemble(texts) {
     let j = null;
     try { j = JSON.parse(t); } catch (e) { continue; }
     // Outside the try: a throw inside it would be skipped as "not JSON".
-    if (j && typeof j === 'object' && j.kind) throw new Error(kindError(j));
+    const why = refusalOf(j);
+    if (why) throw new Error(why);
     if (j && typeof j === 'object' && (Array.isArray(j.items) || j.source)) found.push({ payload: j, via: 'plain-json' });
+  }
+  // The in-app file and the chunk dumps too: every way in is checked.
+  for (const f of found) {
+    const why = refusalOf(f.payload);
+    if (why) throw new Error(why);
   }
   if (!found.length) throw new Error('no payload found: expected an in-app saved result, AEPAYLOAD chunks, or a payload JSON');
   if (found.length === 1) return found[0];
@@ -384,13 +423,14 @@ if (isMain) {
   const files = args.filter((a) => a !== '--check');
   if (!files.length) { console.error('usage: node decode.mjs [--check] <file...>'); process.exit(2); }
   const raws = files.map((f) => [f, readFileSync(f, 'utf8')]);
-  // A details file is named here, so the operator knows which one to leave out.
+  // A refused file is named here, so the operator knows which one to leave out.
   for (const [f, raw] of raws) {
     for (const t of textsOf(raw)) {
       if (!/^\s*\{/.test(t)) continue;
       let j = null;
       try { j = JSON.parse(t); } catch (e) { continue; }
-      if (j && typeof j === 'object' && j.kind) { console.error('decode: ' + f + ': ' + kindError(j)); process.exit(2); }
+      const why = refusalOf(j);
+      if (why) { console.error('decode: ' + f + ': ' + why); process.exit(2); }
     }
   }
   const texts = raws.flatMap(([, raw]) => textsOf(raw));

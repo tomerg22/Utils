@@ -8,19 +8,25 @@
  * The page POSTs its payload with `await __aeHarvest.send(<port>, {via: 'form'})`
  * after `curl -s http://127.0.0.1:<port>/` answers ok (a plain send() fetch
  * was refused by both browsers on 2026-10-18; see SKILL.md step 3). The body is
- * validated as a harvest payload and written to
- *   <dir>/harvest-<query-slug>-<timestamp>.json
- * or, for a payload that names its `kind` (the detail records of
- * __aeListing.sendAll() are kind 'details'), to
- *   <dir>/<kind>-<timestamp>.json
- * and the receiver prints `saved <path>` in its own output. With the form,
+ * validated as a payload and written to
+ *   <dir>/harvest-<query-slug>-<timestamp>.json   a search payload (harvest.js, decode.mjs)
+ *   <dir>/<kind>-<timestamp>.json                 a payload that names its `kind` (the detail
+ *                                                 records of __aeListing.sendAll(): details-…)
+ *   <dir>/page-<timestamp>.json                   anything else: the one page of extract.js
+ * and the receiver prints `saved <path>` in its own output. Only search
+ * payloads are named harvest-*, so `decode.mjs harvest-*.json` takes in no
+ * other kind of file (decode.mjs refuses the others too). With the form,
  * that line is the only proof of delivery: send() answers UNCONFIRMED, and
  * the reply page the tab navigates to cannot be read in a hidden tab. A
  * fetch gets the same `saved <path>` line back as its reply.
  * Exits after --idle seconds without a request (default 3600), or after
  * --count payloads when --count is above 0 (default 0: no limit), so a
  * forgotten receiver does not outlive the session. `curl -s
- * http://127.0.0.1:<port>/stop` ends it at once, with exit 0.
+ * http://127.0.0.1:<port>/stop` ends it at once, with exit 0. A /stop that a
+ * web page sends (it carries Origin, or a Sec-Fetch-Site other than "none")
+ * is refused with 403: any page in the browser could stop the receiver in the
+ * middle of a harvest (review of 58c8a00). curl sends neither header, and an
+ * address typed in the browser sends Sec-Fetch-Site: none.
  *
  * WHY THESE DEFAULTS (measured 2026-10-17): the defaults used to be one
  * payload and 900 s. The hidden-tab recovery needs TWO sends (the stuck tab,
@@ -82,6 +88,24 @@ export function slugify(q) {
   return String(q || 'payload').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'payload';
 }
 
+/** The file name, before the stamp: see the header. A search payload is
+ * harvest.js's ('harvest-paged'), a decode.mjs merge ('merged'), or an old
+ * one with a query and no source. extract.js payloads (source 'init-data' or
+ * 'dom', no query) were saved as harvest-payload-<stamp>.json, and the
+ * `decode.mjs harvest-*.json` of SKILL.md merged a page with no query into
+ * the search pool (review of 58c8a00). */
+export function fileBase(p) {
+  if (p.kind) return slugify(p.kind).slice(0, 40);
+  const search = p.source === 'harvest-paged' || p.source === 'merged' || (p.source == null && p.query != null);
+  return search ? 'harvest-' + slugify(p.query).slice(0, 80) : 'page';
+}
+
+/** A /stop sent by a web page: it carries Origin, or Sec-Fetch-Site other than "none". */
+export function fromWebPage(headers) {
+  const site = headers['sec-fetch-site'];
+  return headers.origin != null || (site != null && site !== 'none');
+}
+
 /** Accept only something shaped like a harvest/extract payload. The body may
  * be raw JSON (fetch) or a text/plain FORM submission, which arrives as
  * `payload=<json>\r\n` — a top-level form POST is how the page reaches
@@ -119,6 +143,12 @@ export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () 
      * idle timer or a kill, and a killed receiver shows as a FAILED background
      * task (exit 144, measured 2026-11-08). */
     if (req.method === 'GET' && /^\/stop\/?(\?|$)/.test(req.url || '')) {
+      if (fromWebPage(req.headers)) {
+        res.writeHead(403, cors);
+        res.end('stop refused: it must come from a terminal (curl), not a web page');
+        log('refused a /stop from a web page (' + (req.headers.origin || req.headers['sec-fetch-site']) + ')');
+        return;
+      }
       res.writeHead(200, cors);
       res.end('stopping: ' + received + ' saved');
       log('stopped by GET /stop after ' + received + ' payload(s)');
@@ -145,10 +175,8 @@ export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () 
        * of sendAll() were saved as harvest-details-<stamp>.json, so the
        * `decode.mjs harvest-*.json` of SKILL.md merged them into the search
        * pool with exit 0 and no warning: a stream with no query, and detail
-       * prices over grid prices (measured 2026-11-08). */
-      const base = join(dir, (v.payload.kind
-        ? slugify(v.payload.kind).slice(0, 40)
-        : 'harvest-' + slugify(v.payload.query).slice(0, 80)) + '-' + stamp);
+       * prices over grid prices (measured 2026-11-08). See fileBase(). */
+      const base = join(dir, fileBase(v.payload) + '-' + stamp);
       let file = base + '.json';
       for (let n = 2; existsSync(file); n++) file = base + '-' + n + '.json';
       // A write error (dir removed, disk full) answers 500 and keeps the

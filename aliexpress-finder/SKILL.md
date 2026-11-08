@@ -86,9 +86,11 @@ search missed it.** Titles omit physical attributes — wires, connector type,
 mounting, enclosure, dimensions. A title search for "wire" returning zero says
 something about titles, not about the world. `rank.mjs` now emits an
 `absence-is-not-evidence` warning when a `--require` regex collapses the pool
-(it matched no title, or it dropped 90% or more and matched fewer than 10;
-the warning states the counts); when you see it, go look at images and
-descriptions before writing a word about absence.
+(it matched 10% of the titles or fewer, or none of a pool under 10; the
+warning states the counts); when you see it, go look at images and
+descriptions before writing a word about absence. A regex that picks one
+product class out of a merged pool (a brand, a type) goes in `--class`
+instead, which warns only when it matches no title (step 4).
 
 ## One given listing — a link, not a search
 
@@ -98,7 +100,8 @@ section the steps were chosen by hand, the spec table was never seen, and most
 photos were not read. A conflict on the recommended option stayed hidden until
 the user asked whether the skill had worked.
 
-**Runs:** step 0 (browser and sign-in), step 2 (the wall rules), the third rule.
+**Runs:** step 0 (browser and sign-in), step 2 (the wall rules), the third rule,
+and the end-of-run cleanup (step 9 below).
 
 1. Open the link and install `listing.js` (step 3 shows how).
 2. Select the option the user named: `options()`, `pick()`, then
@@ -111,11 +114,13 @@ the user asked whether the skill had worked.
 4. `const r = __aeListing.last`, then read `r.warnings` and `r.specs`, **one
    field per call**. Chrome cuts a result at 1,000 characters, so a joined field
    can vanish past the cut. Check the length of what came back.
-5. Download `r.gallery`, `r.descriptionImages` and `r.selectedImages` with
-   `labels.sh` and read **every image**. `labels.sh sheet <dir>` puts them 12 to
-   a numbered sheet; crop a tile's `img<N>.png` for small print. Report the
-   count as "N of M read". An image you did not read is unknown, never "the
-   listing does not say".
+5. Download the images into one folder for this listing, named by its id:
+   `labels.sh fetch <out>/<id>` with `r.gallery` and the `image` of each
+   `r.selectedImages` entry, then `labels.sh fetch --desc <out>/<id>` with
+   `r.descriptionImages`. Read **every image**: `labels.sh sheet <out>/<id>`
+   puts them 12 to a numbered sheet; crop a tile's file for small print.
+   Report the count as "N of M read". An image you did not read is unknown,
+   never "the listing does not say".
 6. Compare the three sources: the option's own image (`selectedImages`, or
    `image` in `options()`), the description images, and the spec table.
    - A `specs-vs-option` warning means the table may describe another option.
@@ -129,6 +134,11 @@ the user asked whether the skill had worked.
 7. Check the user's need against the item, using the need's own source for the
    other side (the old part's label, a teardown, a datasheet). Name that source.
 8. Do step 6 for the brand, in one line.
+9. Clean up: run the snippet of "End of the run: clean up" (step 5) on
+   `https://he.aliexpress.com/`, then close the tab you opened. This flow
+   saves `listing.js` (`__aeSrc:listing`) and a `capture()` record
+   (`__aeDet:<id>`) in the user's storage. Until the review of 58c8a00 it had
+   no cleanup step, so both stayed there.
 
 **Skips:** steps 1, 3, 4 and 7. Nothing was ranked, so the report must say:
 "not compared with other listings". If the user wants alternatives, run the
@@ -660,7 +670,7 @@ is two queries, not a guarantee, and the switch is off since 2026-10-20
 stream whose last quarter is hair clips passes; under the 60-page cap, drift
 that begins at page 31 or later can never reach that threshold. Read
 `pages[].onQuery` (the share per page) to see where drift begins, and remove
-the drifted items with the `--require` class split of step 4.
+the drifted items with the `--class` split of step 4.
 
 **Check that the stream is the product at all.** Measured 2026-10-17: the
 slug `wholesale-wired-usb-mouse` was served as craft wire, 281 of 282
@@ -901,7 +911,15 @@ path to it, or pass the printed path instead. The detail records of
 and `decode.mjs` refuses them (exit 2, naming the file). Until 2026-11-08 they
 were `harvest-details-<stamp>.json`, and `decode.mjs harvest-*.json` merged
 them into the search pool with exit 0: a stream with no query, and detail
-prices over grid prices.
+prices over grid prices. The one page of `extract.js` lands as
+`page-<stamp>.json`, also for `rank.mjs` only; `decode.mjs` refuses it, any
+other payload that is not a search stream, and a merged file that holds one.
+Until the review of 58c8a00 it was `harvest-payload-<stamp>.json`, so the
+same glob took it in.
+
+`curl -s http://127.0.0.1:8765/stop` ends the receiver. A `/stop` from a web
+page (it carries `Origin`, or a `Sec-Fetch-Site` other than `none`) is refused
+with 403, so no page in the browser can end it in the middle of a harvest.
 
 **Fallbacks**, decoded by the one decoder:
 
@@ -963,8 +981,8 @@ the share rule only, and repeats each part's own warning. A bad flag value (`--t
 are errors, exit 2, never an empty list or a dropped requirement. So are a
 flag with one hyphen (`-constraint`), in upper case (`--Constraint`) or with
 an em dash from autocorrect in place of `--`, a stray word, a blank
-`--require ''` and a `--require` regex that does not compile. Until
-2026-10-19 the first four were skipped with exit 0.
+`--require ''` and a `--require` regex that does not compile, and the same for
+`--class`. Until 2026-10-19 the first four were skipped with exit 0.
 `--name=value` works as well as `--name value`.
 
 **Class separation is mandatory once the pool is large, not optional.** With 60
@@ -974,18 +992,27 @@ bottle brushes, PCB anti-static brushes and gas-hob brushes. They are not
 substitutes. Filter to the class the user actually asked for:
 
 ```bash
-... --require 'handle|hand |inch'        # English titles (signed-in Chrome, or in-app after forceEnglish())
-... --require 'ידית|יד |אינץ'             # Hebrew titles (in-app browser without forceEnglish())
+... --class 'handle|hand |inch'        # English titles (signed-in Chrome, or in-app after forceEnglish())
+... --class 'ידית|יד |אינץ'             # Hebrew titles (in-app browser without forceEnglish())
 ```
 
 Write the regex in the language the titles came back in — check one title
 first. A regex in the wrong language drops the whole pool and the
 `absence-is-not-evidence` warning fires. In the measured run, a hand-brush
-`--require` cut 1,166 to 187 and the ranking became answerable. Ask which
-class the user wants, or present both. A class split of a pool merged from
-several searches can drop 95% and still be right (2026-11-08: 32 of 884, 39 of
-1,265): the warning fires only when fewer than 10 titles match, and it says how
-many did.
+class split cut 1,166 to 187 and the ranking became answerable. Ask which
+class the user wants, or present both.
+
+**`--class` for a class, `--require` for an attribute.** Both drop the titles
+the regex does not match. A class split of a pool merged from several searches
+can drop 95% and still be right (2026-11-08: 32 of 884 USB-C chargers that name
+Dell, 39 of 1,265 GaN laptop chargers), so `--class` warns only when it matches
+no title. `--require` is for an attribute the user asked for (`wire`, `9v`):
+there a small share is the "it does not exist" trap of the third rule, so it
+warns when it matches 10% of the titles or fewer (counted over the titles
+`--class` kept), or none of a pool under 10. Both warnings state the counts.
+Until the review of 58c8a00 class splits went in `--require`, and to keep those
+quiet the warning was cut to "fewer than 10 titles": an attribute regex that
+matched 12 of 900 said nothing. Both together: `--class 'gan' --require 'wire'`.
 
 The no-rating filter removes AliExpress's SEO keyword-stuffing links (titles
 like "milk frother containeraliexpress milk frother…", all fields null).
@@ -1125,7 +1152,8 @@ here, between the markers, and run the tests after any change.
     const c = String(e.className || '');
     if (/sku-item--(image|text)|sku-property-item/.test(c)) {
       const im = e.querySelector && e.querySelector('img');
-      opts.push(((im && (im.getAttribute('alt') || im.getAttribute('title'))) || e.textContent || '').replace(/\s+/g, ' ').trim() + (/selected/.test(c) ? '*' : ''));
+      const name = ((im && (im.getAttribute('alt') || im.getAttribute('title'))) || e.textContent || '').replace(/\s+/g, ' ').trim();
+      if (name) opts.push({ name, sel: /selected/.test(c) });
     }
     if (/specification--prop/.test(c) && e.querySelector) {
       const k = e.querySelector('[class*="specification--title"]'), v = e.querySelector('[class*="specification--desc"]');
@@ -1157,10 +1185,16 @@ here, between the markers, and run the tests after any change.
     Object.assign(spec, best);
     if (Object.keys(spec).length) specFrom = 'text';
   }
-  // Deduped on the WHOLE name, then shortened keeping both ends, so
-  // "Bluetooth Rechargeable Black" and "... Grey" stay two options.
+  // One entry per tile. A name that several tiles share gets " #1", " #2", …,
+  // the n of listing.js options() and pick(name, n); "*" (selected) stays last.
+  // Then shortened keeping both ends, so "Bluetooth Rechargeable Black" and
+  // "... Grey" stay two options and the "#2*" stays readable.
   const short = (x) => (x.length > 24 ? x.slice(0, 13) + '…' + x.slice(-10) : x);
-  const uo = [...new Set(opts)], shown = uo.slice(0, 10);
+  const uses = {}, seen = {};
+  opts.forEach((t) => { uses[t.name] = (uses[t.name] || 0) + 1; });
+  const uo = opts.map((t) => { seen[t.name] = (seen[t.name] || 0) + 1;
+    return t.name + (uses[t.name] > 1 ? ' #' + seen[t.name] : '') + (t.sel ? '*' : ''); });
+  const shown = uo.slice(0, 10);
   for (const x of uo) if (/\*$/.test(x) && !shown.includes(x)) shown.push(x);
   const out = { id: (path.match(/(\d+)\.html/) || [])[1],
     rating: ar.ratingValue != null ? Number(ar.ratingValue) : null,
@@ -1223,8 +1257,12 @@ What comes back, and why each field is there (all measured 2026-09-25):
 - **`options`** are the listing's own options, read from the option selector;
   `*` marks the selected one, one per option property (Color AND Type). The
   first 10 come back, plus every selected one past them; `optionCount` is the
-  total. The JSON-LD `price` is the selected options' price, so say which
-  they are. A "$2.14 keychain" was the 1-key option, not the 9-key pad in its
+  number of tiles. A name that several tiles share comes back once per tile,
+  numbered: `EU Plug Add Cable #2*` is the second tile of that name, and it is
+  selected. The number is the `n` of `options()` and `pick(name, n)` in
+  `listing.js`. Until the review of 58c8a00 the reader kept such a name once,
+  so the selected tile and the tile count were hidden. The JSON-LD `price` is
+  the selected options' price, so say which they are. A "$2.14 keychain" was the 1-key option, not the 9-key pad in its
   title. When the output would pass 1,000 characters, options are cut and
   `optionsCut` is `true`. Unselected ones go first. A selected one is cut
   only when no unselected one is left.
@@ -1274,40 +1312,57 @@ __aeListing.dropCaptured()         // after the receiver printed "saved <path>"
 `capture()` saves nothing on a wall and returns `blocked` or `suspectedWall`: stop
 as in step 2. A record also holds `store`, the seller's store name (`null` when
 the page text had none: unknown), and `storeOfficial`, for step 6. After
-`sendAll()` the tab is on the receiver, not AliExpress: navigate back before the
-next read.
+`sendAll()` the tab is on the receiver, not AliExpress: navigate back to
+`https://he.aliexpress.com/` before the next read.
+
+When tiles share a name (`pick(name, n)`), a record also holds `selectedTiles`,
+`{ name, n }` per selected tile, and the summary holds `selectedN`: the n of
+the tile that is selected, so the price is tied to one tile. `selected` holds
+names only. Found in the review of 58c8a00 (2026-11-08, in the code, not on
+the live site): a picked "EU Plug Add Cable" #2 was saved as the bare name, the
+same as #1 and #3.
 
 ### End of the run: clean up
 
-Every key this skill writes in the user's AliExpress `localStorage` starts with
-`__ae`: the saved scripts (`__aeSrc:`), the harvest backups (`__aeHarvest:`) and
-the `capture()` records (`__aeDet:`). Remove them all when the run is over, and
+This skill writes three kinds of keys in the user's AliExpress `localStorage`:
+the saved scripts (`__aeSrc:`), the harvest backups (`__aeHarvest:`) and the
+`capture()` records (`__aeDet:`). Remove them all when the run is over, and
 only after every `saved <path>` line has been read in the receiver's output:
 until then the backups are the way back. Measured 2026-11-08: the old instruction
 named only `__aeSrc:*`, so 3 harvest backups stayed behind; and after a last
-`sendAll()` the tab sat on 127.0.0.1, where the cleanup removed nothing. Run this
-on an AliExpress page (after a send, navigate back first: one page load):
+`sendAll()` the tab sat on 127.0.0.1, where the cleanup removed nothing.
+
+Storage belongs to one host, and the skill's pages run on `he.aliexpress.com`
+(step 1). Run this on `https://he.aliexpress.com/` (after a send, navigate
+back first: one page load). It removes only those three prefixes, never another
+key that starts with `__ae`. On another AliExpress host with none of them it
+says `NOT CLEANED` and names the host, instead of "none left" (review of
+58c8a00: any AliExpress host passed, and a clean report there meant nothing):
 
 <!-- @snippet:cleanup:start -->
 ```js
 (() => {
-  // Every key this skill writes starts with __ae: __aeSrc: (the saved scripts),
+  // Only the keys this skill writes: __aeSrc: (the saved scripts),
   // __aeHarvest: (harvest backups), __aeDet: (capture() records).
-  const host = String(location.hostname || '');
+  const MINE = /^__ae(Src|Harvest|Det):/;
+  const mine = () => { const out = []; for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && MINE.test(k)) out.push(k); } return out; };
+  const host = String(location.hostname || '') || 'no host';
+  const home = 'he.aliexpress.com';
   if (!/(^|\.)aliexpress\./i.test(host)) {
-    return 'NOT CLEANED: this tab is on ' + (host || 'no host') + ', not AliExpress (a send() navigates to the ' +
-      'receiver). Navigate to any AliExpress page and run this again.';
+    return 'NOT CLEANED: this tab is on ' + host + ', not AliExpress (a send navigates to the receiver). ' +
+      'Open https://' + home + '/ and run this again.';
   }
-  const keys = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
-    if (k && k.indexOf('__ae') === 0) keys.push(k);
+  const keys = mine();
+  if (!keys.length && host !== home) {
+    return 'NOT CLEANED: no key of this skill on ' + host + '. Storage belongs to one host, and the skill ' +
+      'runs on ' + home + ': open https://' + home + '/ and run this again.';
   }
   const by = {};
   keys.forEach((k) => { const p = k.split(':')[0]; by[p] = (by[p] || 0) + 1; localStorage.removeItem(k); });
-  let left = 0;
-  for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.indexOf('__ae') === 0) left++; }
-  return 'removed ' + keys.length + ' key(s) ' + JSON.stringify(by) + (left ? '; ' + left + ' still there: run it again' : '; none left');
+  const left = mine().length;
+  return 'removed ' + keys.length + ' key(s) on ' + host + ' ' + JSON.stringify(by) +
+    (left ? '; ' + left + ' still there: run it again' : '; none left on ' + host) +
+    (host === home ? '' : '. Run it on https://' + home + '/ too');
 })()
 ```
 <!-- @snippet:cleanup:end -->
@@ -1409,37 +1464,54 @@ Five things it encodes that cost real time to discover:
   is now read from its shadow tree, `<style>` skipped. The iframe under
   `#nav-description` is empty in both tab states: it is not the description.
 
-Then read the labels — this is not optional for hardware. Pass `gallery`
-AND `descriptionImages`:
+Then read the labels — this is not optional for hardware. **One folder per
+listing, named by its id** (`<out>` is a folder in the scratchpad). The gallery
+and the option images (`selectedImages`) go in as `img<N>.png`, the description
+images with `--desc` as `desc<N>.png`:
 
 ```bash
-~/.claude/skills/aliexpress-finder/scripts/labels.sh fetch /tmp/labels <url1> <url2> ...
+~/.claude/skills/aliexpress-finder/scripts/labels.sh fetch <out>/<id> <gallery url> <option image url> ...
+~/.claude/skills/aliexpress-finder/scripts/labels.sh fetch --desc <out>/<id> <description image url> ...
 ```
+
+A second call into the same folder goes on after the highest number there, so
+nothing is overwritten; `--fresh` first removes the folder's own `img*`, `desc*`
+and `sheet-*` files, to fetch that listing again from scratch. Until the review
+of 58c8a00 every call started at `img1`, and the docs used one shared
+`/tmp/labels`: a second listing overwrote the first one's photos, and a longer
+first listing left its extra photos behind under the second one's name.
 
 Downloads are **WebP even when the URL ends in .jpg**, so the script converts
 to PNG (`sips`; PIL is not installed here). If the case text is too small to
 read in the 800x800 shot — and it usually is — crop and upscale:
 
 ```bash
-~/.claude/skills/aliexpress-finder/scripts/labels.sh crop /tmp/labels/img1.png 295 328 150 175
+~/.claude/skills/aliexpress-finder/scripts/labels.sh crop <out>/<id>/img1.png 295 328 150 175
 ```
 
 Reading the uncropped image is exactly how `OUTPUT: 9V1.6A` went unnoticed on
 the first pass.
 
 **Many images: read them as numbered sheets.** "Read every image" was 434 images
-over 18 listings on 2026-11-08, one Read call each. `labels.sh sheet` puts 12 to a
-sheet (4 per row, the red number on a tile is its `img<N>.png`), so that is about
-one call per 12 images; crop a tile's file when its print is small. It uses
-AppKit through `sheet.swift`, compiled once into `~/.cache/aliexpress-finder`
-(needs `swiftc`, from the Xcode command line tools).
+over 20 listings on 2026-11-08, one Read call each. `labels.sh sheet` puts 12 to a
+sheet, 4 per row, so that is about one call per 12 images. The red label on a
+tile is its file: `3` is `img3.png`, `d3` is `desc3.png`; crop that file when
+its print is small. Each run first removes the folder's old `sheet-*.png`. It
+uses AppKit through `sheet.swift`, compiled once into `~/.cache/aliexpress-finder`
+(needs `swiftc`, from the Xcode command line tools; a failed build prints the
+compiler's own words).
 
 ```bash
 ~/.claude/skills/aliexpress-finder/scripts/labels.sh sheet <out>/<id>   # writes <out>/<id>/sheet-1.png, sheet-2.png, …
 ```
 
-**One product, several listings.** Fetch each finalist into its own directory
-named by its id (`labels.sh fetch <out>/<id> …`), then compare their photos:
+An image AppKit cannot decode is a blank tile. `sheet` names it (`COULD NOT
+READ: img4`) and exits 3: that image is NOT read. Fetch it again, or report it
+as unread. Until the review of 58c8a00 the blank tile was silent, and a blank
+tile looks like a white product photo.
+
+**One product, several listings.** Fetch each finalist into its own folder
+named by its id, as above, then compare their photos:
 
 ```bash
 ~/.claude/skills/aliexpress-finder/scripts/labels.sh same <out>/*
@@ -1453,6 +1525,15 @@ and filled rows 1-3 of a top-4 table; their image URLs differed, so only the byt
 tell. A pair with fewer shared photos is printed as "some photos in common":
 sellers of different products share banners. Look at those by eye. Put the group's
 `product` on each member for step 7.
+
+Only gallery photos (`img<N>.png`) are compared: stores put the same banners in
+the descriptions of different products. A group is printed only when EVERY pair
+in it is one product. `NOT one product: A B C` is a chain: A = B and B = C, but
+A and C do not share enough photos (B may show both products). Compare those by
+eye and set no `product` on them. A folder with no `img<N>.png`, and anything
+that is not a folder (a file in `<out>/*`), is skipped and named. All three were
+found in the review of 58c8a00: description banners joined two products, a chain
+was one group, and one stray file stopped the whole comparison.
 
 **Detail price often differs from search price** — the grid shows one option's
 price or a promo figure, not always the cheapest one (measured 2026-10-31:
@@ -1555,11 +1636,17 @@ ratings). In a small niche rerun with `--min-evidence 1` and report the thin cou
 
 **One product is ranked once.** Run `labels.sh same` on the finalists' photo
 directories (step 5) and put the group on each member as `"product": "<id>"`.
-`rank.mjs` then ranks the product on its best-scoring listing, lists the others
-under `sameProduct` and `otherListings` with their prices, and says so in a
-`same-product` warning, naming the cheapest listing when it is not the one
-ranked. Without it, three listings of one charger took rows 1-3 of a top-4 table
-(2026-11-08).
+`rank.mjs` then ranks the product on its best-scoring listing. For each product
+in the ranking (after the `--top` cut) it lists every other listing under
+`sameProduct` and `otherListings`, with its price and currency, and with `why`
+when that listing was set aside (thin evidence, no own count, …). The
+`same-product` warning names the cheapest listing when it is not the one ranked,
+and only when every price is known and in one currency; otherwise it says why
+no cheapest is named. Without the product key, three listings of one charger
+took rows 1-3 of a top-4 table (2026-11-08). Until the review of 58c8a00 the
+grouping ran before the cut (a product below it was called "already ranked"),
+it saw only the listings kept (a cheaper one set aside for thin evidence was
+never named), and it named a cheapest across two currencies.
 
 **Set each constraint from the spec rows, never from the title alone:**
 
@@ -1590,7 +1677,8 @@ data.
 Table of the 4 PRODUCTS (not listings: see "One product is ranked once" in step
 7): title, detail price (in the currency the account shows), OWN rating
 (`ownRating`), OWN rating count, sold, store and brand verdict, link. A product
-with `otherListings` names them and their prices in its row. Say once that the
+with `otherListings` names them, their prices and currency in its row, and a
+set-aside one with its `why`. Say once that the
 header count on the page is pooled across other sellers, with one example pair.
 Then, briefly:
 
@@ -1648,17 +1736,17 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 | File | Role |
 |------|------|
 | `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until an empty page or a page with no new ids (never on `finished`), reports `coverage.verdict`, `endSignal`, `relevance` (off-query streams) and `visibility`. Runs unchanged in both browsers; `forceEnglish()` (in-app only), `send()` (outcome-first reply; `send(port, {via: 'form'})` always posts the form, so it navigates even to a dead port: curl the receiver first; a plain `send()` never navigates after a refused fetch; a backup is saved before any form POST; the fetch race is skipped in a hidden tab), `restore()`/`backups()`/`dropBackup()` (localStorage backup per page, the run saved last first), `resume()` (clears a stop, keeps the items), `startPage`, `maxPages` capped at the site's last page (60), one `step()` loop at a time (`running` in `status()`), `expose()`/`chunks()` (Chrome export, visible tab only), `debugUrl()` (in-app only); `fourStar` off by default since 2026-10-20 (`true`, or an `extra` that carries the 4★ switch, makes `start()` `note`, `status()` `note` and a `four-star-switch` payload warning say so); a `step()` that reads the last allowed page ends with its stop set (`done: true`). |
-| `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; after a `curl` check, `__aeHarvest.send(port, {via: 'form'})` POSTs the payload to it and it writes `harvest-<query>-<stamp>.json` and prints `saved <path>` in its own output (a fetch gets the same line as its reply). A payload with a `kind` (the `sendAll()` detail records) is written as `<kind>-<stamp>.json`, so `details-<stamp>.json`. No payload limit by default; exits after 60 idle minutes; `GET /` answers `ok …`; `GET /stop` ends it with exit 0. |
-| `scripts/decode.mjs` | **Fallback decoder and merger.** Reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps (any order, refuses a partial set), or from a plain payload JSON or an array of them. Several payloads are merged, deduped by id, never dropped. A file with a `kind` (detail records) is refused with exit 2, naming the file: it goes to `rank.mjs`. |
+| `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; after a `curl` check, `__aeHarvest.send(port, {via: 'form'})` POSTs the payload to it and it writes `harvest-<query>-<stamp>.json` and prints `saved <path>` in its own output (a fetch gets the same line as its reply). A payload with a `kind` (the `sendAll()` detail records) is written as `<kind>-<stamp>.json`, so `details-<stamp>.json`, and any other payload that is not a search payload (the one page of `extract.js`) as `page-<stamp>.json`. No payload limit by default; exits after 60 idle minutes; `GET /` answers `ok …`; `GET /stop` ends it with exit 0, and is refused (403) when a web page sends it. |
+| `scripts/decode.mjs` | **Fallback decoder and merger.** Reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps (any order, refuses a partial set), or from a plain payload JSON or an array of them. Several payloads are merged, deduped by id, never dropped. A file that is not a search payload (a `kind`, the one page of `extract.js`, another source, a merged file that holds one) is refused with exit 2, naming the file: it goes to `rank.mjs`. |
 | `scripts/dist/bootstrap-harvest.min.js`, `bootstrap-listing.min.js` | **The one paste per script per run.** Generated. The min copy, which also saves its own text in `localStorage`; later pages run `(0,eval)(localStorage.getItem('__aeSrc:harvest'))`. |
 | `scripts/build.mjs` | Writes `scripts/dist/*.min.js`: the three browser files without comments, for the install paste, and the two `bootstrap-*.min.js` files. `--check` reports a stale copy; `test.mjs` fails on one. |
 | `scripts/dist/*.min.js` | Generated install copies. Never edit them; edit the source and run `build.mjs`. |
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. `_init_data_` first, DOM fallback, reports `source`, `blocked` and `visibility`. The result also stays on `window.__aeExtract` (Chrome cuts the return at 1,000 characters): return pieces of `.result`, or `.send(port)` posts it to `receiver.mjs`. |
-| `scripts/listing.js` | **Detail-page reader.** `await read()`: expands, then returns text AND images in one call. Shadow-DOM aware, block-aware; `gallery` is the product's own photos only (other products counted in `excludedImages`); reads the description (from its shadow tree, or fetched when a hidden tab left it unrendered) into `text`, `sizeLines` and `descriptionImages`; separates product size from carton size, reads options only from the option selector (`selectedVariant` too; `optionTiles` and a `same-name-options` warning when tiles share a name), returns the own vs pooled review counts and the seller's `store`, reports `visibility` and `warnings`, keeps the result in `last` before the description fetch, `changed()` proves a re-read is owed. `options()`, `pick(name, n)` (exact name; `n` for a name on several tiles), `price()`, `capture()`, `captured()`, `sendAll()`, `dropCaptured()`. |
-| `scripts/labels.sh` | Downloads gallery images and makes their printed text readable (WebP→PNG, crop + upscale). The label on the case is the spec sheet. `sheet` puts a directory's images on numbered contact sheets (`sheet.swift`); `same` runs `same.mjs` on several listing directories. |
-| `scripts/sheet.swift` | Contact-sheet maker for `labels.sh sheet`: AppKit, compiled once into `~/.cache/aliexpress-finder`. 12 images per sheet, 4 per row, each tile numbered with its `img<N>.png`. |
-| `scripts/same.mjs` | Which listings are one product: md5 of each listing's photos, a pair sharing at least half of the smaller one's distinct photos (and at least 2) is one product. Prints the groups to put as `product` on the finalists; `--json` for a machine. |
-| `scripts/rank.mjs` | Ranker. Bayesian shrinkage (own rating in final mode), log volume, neutral brand default, `--require` filter, `--spread` tier stratification, `--constraint` hard filters, absence (only when the regex matched no title or fewer than 10, with the counts), off-query (`off-query-results`, `-connector`, `-keywords`) and `tie-at-cutoff` warnings, `sold-unparsed` and `own-reviews-unknown` set-asides with warnings, one product ranked once (`product`, `sameProduct`, `otherListings`, a `same-product` warning), strict flag values. |
+| `scripts/listing.js` | **Detail-page reader.** `await read()`: expands, then returns text AND images in one call. Shadow-DOM aware, block-aware; `gallery` is the product's own photos only (other products counted in `excludedImages`); reads the description (from its shadow tree, or fetched when a hidden tab left it unrendered) into `text`, `sizeLines` and `descriptionImages`; separates product size from carton size, reads options only from the option selector (`selectedVariant` too; `optionTiles` and a `same-name-options` warning when tiles share a name), returns the own vs pooled review counts and the seller's `store`, reports `visibility` and `warnings`, keeps the result in `last` before the description fetch, `changed()` proves a re-read is owed. `options()`, `pick(name, n)` (exact name; `n` for a name on several tiles; `selectedTiles` and `selectedN` say which tile is selected), `price()`, `capture()`, `captured()`, `sendAll()`, `dropCaptured()`. |
+| `scripts/labels.sh` | Downloads a listing's images into its own folder and makes their printed text readable (WebP→PNG, crop + upscale). The label on the case is the spec sheet. `fetch` numbers on after the files already there (`--fresh` starts over), description images with `--desc` as `desc<N>.png`. `sheet` puts a folder's images on numbered contact sheets (`sheet.swift`), names an image it cannot read and exits 3; `same` runs `same.mjs` on several listing folders. |
+| `scripts/sheet.swift` | Contact-sheet maker for `labels.sh sheet`: AppKit, compiled once into `~/.cache/aliexpress-finder`. 12 images per sheet, 4 per row, each tile labelled with its file (`3` is `img3.png`, `d3` is `desc3.png`); prints the labels of the images it could not decode. |
+| `scripts/same.mjs` | Which listings are one product: md5 of each listing's gallery photos (`img<N>.png` only), a pair sharing at least half of the smaller one's distinct photos (and at least 2) is one product, and a group only when every pair in it is. Prints the groups to put as `product` on the finalists, the chains to check by eye and the skipped arguments; `--json` for a machine. |
+| `scripts/rank.mjs` | Ranker. Bayesian shrinkage (own rating in final mode), log volume, neutral brand default, `--class` split (warns only when it matches no title), `--require` filter (absence warning at 10% of the titles or fewer, with the counts), `--spread` tier stratification, `--constraint` hard filters, off-query (`off-query-results`, `-connector`, `-keywords`) and `tie-at-cutoff` warnings, `sold-unparsed` and `own-reviews-unknown` set-asides with warnings, one product ranked once (`product`; `sameProduct`, `otherListings` and a `same-product` warning for the ranked products, set-aside listings included), strict flag values. |
 | `scripts/lib.mjs` | Pure helpers (`parseSold`, `SOLD_RE`, `parseReviewBlock`, `median`, `clean`, **`wallVerdict`**, `queryRelevance`) shared by ranker, browser files, the step-5 reader and tests. |
 | `scripts/test.mjs` | Assertion suite incl. regression guards for every defect below. It also runs the step-5 reader, pulled out of this file. |
 | `scripts/fixtures/` | Real titles for the relevance tests: `real-titles-2026-10-17.json` (craft wire served for `wired usb mouse`, a real mouse stream), `real-streams-2026-10-19.json` (POCO phones for `poco f7 ultra wallet case`, cables for `type c iem`, three correct streams), `live-streams-2026-10-19.json` (18 labelled live captures). |
@@ -1672,11 +1760,75 @@ if you don't. A drifted `wallVerdict` means one entry point silently stops
 detecting walls; a drifted `SOLD_RE` means best sellers silently lose their
 sold count.
 
+### Defects fixed 2026-11-08, second round (review of 58c8a00)
+
+A code review of the first round below (commit 58c8a00) found 15 defects,
+several of them in that round's own fixes. Each has a test (`N9`) that fails
+on the code before the fix. Not run on the live site: the guards are checked
+in `test.mjs` only.
+
+1. **`labels.sh fetch` started at `img1` on every call**, and the docs used one
+   shared `/tmp/labels`. A second listing overwrote the first one's photos, and
+   a longer first listing left its extra photos under the second one's name.
+   Guard: one folder per listing, numbering goes on after the files there,
+   `--fresh` starts over, `--desc` writes `desc<N>.png`.
+2. **`same.mjs` joined a chain into one product.** A = B and B = C put A and C
+   (no shared photo) in one group. Guard: a group needs every pair; a chain is
+   printed as `NOT one product`, with no product key.
+3. **`same.mjs` counted description banners.** Stores reuse them on different
+   products. Guard: only gallery photos (`img<N>.png`) are compared.
+4. **The absence warning went quiet at 10 matches.** An attribute regex that
+   matched 12 of 900 titles said nothing, and the rule compared a count of all
+   titles with a count of the items the regex alone dropped. Guard: `--class`
+   for class splits (warns only at no match); `--require` warns at 10% or fewer
+   of the titles `--class` kept.
+5. **"is the cheapest" could be false.** Listings set aside (thin evidence)
+   were never seen, a missing price was skipped, and two currencies were
+   compared. Guard: every listing of the product is named, a set-aside one
+   with its `why`; a cheapest only when every price is known and in one
+   currency.
+6. **`same-product` named products below the `--top` cut as ranked.** Guard:
+   the grouping runs after the cut, on the ranked products only.
+7. **The cleanup passed on any AliExpress host, and removed any `__ae*` key.**
+   Storage belongs to one host, so "none left" on another host meant nothing.
+   Guard: only `__aeSrc:`, `__aeHarvest:` and `__aeDet:`; `NOT CLEANED` naming
+   the host when none is found off `he.aliexpress.com`.
+8. **`capture()` saved only the name of a picked tile that shares its name.**
+   Guard: `selectedTiles` (`{ name, n }`) in `read()` and the record,
+   `selectedN` in the summary.
+9. **The step-5 reader kept a shared name once.** The selected tile and the
+   tile count were hidden. Guard: one entry per tile, numbered `#n`;
+   `optionCount` counts tiles.
+10. **The one page of `extract.js` was saved as `harvest-payload-<stamp>.json`**,
+    so `decode.mjs harvest-*.json` merged a page with no query. Guard:
+    `page-<stamp>.json`, and `decode.mjs` refuses every payload that is not a
+    search stream, and an old merged file that holds one.
+11. **The link flow had no cleanup step.** Guard: step 9 of that flow.
+12. **`labels.sh sheet` hid an unreadable image and the compiler's error.** A
+    blank tile looks like a white photo. Guard: it names the image and exits 3;
+    a failed build prints `swiftc`'s own words; old `sheet-*.png` go first.
+13. **The tests wrote the real `~/.cache` and left temp folders.** Guard:
+    `labels.sh` reads `XDG_CACHE_HOME`, the tests point it at their own cache,
+    and every temp folder is removed at exit.
+14. **`same <out>/*` stopped on one stray file or an empty folder.** Guard:
+    those are skipped and named.
+15. **Any web page could stop the receiver** (`GET /stop`). Guard: 403 when
+    the request carries `Origin`, or `Sec-Fetch-Site` other than `none`.
+
+Also fixed: `read()` cut option names to 80 characters before it counted them,
+so two names that differ past character 80 were one; `same-name-options` now
+counts whole names. The `N8-11` test left 2 to 3 s timers running. "434 images
+over 18 listings" was 20 listings (434 PNG files in 20 listing folders of the
+session). Checked and not changed: `/stop` with an idle keep-alive socket open
+closed the server in 56 ms on Node 22 (`server.close()` closes idle sockets
+there).
+
 ### Defects fixed 2026-11-08 (the Dell charger session)
 
 Found when the user asked whether the run (a USB-C Dell charger, then GaN
 chargers) showed issues in the skill. Each has a test (`N8`) that fails on the
-code before the fix; 9, 10 and 11 were gaps more than defects.
+code before the fix; 9, 10 and 11 were gaps more than defects. Not run on the
+live site after the fix: the guards are checked in `test.mjs` only.
 
 1. **`decode.mjs` merged detail records into the search pool.** `sendAll()`
    output was saved as `harvest-details-<stamp>.json`, so `decode.mjs

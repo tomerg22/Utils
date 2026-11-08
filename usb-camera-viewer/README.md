@@ -116,11 +116,18 @@ adb logcat -s usbcamera libusb
 ```
 
 Once a second while streaming: `HD Camera · MJPEG 1280×720 30 fps · showing 30 fps (… received,
-… shown)`. One error line is expected each time the camera closes:
+… shown)`. A close with the camera plugged in usually logs one error line:
 `submit_bulk_transfer submiturb failed, errno=16` (EBUSY). Measured: it comes at the close, and
 right after the close `uvcvideo` holds the camera's interfaces again. Likely, from libuvc's code:
 the camera's status transfer completes during the close, and libuvc's attempt to submit it
 again fails because `uvcvideo` now owns the interface.
+
+Of 11 such closes in the saved logs of 2026-11-08, 9 logged that line, 1 logged nothing, and 1
+logged two other lines: `[do_close] Device handle closed while transfer was still being
+processed` and `[do_close] A cancellation hasn't even been scheduled`. From the code:
+`uvc_close` does not cancel the status transfer before `libusb_close`, and libusb prints these
+two lines when a transfer is still in flight at that point. The camera opened normally after
+all 11. A close after an unplug logs no libusb error.
 
 ### Tests
 
@@ -135,10 +142,31 @@ the 25 fps rule, the MJPEG preference or the 1080p cap, preferring larger frames
 lower frame rates, ignoring the forced mode, a 26 fps threshold, or a looser parse each make it
 fail.
 
+### Tested on the phone (2026-11-08)
+
+- **Unplug and plug in while the app runs** (by hand, twice). On unplug, the status line showed
+  "Plug in a USB camera." 8 to 33 ms after the system removed the camera. On plug-in, the phone
+  opened the app for the camera with no dialog: on this phone the app is the camera's default
+  (`adb shell dumpsys usb`, under `device_preferences`). The stream started 0.19 and 0.26 s after
+  the system saw the camera, at 30 fps. The app opens the camera twice on plug-in: once from its
+  attach receiver, and again because the system's new intent pauses and resumes the activity.
+  The first stream lives under 0.1 s.
+- **Rotation**, through `adb shell cmd window user-rotation lock 1`, then `3`, then `0`
+  (auto-rotate is off on this phone). The activity was not recreated and the camera was not
+  reopened. Frames stayed at 30 fps. In both landscape rotations the picture stayed upright,
+  16:9 and clear of the system bars.
+- **Watchdog**, with a test build that is not in this repo. It adds an adb broadcast that calls
+  `libusb_cancel_transfer` on every transfer in libuvc's stream handle. libuvc frees a cancelled
+  transfer and does not submit it again, so the stream ends in the same state as the ENOMEM
+  freeze: running, with no transfer left. 5 stalls: 4 in MJPEG 1280×720 and 1 in a forced YUYV
+  640×480. Each time, the status line came back with "showing 0 fps", and the app logged
+  `No frame for 3001 ms, reopening (N)` (3001 to 3003 ms). The check runs once a second, so
+  this is 3 to 4 s after the last frame. Frames were back within 1 s, at the full rate the
+  second after. The reopen kept the forced mode.
+
 ### Not tested
 
-- The watchdog: it never triggered (no stall with 8 packets; 3 runs with 32 packets did not
-  freeze either).
-- Unplugging and plugging the camera in while the app runs (including the offer to open the
-  app), and screen rotation.
+- A real stall (ENOMEM) reaching the watchdog. The watchdog test cancelled transfers instead.
+- Plugging the camera in when the app is not its default (the USB access dialog and the offer
+  to open the app), or while the app is not running.
 - Other cameras and other phones.

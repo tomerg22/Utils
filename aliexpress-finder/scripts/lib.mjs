@@ -2,7 +2,8 @@
  *
  * extract.js, harvest.js and listing.js run inside the browser and CANNOT
  * import this file, so they inline copies of the helpers they need
- * (parseSold, SOLD_RE, parseReviewBlock, wallVerdict) between @shared
+ * (parseSold, SOLD_RE, parseReviewBlock, wallVerdict, queryRelevance, the
+ * request log) between @shared
  * markers, and so does the step-5 snippet in SKILL.md. test.mjs pulls
  * every copy out and
  * asserts it agrees with this one on every fixture, so they cannot silently
@@ -519,7 +520,51 @@ function queryRelevance(query, titles) {
 }
 /* @shared:queryRelevance:end */
 
-export { parseSold, SOLD_RE, parseReviewBlock, wallVerdict, queryRelevance };
+/* @shared:reqLog:start */
+/* The site requests of this browser, across tabs, scripts and runs, in
+ * localStorage (it belongs to the origin, so every tab of he.aliexpress.com
+ * sees one log). The wall (SKILL.md step 2) was measured near 50-60 requests
+ * in one session, and nothing counted them: the harvester counted its own
+ * fetches only, and the detail pages of step 5 were counted by hand (about 52
+ * on 2026-11-09). Each entry is [time in ms, kind]:
+ *   page    a page load on which a skill script was installed (once per
+ *           document; a page with no script installed is not seen)
+ *   search  a harvest.js search-page fetch
+ *   desc    a listing.js description fetch (another host: counted apart)
+ * Entries older than 24 h are dropped, and at most 500 are kept. */
+const REQ_KEY = '__aeReq:log';
+function reqLogRead(ls) {
+  try {
+    const a = JSON.parse((ls && ls.getItem(REQ_KEY)) || '[]');
+    return Array.isArray(a) ? a.filter((e) => Array.isArray(e) && typeof e[0] === 'number' && typeof e[1] === 'string') : [];
+  } catch (e) { return []; }
+}
+function reqLogAdd(ls, kind, now) {
+  if (!ls) return false;
+  const t = now == null ? Date.now() : now;
+  const a = reqLogRead(ls).filter((e) => t - e[0] <= 24 * 3600e3).slice(-499);
+  a.push([t, kind]);
+  try { ls.setItem(REQ_KEY, JSON.stringify(a)); return true; } catch (e) { return false; }
+}
+/* Counts in the last 10 and 60 minutes and 24 hours. `site` is pages plus
+ * search fetches; `desc` is the description host, counted apart. */
+function reqLogSummary(log, now) {
+  const t = now == null ? Date.now() : now;
+  const win = (min) => {
+    const o = { site: 0, desc: 0 };
+    for (const [at, kind] of log) if (t - at >= 0 && t - at <= min * 60e3) o[kind === 'desc' ? 'desc' : 'site']++;
+    return o;
+  };
+  const s = { last10min: win(10), last60min: win(60), last24h: win(1440) };
+  s.firstMinAgo = log.length ? Math.round((t - log[0][0]) / 60e3) : null;
+  if (s.last60min.site >= 45) {
+    s.warn = 'near the wall: ' + s.last60min.site + ' site requests in 60 min, and the wall was measured near 50-60 in one session (SKILL.md step 2)';
+  }
+  return s;
+}
+/* @shared:reqLog:end */
+
+export { parseSold, SOLD_RE, parseReviewBlock, wallVerdict, queryRelevance, REQ_KEY, reqLogRead, reqLogAdd, reqLogSummary };
 
 /* A payload harvested with the 4StarRating switch that carries no
  * four-star-switch warning of its own: every harvest.js run before

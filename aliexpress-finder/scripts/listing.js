@@ -232,6 +232,50 @@ function wallVerdict(sig) {
   }
   /* @shared:reviewBlock:end */
 
+  /* @shared:reqLog:start */
+  /* The site requests of this browser, across tabs, scripts and runs, in
+   * localStorage (it belongs to the origin, so every tab of he.aliexpress.com
+   * sees one log). The wall (SKILL.md step 2) was measured near 50-60 requests
+   * in one session, and nothing counted them: the harvester counted its own
+   * fetches only, and the detail pages of step 5 were counted by hand (about 52
+   * on 2026-11-09). Each entry is [time in ms, kind]:
+   *   page    a page load on which a skill script was installed (once per
+   *           document; a page with no script installed is not seen)
+   *   search  a harvest.js search-page fetch
+   *   desc    a listing.js description fetch (another host: counted apart)
+   * Entries older than 24 h are dropped, and at most 500 are kept. */
+  const REQ_KEY = '__aeReq:log';
+  function reqLogRead(ls) {
+    try {
+      const a = JSON.parse((ls && ls.getItem(REQ_KEY)) || '[]');
+      return Array.isArray(a) ? a.filter((e) => Array.isArray(e) && typeof e[0] === 'number' && typeof e[1] === 'string') : [];
+    } catch (e) { return []; }
+  }
+  function reqLogAdd(ls, kind, now) {
+    if (!ls) return false;
+    const t = now == null ? Date.now() : now;
+    const a = reqLogRead(ls).filter((e) => t - e[0] <= 24 * 3600e3).slice(-499);
+    a.push([t, kind]);
+    try { ls.setItem(REQ_KEY, JSON.stringify(a)); return true; } catch (e) { return false; }
+  }
+  /* Counts in the last 10 and 60 minutes and 24 hours. `site` is pages plus
+   * search fetches; `desc` is the description host, counted apart. */
+  function reqLogSummary(log, now) {
+    const t = now == null ? Date.now() : now;
+    const win = (min) => {
+      const o = { site: 0, desc: 0 };
+      for (const [at, kind] of log) if (t - at >= 0 && t - at <= min * 60e3) o[kind === 'desc' ? 'desc' : 'site']++;
+      return o;
+    };
+    const s = { last10min: win(10), last60min: win(60), last24h: win(1440) };
+    s.firstMinAgo = log.length ? Math.round((t - log[0][0]) / 60e3) : null;
+    if (s.last60min.site >= 45) {
+      s.warn = 'near the wall: ' + s.last60min.site + ' site requests in 60 min, and the wall was measured near 50-60 in one session (SKILL.md step 2)';
+    }
+    return s;
+  }
+  /* @shared:reqLog:end */
+
   /* Recursive walk THROUGH shadow roots. See failure 3 above. */
   function walk(root, fn) {
     let els;
@@ -433,6 +477,49 @@ function wallVerdict(sig) {
     return out;
   }
 
+  /* Mouse sensor codes: "PAW3311", "PMW3389", "Pixart 3395". Measured
+   * 2026-11-09 on 1005009916144912 (SMAILWOLF RS7): the selected option was
+   * "RS7 Black" ($13.39), the spec row "Sensor model" said "Pixart 3311
+   * (12000 DPI|300 IPS|35G)", and that option's own photo said PAW3111.
+   * Another option was named "RS7 Black PAW3311" ($18.67). The check above
+   * compares V, W, A, RPM and mAh only, so nothing warned, and only reading
+   * the photos found it. Only the 4 digits are compared: a "PAW3395SE"
+   * option against a "Pixart 3395" row says nothing. */
+  const SENSOR_RE = /(?:PAW|PMW|PIXART|PIX)[\s-]*(\d{4})(?!\d)/gi;
+  function sensorsOf(text, bare) {
+    const out = new Set();
+    for (const m of String(text || '').matchAll(SENSOR_RE)) out.add(m[1]);
+    // A row named for the sensor may give the number alone ("3311").
+    if (bare) for (const m of String(text || '').matchAll(/(?<!\d)(3\d{3})(?!\d)/g)) out.add(m[1]);
+    return [...out];
+  }
+  /* { option, row, value, why } per conflict. why 'differs': the selected
+   * option names a sensor and a row named for the sensor names another.
+   * why 'other-option' (the RS7 case): no selected option names a sensor,
+   * and the row names the sensor that an option NOT selected names (`other`).
+   * The table is one set of rows for the whole listing. */
+  function sensorConflicts(selected, variants, rows) {
+    const out = [];
+    const sel = selected || [];
+    const anyNamed = sel.some((o) => sensorsOf(o, false).length);
+    for (const [row, value] of Object.entries(rows || {})) {
+      if (!/sensor/i.test(row)) continue;
+      const theirs = sensorsOf(value, true);
+      if (!theirs.length) continue;
+      for (const option of sel) {
+        const mine = sensorsOf(option, false);
+        if (mine.length) {
+          if (!mine.some((c) => theirs.includes(c))) out.push({ option, row, value, why: 'differs' });
+          continue;
+        }
+        if (anyNamed) continue;
+        const other = (variants || []).find((v) => !sel.includes(v) && sensorsOf(v, false).some((c) => theirs.includes(c)));
+        if (other) out.push({ option, row, value, why: 'other-option', other });
+      }
+    }
+    return out;
+  }
+
   /* "US $8.99", "₪6.38", "1,234.50 €" as a number. The last separator is the
    * decimal mark only when one or two digits follow it. */
   function priceNumber(text) {
@@ -557,6 +644,7 @@ function wallVerdict(sig) {
   // Reviews too: buyers' text, pooled across sellers (see zone()).
   const FOREIGN_ZONE = /^(carousel|footer|menu|reviews)$/;
   const RECORD_PREFIX = '__aeDet:';
+  const lsOf = () => { try { return window.localStorage || null; } catch (e) { return null; } };
   // A capture() record younger than this is this run's (see sendAll()).
   const RECENT_HOURS = 8;
   function leavesOf(root, seenLeaf, out) {
@@ -895,6 +983,7 @@ function wallVerdict(sig) {
       }
       const u = descriptionUrl();
       if (!u) return { source: 'missing', text: '', leaves: [], images: [] };
+      reqLogAdd(lsOf(), 'desc');
       try {
         const res = await window.fetch(u);
         const html = await res.text();
@@ -1052,6 +1141,14 @@ function wallVerdict(sig) {
         SOLD_RE.source.replace('(?:נמכר|sold)', '(?:נמכר|sold|sales)'), 'i');
       const sold = body.match(HEAD);
       const id = (String(location.pathname || '').match(/(\d+)\.html/) || [])[1] || null;
+      /* A read with no description (skipped on a new page, failed, missing)
+       * keeps the description images of this listing's earlier record:
+       * capturing again used to replace them with none (2026-11-09, see
+       * read()). descriptionKeptFrom names that record's capture time. */
+      let prevRec = null;
+      try { prevRec = JSON.parse(window.localStorage.getItem(RECORD_PREFIX + id)); } catch (e) { prevRec = null; }
+      const descRead = r.description && (r.description.source === 'rendered' || r.description.source === 'fetched');
+      const kept = !descRead && prevRec && Array.isArray(prevRec.descriptionImages) && prevRec.descriptionImages.length ? prevRec : null;
       const rec = {
         id,
         // When it was captured: sendAll() sends only this run's records (see there).
@@ -1079,7 +1176,8 @@ function wallVerdict(sig) {
         specs: r.specs,
         specsSource: r.specsSource,
         gallery: r.gallery,
-        descriptionImages: r.descriptionImages,
+        descriptionImages: kept ? kept.descriptionImages : r.descriptionImages,
+        ...(kept ? { descriptionKeptFrom: typeof kept.capturedAt === 'number' ? kept.capturedAt : null } : {}),
         detail: r,
       };
       let saved = false, err = null;
@@ -1094,9 +1192,17 @@ function wallVerdict(sig) {
         selected: rec.selected.map((v) => v.slice(0, 24)).slice(0, 4), optionCount: rec.options.length,
         store: rec.store ? rec.store.slice(0, 40) : null,
         specRows: Object.keys(rec.specs).length, specsSource: rec.specsSource, description: r.description.source,
-        gallery: r.galleryCount, descriptionImages: r.descriptionImages.length, visibility: r.visibility,
+        gallery: r.galleryCount, descriptionImages: rec.descriptionImages.length, visibility: r.visibility,
         warnings: r.warnings.map((w) => w.split(':')[0]) };
       if (err) brief.err = err;
+      // The description of an earlier read: in this document, or the record's.
+      if (r.description.reused) brief.descriptionReused = true;
+      if (kept) brief.descriptionKept = true;
+      // Site requests of the last 60 min in this browser (see requests()).
+      const req = reqLogSummary(reqLogRead(lsOf()));
+      brief.siteRequests60m = req.last60min.site;
+      // A flag, not the sentence: the summary must stay under 1,000 characters.
+      if (req.warn) brief.nearWall = true;
       // More tiles than names: some share a name (see options() and pick(name, n)).
       if (rec.optionTiles !== rec.options.length) brief.optionTiles = rec.optionTiles;
       // A selected tile that shares its name: its n, the one pick(name, n) took.
@@ -1421,6 +1527,14 @@ function wallVerdict(sig) {
                         c.row.slice(0, 40) + '": ' + String(c.value).slice(0, 40) + '. The table is one set of rows for the ' +
                         'whole listing and may describe another option. Read the option\'s own image (`selectedImages`).');
         });
+        sensorConflicts(selectedVariants, variants, specs.rows).slice(0, 3).forEach((c) => {
+          const row = '"' + c.row.slice(0, 30) + '": ' + String(c.value).slice(0, 40);
+          warnings.push('specs-vs-option: ' + (c.why === 'differs'
+            ? 'the selected option "' + c.option.slice(0, 40) + '" names another sensor than spec row ' + row + '.'
+            : 'spec row ' + row + ' names the sensor of another option, "' + String(c.other).slice(0, 40) + '". The selected option "' +
+              c.option.slice(0, 40) + '" names no sensor and may have another one.') +
+            ' Read the option\'s own image (`selectedImages`) before quoting the sensor.');
+        });
         /* A list that is cut says so. `gallery` stopped at 20 with no warning, and
          * on 2026-11-01 a 22-image listing lost two option images. Images and
          * options are now returned whole; these line lists keep their caps. */
@@ -1504,7 +1618,8 @@ function wallVerdict(sig) {
           descriptionImages,
           // Big images that are NOT this product, counted by where they sat.
           excludedImages: excluded,
-          description: { source: desc.source, textLen: desc.text.length, imageCount: descriptionImages.length },
+          description: Object.assign({ source: desc.source, textLen: desc.text.length, imageCount: descriptionImages.length },
+            desc.reused ? { reused: true } : {}),
           text: joined.text,
           textCut: joined.cut,
           // Loud, because both halves were skipped in the failure this file exists for.
@@ -1515,17 +1630,71 @@ function wallVerdict(sig) {
       };
 
       const none = (source) => ({ source, text: '', leaves: [], images: [] });
+      /* The description is one per listing, not per option. Measured
+       * 2026-11-09 (Baseus F01B): pick() then capture({ description: false })
+       * on the same page saved a record with no description images, over a
+       * record that had 14. So read({ description: false }) on a page whose
+       * description was read before, in this document, uses that read again
+       * (description.reused: true) and fetches nothing. */
+      const path = String(location.pathname || '');
       if (opts.description === false) {
-        this.last = build(none('skipped'));
+        const c = this.descCache;
+        this.last = build(c && c.path === path ? Object.assign({}, c.desc, { reused: true }) : none('skipped'));
         return this.last;
       }
       this.last = build(none('pending'));
       const desc = await this.description();
+      if (desc.source === 'rendered' || desc.source === 'fetched') this.descCache = { path, desc };
       this.last = build(desc);
       return this.last;
+    },
+
+    // The last description read in this document: { path, desc } (see read()).
+    descCache: null,
+
+    /* The spec rows of the last read() as one line under the Chrome
+     * connector's 1,000 characters: "Name: value / Name: value".
+     * Never "name=value; name=value". Measured 2026-11-09 (Chrome connector,
+     * on example.com): a result holding two name=value pairs joined by ";"
+     * or "&" came back as [BLOCKED: Cookie/query string data], with or
+     * without spaces around "=" ("a=b; c=d", "a = b; c = d", "x=1&y=2"). One
+     * pair ("price=3.84"), or pairs joined by a space, a comma, a new line
+     * or " / " came back, and so did "a: b; c: d". So a ";" or "&" inside a
+     * name or a value becomes ",". The rows SKIP names (brand, origin,
+     * package, chemical) are left out unless opts.all. opts.max (default
+     * 990) cuts the line at a whole row, and the end says how many it kept. */
+    specLine(opts) {
+      opts = opts || {};
+      const r = this.last;
+      if (!r || !r.specs) return 'no rows: await __aeListing.read() first';
+      const SKIP = /^(brand name|origin|package|hi(?:gh|gn)-concerned chemical)$/i;
+      const safe = (s) => String(s).replace(/[;&]/g, ',').replace(/\s+/g, ' ').trim();
+      const rows = Object.entries(r.specs).filter(([k]) => opts.all || !SKIP.test(k)).map(([k, v]) => safe(k) + ': ' + safe(v));
+      if (!rows.length) return 'no rows (specsSource ' + r.specsSource + ')';
+      const max = opts.max || 990;
+      let line = '', kept = 0;
+      for (const row of rows) {
+        const next = line ? line + ' / ' + row : row;
+        if (next.length > max - 30) break;
+        line = next; kept++;
+      }
+      return kept < rows.length ? line + ' ... cut: ' + kept + ' of ' + rows.length + ' rows' : line;
+    },
+
+    /* The site requests this browser made, from the shared log (see
+     * reqLog): pages with a skill script installed, search fetches and
+     * description fetches, in the last 10 and 60 minutes and 24 hours, with
+     * a `warn` from 45 site requests in 60 minutes. The same numbers as
+     * __aeHarvest.requests(). */
+    requests() {
+      return reqLogSummary(reqLogRead(lsOf()));
     },
   };
 
   window.__aeListing = L;
+  /* This page load, once per document, in the shared request log. A flag on
+   * `window` and not in storage: a navigation clears it, a second install
+   * on the same page (or harvest.js beside this file) does not count twice. */
+  if (!window.__aeReqPage) { window.__aeReqPage = true; reqLogAdd(lsOf(), 'page'); }
   return 'aeListing ready — await __aeListing.read() returns text AND images together';
 })()

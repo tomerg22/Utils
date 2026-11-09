@@ -18,6 +18,9 @@
 
 #include <libusb.h>
 #include <libuvc/libuvc.h>
+/* For devh->info->stream_ifs: libuvc's public API lists the formats of the first streaming
+ * interface only (uvc_get_format_descs). */
+#include <libuvc/libuvc_internal.h>
 
 #define TAG "usbcamera"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -98,7 +101,9 @@ static int decode_yuyv(camera *cam, const uvc_frame_t *frame) {
     }
     const uint8_t *s = frame->data;
     uint8_t *d = cam->rgba;
-    for (size_t i = 0; i < need; i += 4, d += 8) {
+    /* Whole 4-byte pairs only: with an odd width * height, need is not a multiple of 4, and a
+     * last partial pair would read past the frame and write 4 bytes past rgba. */
+    for (size_t i = 0; i + 4 <= need; i += 4, d += 8) {
         int u = s[i + 1] - 128, v = s[i + 3] - 128;
         int r = 409 * v + 128, g = -100 * u - 208 * v + 128, b = 516 * u + 128;
         for (int k = 0; k < 2; k++) {
@@ -169,32 +174,37 @@ Java_com_tomerg_usbcamera_UvcCamera_open(JNIEnv *env, jclass cls, jint fd) {
 }
 
 /* Writes {kind, width, height, fps} for each MJPEG or YUYV frame size into out (when not NULL),
- * at the size's highest frame rate. Returns the number of ints. */
+ * at the size's highest frame rate. Returns the number of ints. Reads every streaming interface,
+ * as uvc_get_stream_ctrl_format_size searches them all. A camera with none has no modes. */
 static int list_modes(camera *cam, jint *out) {
     int n = 0;
-    for (const uvc_format_desc_t *fmt = uvc_get_format_descs(cam->devh); fmt; fmt = fmt->next) {
-        int kind;
-        if (fmt->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG)
-            kind = KIND_MJPEG;
-        else if (fmt->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED
-                 && uvc_frame_format_for_guid((uint8_t *) fmt->guidFormat) == UVC_FRAME_FORMAT_YUYV)
-            kind = KIND_YUYV;
-        else
-            continue;
-        for (const uvc_frame_desc_t *fr = fmt->frame_descs; fr; fr = fr->next) {
-            /* Discrete intervals come as a zero-terminated list, continuous ones as min / max. */
-            uint32_t shortest = fr->intervals ? 0 : fr->dwMinFrameInterval;
-            for (const uint32_t *iv = fr->intervals; iv && *iv; iv++)
-                if (!shortest || *iv < shortest) shortest = *iv;
-            if (!shortest) continue;
-            if (out) {
-                out[n] = kind;
-                out[n + 1] = fr->wWidth;
-                out[n + 2] = fr->wHeight;
-                /* The same rounding uvc_get_stream_ctrl_format_size matches against. */
-                out[n + 3] = (jint) (10000000 / shortest);
+    for (const uvc_streaming_interface_t *sif = cam->devh->info->stream_ifs; sif; sif = sif->next) {
+        for (const uvc_format_desc_t *fmt = sif->format_descs; fmt; fmt = fmt->next) {
+            int kind;
+            if (fmt->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG)
+                kind = KIND_MJPEG;
+            else if (fmt->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED
+                     && uvc_frame_format_for_guid((uint8_t *) fmt->guidFormat) == UVC_FRAME_FORMAT_YUYV)
+                kind = KIND_YUYV;
+            else
+                continue;
+            for (const uvc_frame_desc_t *fr = fmt->frame_descs; fr; fr = fr->next) {
+                /* YUYV packs two pixels in 4 bytes, so an odd width is not a valid YUYV frame. */
+                if (kind == KIND_YUYV && fr->wWidth % 2) continue;
+                /* Discrete intervals come as a zero-terminated list, continuous ones as min / max. */
+                uint32_t shortest = fr->intervals ? 0 : fr->dwMinFrameInterval;
+                for (const uint32_t *iv = fr->intervals; iv && *iv; iv++)
+                    if (!shortest || *iv < shortest) shortest = *iv;
+                if (!shortest) continue;
+                if (out) {
+                    out[n] = kind;
+                    out[n + 1] = fr->wWidth;
+                    out[n + 2] = fr->wHeight;
+                    /* The same rounding uvc_get_stream_ctrl_format_size matches against. */
+                    out[n + 3] = (jint) (10000000 / shortest);
+                }
+                n += 4;
             }
-            n += 4;
         }
     }
     return n;

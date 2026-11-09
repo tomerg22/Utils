@@ -49,8 +49,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private UsbManager usb;
     private VideoView video;
     private TextView status;
-    /** Opens and closes the camera: libuvc's control transfers block, so not on the UI thread. */
-    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    /**
+     * Opens and closes the camera: libuvc's control transfers block, so not on the UI thread.
+     * Static, so one thread serves every instance: when the activity is recreated (a config
+     * change it does not handle, or Back then a relaunch), the new instance's open waits for the
+     * old instance's close instead of racing it for the USB interfaces and the native globals.
+     */
+    private static final ExecutorService WORKER = Executors.newSingleThreadExecutor();
 
     // UI thread
     private boolean resumed, askedCamera, askedUsb;
@@ -182,7 +187,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onDestroy() {
         super.onDestroy();
         unregisterReceiver(usbReceiver);
-        worker.shutdown();
     }
 
     @Override
@@ -234,14 +238,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         deviceName = name;
         show("Opening " + name + "…");
         int[] want = Modes.parse(getIntent().getStringExtra("mode"));
-        worker.execute(() -> open(found, name, want));
+        WORKER.execute(() -> open(found, name, want));
     }
 
     private void stopCamera() {
         if (device == null) return;
         device = null;
         mode = null;
-        worker.execute(this::close);
+        WORKER.execute(this::close);
     }
 
     /** Worker thread. */

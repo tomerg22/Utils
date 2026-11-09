@@ -56,6 +56,25 @@ public final class Modes {
         return (m[0] == MJPEG ? "MJPEG " : "YUYV ") + m[1] + "×" + m[2] + " " + m[3] + " fps";
     }
 
+    /** The list for a mode picker: MJPEG first, then larger frames, then higher frame rates. */
+    public static int[][] sorted(int[] flat) {
+        int[][] out = new int[count(flat)][];
+        for (int i = 0; i < out.length; i++) out[i] = get(flat, i);
+        Arrays.sort(out, (a, b) -> {
+            int c = Boolean.compare(b[0] == MJPEG, a[0] == MJPEG);
+            if (c == 0) c = Long.compare(area(b), area(a));
+            if (c == 0) c = Integer.compare(b[1], a[1]);
+            if (c == 0) c = Integer.compare(b[3], a[3]);
+            return c;
+        });
+        return out;
+    }
+
+    /** The form parse reads. */
+    public static String format(int[] m) {
+        return m[0] + "," + m[1] + "," + m[2] + "," + m[3];
+    }
+
     /** Parses "kind,width,height,fps" (the launch intent's mode extra). Null when s is null or not four integers. */
     public static int[] parse(String s) {
         if (s == null) return null;

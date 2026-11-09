@@ -108,7 +108,19 @@ public class ModesTest {
         check(Modes.label(mode(M, 1280, 720, 30)).equals("MJPEG 1280×720 30 fps"), "MJPEG label");
         check(Modes.label(mode(Y, 640, 480, 30)).equals("YUYV 640×480 30 fps"), "YUYV label");
 
-        System.out.println(checks + " checks, " + failures + " failures");
+        // The saved pick: format is what parse reads.
+        for (int[] m : all) check(Arrays.equals(Modes.parse(Modes.format(m)), m), "format then parse " + Arrays.toString(m));
+
+        // The picker's list: MJPEG first, then larger, then wider, then faster; nothing lost.
+        int[] picker = flat(mode(Y, 640, 480, 30), mode(M, 640, 480, 30), mode(M, 1920, 1080, 30),
+                mode(M, 1280, 720, 60), mode(M, 1280, 720, 30), mode(Y, 1280, 720, 10), mode(M, 720, 1280, 30));
+        int[][] want = {mode(M, 1920, 1080, 30), mode(M, 1280, 720, 60), mode(M, 1280, 720, 30),
+                mode(M, 720, 1280, 30), mode(M, 640, 480, 30), mode(Y, 1280, 720, 10), mode(Y, 640, 480, 30)};
+        int[][] got = Modes.sorted(picker);
+        check(Arrays.deepEquals(got, want), "sorted: " + Arrays.deepToString(got));
+        check(Modes.sorted(new int[0]).length == 0, "sorted: empty");
+
+        System.out.println("ModesTest: " + checks + " checks, " + failures + " failures");
         if (failures > 0) System.exit(1);
     }
 }

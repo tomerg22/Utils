@@ -28,20 +28,62 @@ camera, libuvc gives them back to `uvcvideo`.
   manifest also offers the app when a camera is plugged in; choosing it grants USB access.
 - **Mode**: the first match of: 25 fps or more, then MJPEG before YUYV, then at most 1080p, then
   the larger picture, then the higher frame rate. The HD Camera starts in MJPEG 1280×720 30 fps.
+  **Mode** on the button bar lists the camera's modes (each frame size at its highest frame
+  rate) and "Auto". The choice is saved per camera model (USB vendor and product ID).
 - **Picture**: MJPEG frames are decoded with `AImageDecoder` (Android 11+), YUYV is converted in
-  C. Frames go to a `SurfaceView` that keeps the camera's aspect ratio. The system bars stay
-  visible.
+  C. Frames go to a `TextureView`. One matrix places them: turned, mirrored, fitted with the
+  camera's aspect ratio, then zoomed and moved. The system bars stay visible.
+- **Buttons**: Photo, Mode, Adjust, Rotate, Mirror, at the bottom. A tap on the picture hides or
+  shows them.
+- **Rotate and Mirror**: a quarter turn clockwise; left and right swapped. Both are saved per
+  camera model, since they follow how the camera is mounted.
+- **Zoom**: pinch to zoom (up to 8×), drag to move, double tap to zoom out. The picture's edges
+  stay at the screen's edges. Done on the phone's GPU, so it works with any camera. Not saved.
+- **Photo**: saves the last decoded frame as a JPEG (quality 95) to `Pictures/USB Camera` in
+  the phone's shared storage, where the Gallery finds it. At the camera's full frame size,
+  turned and mirrored as on screen, without the zoom. No storage permission is needed (the app
+  writes its own files through `MediaStore`).
+- **Adjust**: the camera's own settings (UVC controls), as sliders and switches: auto exposure,
+  exposure, gain, brightness, contrast, saturation, hue, sharpness, gamma, backlight
+  compensation, auto white balance, white balance, power line frequency, autofocus, focus and
+  the camera's own zoom. **Each camera lists the controls it has** (in its USB descriptor, the
+  `bmControls` bits of its camera terminal and processing unit). The app shows only those, and
+  only when the camera also answers the range requests for them. A fixed-focus camera has no
+  focus slider. A camera with none shows "This camera has no settings the app can change". An
+  auto switch greys out the slider it drives (exposure, white balance, focus). "Reset to
+  defaults" sets every control to the camera's own default. The values live in the camera, so
+  the app does not save them; a camera may reset them when unplugged. The log lists each
+  camera's controls when it opens (`HD Camera controls: ...`).
 - **Status line**: camera, mode and frames shown per second. It hides after 4 s of frames and
-  comes back when frames stop. A tap on it retries after an error; nothing else takes taps.
+  comes back when frames stop. A tap on it retries after an error.
 - **Watchdog**: with no frame for 3 s, the app closes and opens the camera again.
-- **Forced mode** (kind 0 = MJPEG, 1 = YUYV, then width, height, fps):
+- **Forced mode**, for one launch, ahead of the saved choice (kind 0 = MJPEG, 1 = YUYV, then
+  width, height, fps):
 
   ```bash
   adb shell am start -n com.tomerg.usbcamera/.MainActivity --es mode 1,640,480,20
   ```
 
 `app/jni/usbcamera.c` is the native side, `UvcCamera.java` its JNI bridge, `Modes.java` the
-mode choice, `MainActivity.java` the rest.
+mode choice, `Picture.java` the picture's placement, `Controls.java` the control list,
+`MainActivity.java` the rest.
+
+### UVC controls
+
+The native side sends the control requests itself (`libusb_control_transfer` with a 1 s
+timeout), not through libuvc's control functions, which wait forever. The control table in
+`usbcamera.c` takes its bit numbers, sizes and requests from the Linux `uvcvideo` driver's
+control table (`drivers/media/usb/uvc/uvc_ctrl.c`):
+
+- Range controls answer `GET_MIN`, `GET_MAX`, `GET_RES`, `GET_DEF`, `GET_CUR`. Brightness and
+  hue are signed.
+- Switches (auto white balance, autofocus) and power line frequency answer only `GET_DEF` and
+  `GET_CUR`. Power line frequency offers off, 50 Hz and 60 Hz, plus auto when the camera is
+  UVC 1.5. A camera may refuse some of these values; the app then says so and shows the value
+  the camera kept.
+- Auto exposure answers `GET_RES` with the modes the camera has. "On" sets the camera's default
+  mode if it is an auto mode, else aperture priority (automatic exposure time), else full auto.
+  "Off" sets manual.
 
 ### Build
 
@@ -135,14 +177,75 @@ all 11. A close after an unplug logs no libusb error.
 ./tests/run.sh
 ```
 
-Plain JDK, no SDK. Checks which mode `Modes.pick` starts a camera in for webcam-like mode
-lists, in both list orders. Checks that the ranking is a strict order (so the list order cannot
-change the pick), and the parsing of the forced mode (327 checks). Mutation-checked: removing
-the 25 fps rule, the MJPEG preference or the 1080p cap, preferring larger frames above 1080p or
-lower frame rates, ignoring the forced mode, a 26 fps threshold, or a looser parse each make it
-fail.
+Plain JDK, no SDK. Three test classes:
 
-### Tested on the phone (2026-11-08)
+- `ModesTest` (340 checks): which mode `Modes.pick` starts a camera in for webcam-like mode
+  lists, in both list orders; that the ranking is a strict order (so the list order cannot
+  change the pick); the parsing of the forced mode; the saved form of a picked mode; the mode
+  picker's order. Mutation-checked: removing the 25 fps rule, the MJPEG preference or the 1080p
+  cap, preferring larger frames above 1080p or lower frame rates, ignoring the forced mode, a
+  26 fps threshold, or a looser parse each make it fail.
+- `PictureTest` (372 checks): where each corner of the frame lands for all 4 turns, with and
+  without mirror; that the scale is the same both ways (aspect ratio); that the TextureView
+  matrix lands 20 random frame points where `Picture.map` says, for each turn, mirror, zoom and
+  pan; that the pinch point stays put; the zoom limits; that a drag stops when an edge reaches
+  the screen's edge; that nothing becomes NaN before the first frame.
+- `ControlsTest` (5824 checks): reads `control_table` from `usbcamera.c` and checks each row's
+  selector, unit, bit, size and kind against the Java ids and the Linux driver's bit numbers;
+  the auto switch links; value texts; that every slider position maps to a value on the
+  camera's step grid and back.
+
+17 deliberate bugs in `Picture`, `Controls`, `Modes` and the C table (a swapped turn, mirror
+before the turn, no stretch undo, no clamp, zoom ignoring the pinch point, two swapped C rows, a
+wrong bit, hue unsigned, and others) each make it fail.
+
+```bash
+./tests/native.sh
+```
+
+Compiles `app/jni/usbcamera.c` on the build machine with stub Android headers
+(`tests/native/stubs`) and a fake camera behind `libusb_control_transfer`, and runs
+`tests/native/harness.c` twice: with AddressSanitizer and UndefinedBehaviorSanitizer, then with
+ThreadSanitizer (107 checks each). Needs clang, a JDK (for `jni.h`) and `third_party/` from a
+first `./build.sh`. Checks the control list (declared and answering controls only; a stalling,
+a short and an empty-range control are left out; undeclared controls are never asked), signed
+and 4-byte values, the auto exposure modes for 7 mode sets, refused values and missing units,
+the 1 s timeout on every transfer, the snapshot copy (row stride, size and format checks, no
+snapshot after a bad frame) and the drawing on the window. A thread decoding frames while
+another takes snapshots runs under ThreadSanitizer. 17 deliberate bugs (no frame lock in the
+snapshot or the frame callback, stride ignored, signed read as unsigned, big-endian values,
+`bmControls` ignored or off by one bit, no timeout, the wrong auto exposure mode, and others)
+each make it fail.
+
+### Tested on the phone (2026-11-09, the features above)
+
+By hand, from 20:15 to 20:21 Israel time. Results from the app's log.
+
+- **HD Camera controls**: 13. Auto exposure, exposure (1 to 250 ms), gain, brightness,
+  contrast, saturation, hue, sharpness, gamma, backlight compensation, auto white balance, white
+  balance (2800 to 6500 K), power line frequency (off, 50 Hz, 60 Hz). The camera declares no
+  focus and no zoom, so the panel has no autofocus, focus or zoom row.
+- **Photo**: two photos, 1280×720 JPEG, in `Pictures/USB Camera`. The first one matched the
+  screen.
+- **Mode**: the picker switched to YUYV 640×480, MJPEG 640×480 and MJPEG 1280×720. Each pick
+  reopened the camera in that mode.
+- **Adjust**: gain, brightness, sharpness, gamma and backlight compensation were changed. After a
+  reopen the camera read back the new values (gain 5, brightness 172, sharpness 6, gamma 137,
+  backlight 1). "Reset to defaults" brought back gain 4, brightness 128, sharpness 2, gamma 120
+  and backlight 0.
+- **Rotate, Mirror, pinch zoom**: reported working by the person testing. They write nothing to
+  the log, and no screenshot was taken with them on.
+- **Screen rotation** with the `TextureView`, through `adb shell cmd window user-rotation lock
+  1`, then `3`, then `0`. Same process, no reopen of the camera, and the frame rate did not
+  change. In both landscape rotations the picture was upright, 16:9 (1442×812 of 2000×900 in
+  the screenshot) and below the status bar.
+- **10 fps**: the camera sent 10 frames a second in every mode tried, including YUYV 640×480 (a
+  20 fps mode). Received always equalled shown, so the app dropped nothing. The committed build
+  without these features (c0f80c6), run 5 minutes later in the same place, also got 10 fps, so
+  the new code did not cause it. On 2026-11-08 the camera sent 30 fps. Cause not found. Guess,
+  not tested: auto exposure lowers the frame rate in a dark room.
+
+### Tested on the phone (2026-11-08, build a087ff9, before the features above)
 
 - **Unplug and plug in while the app runs** (by hand, twice). On unplug, the status line showed
   "Plug in a USB camera." 8 to 33 ms after the system removed the camera. On plug-in, the phone
@@ -166,6 +269,10 @@ fail.
 
 ### Not tested
 
+- The `TextureView` at 30 fps: the camera sent only 10 fps during the 2026-11-09 test.
+- Whether auto exposure off, or more light, brings back 30 fps.
+- A photo with Rotate or Mirror on (the turn and mirror in the saved file).
+- The replug and watchdog tests of 2026-11-08 with the `TextureView` build.
 - A real stall (ENOMEM) reaching the watchdog. The watchdog test cancelled transfers instead.
 - Plugging the camera in when the app is not its default (the USB access dialog and the offer
   to open the app), or while the app is not running.

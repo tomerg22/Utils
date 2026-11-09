@@ -163,8 +163,10 @@ a Mi account), tests and the sweep tool.
 Android app that shows a UVC camera plugged into the phone's USB port, on a
 phone whose camera service does not support USB cameras (POCO X6 Pro, HyperOS
 3.0). Runs libuvc on libusb over the file descriptor from Android's
-`UsbManager`, decodes MJPEG with `AImageDecoder`. Java plus C, built with
-`build.sh` (no Gradle), which fetches libusb and libuvc at pinned commits.
+`UsbManager`, decodes MJPEG with `AImageDecoder`. Photo to the Gallery, mode
+picker, the camera's own UVC controls (only those it has), rotate, mirror and
+pinch zoom. Java plus C, built with `build.sh` (no Gradle), which fetches libusb
+and libuvc at pinned commits.
 
 See `usb-camera-viewer/README.md` for build, install over Wireless debugging,
 the USB transfer-size limit found on this phone, tests and what is not tested.

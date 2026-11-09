@@ -23,7 +23,8 @@
  *   __aeListing.options()     // the option tiles, with `image` on an image tile;
  *                             // pick('12CM') selects one by exact name
  *   __aeListing.price()       // the price on screen, for the options selected now
- *   __aeListing.sendAll(8765) // every captured record to receiver.mjs (navigates)
+ *   __aeListing.sendAll(8765, {token: '<token>'}) // this run's captured records to
+ *                             // receiver.mjs (navigates); the token is in its "listening" line
  *
  * The Chrome connector cuts a result at 1,000 characters, so there keep the
  * result on window (`window.__r = await __aeListing.read()`) and return the
@@ -297,7 +298,18 @@ function wallVerdict(sig) {
    *                to ANOTHER item: the store's own list has hashed class names
    *                (_1nZuI inside card-out-wrapper) and gave "ACP14025 ... 140x140x25mm"
    *   footer       footer-copywrite: the business-licence badge
-   *   menu         Categoey--: the category menu icons */
+   *   menu         Categoey--: the category menu icons
+   *   reviews      #nav-review (class review--wrap--), the review items
+   *                (list--itemBox--) and the buyer photo strip
+   *                (list-customer-show--). Measured live 2026-11-09 on
+   *                he.aliexpress.com/item/1005005994445557: the reviews' own
+   *                "View more" opens a comet-v2-modal OUTSIDE #nav-review, and
+   *                its items carry list--itemBox-- there too. Review text is
+   *                pooled across other sellers' similar items ("Reviews
+   *                displayed are from various sellers"), and that page held
+   *                "MacBook זיהה אותו כ-65W ו-20V": a buyer's reading, which
+   *                ratingLines took as this listing's rating. Not reviewer--
+   *                (the header's rating and sold count beside the title). */
   const itemIdOf = (u) => (String(u || '').match(/\/item\/(\d+)\.html/) || [])[1] || null;
   function zone(e) {
     let n = e, d = 0;
@@ -311,6 +323,7 @@ function wallVerdict(sig) {
       }
       if (/(^|\s)main-image--/.test(c)) return 'product';
       if (id === 'nav-description' || /(^|\s)description--wrap/.test(c)) return 'description';
+      if (id === 'nav-review' || /(^|\s)(review--wrap|list--itemBox|list-customer-show)--/.test(c)) return 'reviews';
       if (/(^|\s)slick-(slide|track|list)\b|recommend|(^|\s)(fusion-page-card|productItem)--|(^|\s)(cross-link|card-out-wrapper)\b/i.test(c)) return 'carousel';
       if (/(^|\s)footer/i.test(c)) return 'footer';
       if (/(^|\s)Categoey--|(^|\s)category/i.test(c)) return 'menu';
@@ -541,8 +554,11 @@ function wallVerdict(sig) {
   };
   // Zones that hold OTHER products: their titles are never this listing's
   // size lines (a carousel of "Mouse Pad Size 80x30cm" filled all 10 slots).
-  const FOREIGN_ZONE = /^(carousel|footer|menu)$/;
+  // Reviews too: buyers' text, pooled across sellers (see zone()).
+  const FOREIGN_ZONE = /^(carousel|footer|menu|reviews)$/;
   const RECORD_PREFIX = '__aeDet:';
+  // A capture() record younger than this is this run's (see sendAll()).
+  const RECENT_HOURS = 8;
   function leavesOf(root, seenLeaf, out) {
     walk(root, (e) => {
       if (!isLine(e)) return;
@@ -801,7 +817,10 @@ function wallVerdict(sig) {
 
   const L = {
     /* Click every "show more" so collapsed description text is in the DOM.
-     * Returns how many were clicked. Safe to call repeatedly. */
+     * Returns how many were clicked. Safe to call repeatedly. Not in a
+     * foreign zone: the reviews' "View more" opened a modal of pooled
+     * reviews over the page (measured live 2026-11-09), and a related-items
+     * one loads other products. */
     expand(limit) {
       let clicked = 0;
       const cap = limit == null ? 8 : limit;
@@ -810,6 +829,7 @@ function wallVerdict(sig) {
         if (e.children.length !== 0) return;
         const t = clean(e.textContent);
         if (!t || t.length > 24 || !SHOW_MORE.test(t)) return;
+        if (FOREIGN_ZONE.test(zone(e))) return;
         const target = e.closest && (e.closest('button,[role="button"],a,div') || e);
         try { target.click(); clicked++; } catch (err) { /* not clickable */ }
       });
@@ -1034,6 +1054,8 @@ function wallVerdict(sig) {
       const id = (String(location.pathname || '').match(/(\d+)\.html/) || [])[1] || null;
       const rec = {
         id,
+        // When it was captured: sendAll() sends only this run's records (see there).
+        capturedAt: Date.now(),
         url: 'https://he.aliexpress.com/item/' + id + '.html',
         title: (p && p.name) || clean(document.title),
         price: shown.value != null ? shown.value : ldPrice,
@@ -1083,7 +1105,29 @@ function wallVerdict(sig) {
       if (rec.soldOut.length) brief.soldOut = rec.soldOut.map((v) => v.slice(0, 24));
       // The first two: more than that would pass the 1,000 characters. All are in the record.
       if (rec.selectedImages.length) brief.selectedImages = rec.selectedImages.slice(0, 2).map((s) => s.image);
+      // Records left by an earlier run (over RECENT_HOURS old, or with no
+      // capture time): counted at every capture, so the first capture of a
+      // run shows them. sendAll() leaves them out.
+      const older = this.records().filter((x) => !x.recent).length;
+      if (older) brief.olderRecords = older;
       return brief;
+    },
+
+    /* Every captured record in this site's storage, each as
+     * { id, rec, capturedAt, recent }. recent: captured in the last
+     * RECENT_HOURS hours. A record with no capturedAt (listing.js before
+     * 2026-11-09) is not recent: its age is unknown. */
+    records(now) {
+      const t = now == null ? Date.now() : now;
+      const out = [];
+      for (const id of this.captured()) {
+        let rec = null;
+        try { rec = JSON.parse(window.localStorage.getItem(RECORD_PREFIX + id)); } catch (e) { rec = null; }
+        if (!rec || typeof rec !== 'object') continue;
+        const at = typeof rec.capturedAt === 'number' ? rec.capturedAt : null;
+        out.push({ id, rec, capturedAt: at, recent: at != null && t - at >= 0 && t - at <= RECENT_HOURS * 3600e3 });
+      }
+      return out;
     },
 
     /* The ids captured so far on this site. */
@@ -1099,17 +1143,43 @@ function wallVerdict(sig) {
       return out;
     },
 
-    /* Post every captured record to receiver.mjs, as one file rank.mjs reads.
-     * The same top-level form as __aeHarvest.send(port, {via:'form'}), so it
-     * NAVIGATES, to a dead port too: curl the receiver first. The records stay
-     * in localStorage until dropCaptured(), so a failed post loses nothing. */
-    sendAll(port) {
-      const items = this.captured().map((id) => JSON.parse(window.localStorage.getItem(RECORD_PREFIX + id)));
-      if (!items.length) return 'NOT DELIVERED: nothing captured yet';
+    /* Post this run's captured records to receiver.mjs, as one file rank.mjs
+     * reads. The same top-level form as __aeHarvest.send(port, {via:'form',
+     * token}), so it NAVIGATES, to a dead port too: curl the receiver first.
+     * The records stay in localStorage until dropCaptured(), so a failed post
+     * loses nothing.
+     *   opts.token  REQUIRED: the token in the receiver's "listening" line
+     *   opts.all    true: also the records of an earlier run
+     * THIS RUN ONLY (added 2026-11-09, review of 9e11593). Every __aeDet: key
+     * of the site used to be sent, and a record says nothing about its run, so
+     * the finalists of a run that ended before the cleanup (a charger search,
+     * say) were ranked with the next run's (fans) in rank.mjs --mode final,
+     * with no warning. Now a record carries capturedAt, and only the ones
+     * captured in the last RECENT_HOURS hours are sent. The others are named
+     * in the reply and stay saved. */
+    sendAll(port, opts) {
+      opts = opts || {};
+      const token = opts.token != null ? String(opts.token) : '';
+      if (!/^[0-9A-Za-z]{8,64}$/.test(token)) {
+        return 'NOT DELIVERED: ' + (token ? 'the token is not 8 to 64 letters or digits' : 'no token') +
+               '. Nothing was posted. Pass the token from the receiver\'s "listening" line: ' +
+               'sendAll(' + (port || 8765) + ', {token: \'<token>\'})';
+      }
+      const all = this.records();
+      const sent = opts.all ? all : all.filter((x) => x.recent);
+      const left = opts.all ? [] : all.filter((x) => !x.recent);
+      const leftText = left.length
+        ? ' Left out: ' + left.length + ' record(s) of an earlier run (' + left.slice(0, 5).map((x) => x.id + ' ' +
+            (x.capturedAt == null ? 'no capture time' : Math.round((Date.now() - x.capturedAt) / 3600e3) + ' h old')).join(', ') +
+            (left.length > 5 ? ', …' : '') + '): sendAll(' + (port || 8765) + ', {token, all: true}) sends them too, ' +
+            'and dropCaptured() removes every record.'
+        : '';
+      if (!sent.length) return 'NOT DELIVERED: nothing captured in the last ' + RECENT_HOURS + ' h' + (all.length ? '.' + leftText : ' (nothing captured yet)');
+      const items = sent.map((x) => x.rec);
       const body = JSON.stringify({ kind: 'details', source: 'listing', items });
       const url = 'http://127.0.0.1:' + (port || 8765) + '/harvest';
       const f = document.createElement('form');
-      f.method = 'POST'; f.action = url; f.enctype = 'text/plain';
+      f.method = 'POST'; f.action = url + '/' + token; f.enctype = 'text/plain';
       const ta = document.createElement('textarea');
       ta.name = 'payload'; ta.value = body;
       f.appendChild(ta);
@@ -1120,7 +1190,7 @@ function wallVerdict(sig) {
       return 'UNCONFIRMED: form-posted ' + items.length + ' records (' + body.length + ' chars) to ' + url +
              ' - delivered only if the receiver prints "saved <path>" (a details-<stamp>.json, for rank.mjs, never decode.mjs) in its own output.' +
              ' The records stay saved until dropCaptured(). This tab is now on the receiver: navigate back to https://he.aliexpress.com/' +
-             ' (the records are in that site\'s storage) before the next read or the cleanup.';
+             ' (the records are in that site\'s storage) before the next read or the cleanup.' + leftText;
     },
 
     dropCaptured() {

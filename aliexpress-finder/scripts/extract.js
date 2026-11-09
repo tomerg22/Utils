@@ -4,7 +4,7 @@
  * code without comments) as the `text` argument of javascript_tool. It
  * evaluates to a JSON string. The Chrome connector cuts that string at 1,000
  * characters, so the result also stays on `window.__aeExtract` (`.result`,
- * and `.send(port)` to post it to receiver.mjs); see the end of this file.
+ * and `.send(port, {token})` to post it to receiver.mjs); see the end of this file.
  *
  * TWO SOURCES, tried in order:
  *
@@ -376,18 +376,27 @@ function wallVerdict(sig) {
    * one is about 20,000 for 60 items, so the fallback could not be read
    * there (recheck 2026-10-18, F23). The result also stays on the window:
    * return pieces of __aeExtract.result, or post it all to receiver.mjs
-   * with __aeExtract.send(port) after the curl check. send() is the same
-   * top-level text/plain form POST as harvest.js send(port, {via: 'form'}),
+   * with __aeExtract.send(port, {token}) after the curl check. send() is the same
+   * top-level text/plain form POST as harvest.js send(port, {via: 'form', token}),
    * so it navigates, to a dead port too. Nothing is lost then: the items are
    * on the search page, so navigate back and run this file again. The
    * in-app browser reads the whole return value, as before. */
   try {
     window.__aeExtract = {
       result: out,
-      send(port) {
+      /* opts.token is required: the token in the receiver's "listening"
+       * line (receiver.mjs saves only at /harvest/<token>). Without it
+       * nothing is posted and the page does not navigate. */
+      send(port, opts) {
+        const token = opts && opts.token != null ? String(opts.token) : '';
+        if (!/^[0-9A-Za-z]{8,64}$/.test(token)) {
+          return 'NOT DELIVERED: ' + (token ? 'the token is not 8 to 64 letters or digits' : 'no token') +
+                 '. Nothing was posted. Pass the token from the receiver\'s "listening" line: ' +
+                 '__aeExtract.send(' + (port || 8765) + ', {token: \'<token>\'})';
+        }
         const url = 'http://127.0.0.1:' + (port || 8765) + '/harvest';
         const f = document.createElement('form');
-        f.method = 'POST'; f.action = url; f.enctype = 'text/plain';
+        f.method = 'POST'; f.action = url + '/' + token; f.enctype = 'text/plain';
         const ta = document.createElement('textarea');
         ta.name = 'payload'; ta.value = json;
         f.appendChild(ta);

@@ -376,6 +376,9 @@ const makeItem = (id, over = {}) => ({
 });
 const reply = (html, url = 'https://he.aliexpress.com/w/x.html') =>
   ({ url, text: async () => html });
+/* The receiver token every test send uses (receiver.mjs saves a payload only
+ * at /harvest/<token> since 2026-11-09). */
+const TK = 'testtoken42';
 /* localStorage stand-in: harvest.js saves its state there (2026-10-18). */
 const fakeStorage = () => {
   const m = new Map();
@@ -1422,7 +1425,7 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
   const { readdirSync, readFileSync: rf } = await import('node:fs');
   const dir = tmpDir('ae-recv-');
   const logs = [];
-  const recv = await startReceiver({ dir, port: 0, count: 1, idle: 30, log: (m) => logs.push(m) });
+  const recv = await startReceiver({ dir, port: 0, count: 1, idle: 30, log: (m) => logs.push(m), token: TK });
   ok('receiver picks an ephemeral port', recv.port > 0, String(recv.port));
 
   const src = RUN('harvest.js');
@@ -1434,7 +1437,7 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
   const H = win.__aeHarvest;
   H.start({ query: 'wire brush set' });
   await H.step(1);
-  const msg = await H.send(recv.port);
+  const msg = await H.send(recv.port, { token: TK });
   ok('send() reports the receiver reply', /receiver replied 200: saved /.test(msg), msg);
   ok('send() reply carries no query string', !msg.includes('?'), msg);
   ok('send() reply is under the 1,000-char Chrome cap', msg.length < 400, String(msg.length));
@@ -1457,9 +1460,9 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
   eq('raw JSON is left alone', unwrap('{"a":"b=c","items":[]}'), '{"a":"b=c","items":[]}');
   eq('an = inside the JSON is not the wrapper', unwrap('payload={"a":"b=c"}'), '{"a":"b=c"}');
   {
-    const recvF = await startReceiver({ dir, port: 0, count: 1, idle: 30 });
+    const recvF = await startReceiver({ dir, port: 0, count: 1, idle: 30, token: TK });
     const formBody = 'payload=' + H.payload() + '\r\n';
-    const r = await fetch('http://127.0.0.1:' + recvF.port + '/harvest', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: formBody });
+    const r = await fetch('http://127.0.0.1:' + recvF.port + '/harvest/' + TK, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: formBody });
     eq('form-encoded POST is accepted', r.status, 200);
     const saved = readdirSync(dir).filter((f) => f.startsWith('harvest-wire-brush-set-')).sort();
     eq('form-encoded POST is saved as bare JSON', rf(join(dir, saved[saved.length - 1]), 'utf8'), H.payload());
@@ -1474,9 +1477,9 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
     new Function('window', 'fetch', src)(winHeld, (url) => url.startsWith('http://127.0.0.1:') ? new Promise(() => {}) : Promise.resolve(reply(makePage({ items: [makeItem('h1')], finished: true }))));
     winHeld.__aeHarvest.start({ query: 'wire brush set' });
     await winHeld.__aeHarvest.step(1);
-    const msg2 = await winHeld.__aeHarvest.send(9999, { timeoutMs: 50 });
+    const msg2 = await winHeld.__aeHarvest.send(9999, { timeoutMs: 50, token: TK });
     ok('a held fetch falls back to a form POST, reported as UNCONFIRMED', /^UNCONFIRMED: form-posted /.test(msg2), msg2);
-    eq('the form targets the receiver URL', forms[0].action, 'http://127.0.0.1:9999/harvest');
+    eq('the form targets the receiver URL, with the token', forms[0].action, 'http://127.0.0.1:9999/harvest/' + TK);
     eq('the form is text/plain (no preflight, one field)', forms[0].enctype, 'text/plain');
     eq('the textarea carries the payload verbatim', forms[0].children[0].value, winHeld.__aeHarvest.payload());
     ok('the form was submitted', forms[0].submitted === true);
@@ -1487,7 +1490,7 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
       : Promise.resolve(reply(makePage({ items: [makeItem('h2')], finished: true }))));
     winOk.__aeHarvest.start({ query: 'wire brush set' });
     await winOk.__aeHarvest.step(1);
-    const msg3 = await winOk.__aeHarvest.send(9999, { timeoutMs: 50 });
+    const msg3 = await winOk.__aeHarvest.send(9999, { timeoutMs: 50, token: TK });
     ok('a working fetch returns the reply and posts no form', /receiver replied 200: saved/.test(msg3) && forms.length === 1, msg3);
 
     /* A HIDDEN tab must not start the fetch race: the race needs a timer,
@@ -1504,19 +1507,19 @@ console.log('\nharvest.js send() + receiver.mjs — payload lands on disk, both 
     });
     winHidden.__aeHarvest.start({ query: 'wire brush set' });
     await winHidden.__aeHarvest.step(1);
-    const msg4 = await winHidden.__aeHarvest.send(9999);
+    const msg4 = await winHidden.__aeHarvest.send(9999, { token: TK });
     eq('a hidden tab never calls the loopback fetch', loopbackCalls, 0);
     ok('a hidden tab posts the form straight away', /^UNCONFIRMED: form-posted /.test(msg4) && forms.length === 2, msg4);
     ok('the reply says why the fetch was skipped', /tab hidden: fetch skipped/.test(msg4), msg4);
     ok('the reply points at the receiver output, not get_page_text',
       /receiver prints "saved <path>" in its own output/.test(msg4) && /get_page_text hangs/.test(msg4), msg4);
-    const msg5 = await winHidden.__aeHarvest.send(9999, { via: 'fetch' });
+    const msg5 = await winHidden.__aeHarvest.send(9999, { via: 'fetch', token: TK });
     ok('an explicit via:"fetch" is still honoured in a hidden tab', /receiver replied 200/.test(msg5) && loopbackCalls === 1, msg5);
   }
-  const recv2 = await startReceiver({ dir, port: 0, count: 1, idle: 30 });
-  const bad = await fetch('http://127.0.0.1:' + recv2.port + '/harvest', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{"a":1}' });
+  const recv2 = await startReceiver({ dir, port: 0, count: 1, idle: 30, token: TK });
+  const bad = await fetch('http://127.0.0.1:' + recv2.port + '/harvest/' + TK, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{"a":1}' });
   eq('receiver answers 400 to a non-payload', bad.status, 400);
-  const pre = await fetch('http://127.0.0.1:' + recv2.port + '/harvest', { method: 'OPTIONS' });
+  const pre = await fetch('http://127.0.0.1:' + recv2.port + '/harvest/' + recv2.token, { method: 'OPTIONS' });
   eq('CORS preflight answered', pre.status, 204);
   eq('CORS origin header present', pre.headers.get('access-control-allow-origin'), '*');
   await recv2.close();
@@ -1781,14 +1784,14 @@ await block('send refused fetch', async () => {
   const win = { document: formDoc(forms), localStorage: fakeStorage() };
   const H = await harvestWith(win, (url, init) => url.startsWith('http://127.0.0.1:')
     ? fetch(url, init) : Promise.resolve(reply(makePage({ items: [makeItem('s1')], finished: true }))));
-  const msg = await H.send(port);
+  const msg = await H.send(port, { token: TK });
   ok('a refused fetch is reported NOT DELIVERED', /^NOT DELIVERED: FETCH-ERROR/.test(msg), msg);
   eq('and no form is posted (no navigation)', forms.length, 0);
   ok('the reply says the page did not navigate', /did NOT navigate/.test(msg), msg);
   ok('the reply names the liveness check', /curl -s http:\/\/127\.0\.0\.1:\d+\//.test(msg), msg);
   ok('the reply has no query string and fits the Chrome cap', !msg.includes('?') && msg.length < 1000, String(msg.length));
   eq('the harvest is still in the page', JSON.parse(H.payload()).items.length, 1);
-  const forced = await H.send(port, { via: 'form' });
+  const forced = await H.send(port, { via: 'form', token: TK });
   ok('via:"form" still posts the form on purpose', /^UNCONFIRMED: form-posted/.test(forced) && forms.length === 1, forced);
 });
 
@@ -1802,7 +1805,7 @@ await block('send backup before form', async () => {
     backupAtSubmit = k ? ls.getItem(k) : null; } }), localStorage: ls };
   const H = await harvestWith(win, (url) => url.startsWith('http://127.0.0.1:')
     ? new Promise(() => {}) : Promise.resolve(reply(makePage({ items: [makeItem('b1'), makeItem('b2')], finished: true }))));
-  const msg = await H.send(9999, { timeoutMs: 30 });
+  const msg = await H.send(9999, { timeoutMs: 30, token: TK });
   ok('a held fetch is UNCONFIRMED, not a success', /^UNCONFIRMED: /.test(msg), msg);
   ok('the backup existed when the form was submitted', backupAtSubmit !== null && JSON.parse(backupAtSubmit).items.length === 2,
     String(backupAtSubmit).slice(0, 80));
@@ -1811,9 +1814,9 @@ await block('send backup before form', async () => {
   const forms2 = [];
   const win2 = { document: formDoc(forms2, { doc: { visibilityState: 'hidden' } }) };
   const H2 = await harvestWith(win2, async () => reply(makePage({ items: [makeItem('n1')], finished: true })));
-  const msg2 = await H2.send(9999);
+  const msg2 = await H2.send(9999, { token: TK });
   ok('without a backup no form is posted', /^NOT DELIVERED: no form posted/.test(msg2) && forms2.length === 0, msg2);
-  const msg3 = await H2.send(9999, { force: true });
+  const msg3 = await H2.send(9999, { force: true, token: TK });
   ok('force:true posts anyway and says there is no backup', /^UNCONFIRMED: .*NO backup/.test(msg3) && forms2.length === 1, msg3);
   // A receiver that answers but rejects: NOT DELIVERED, and no form either.
   const forms3 = [];
@@ -1821,7 +1824,7 @@ await block('send backup before form', async () => {
   const H3 = await harvestWith(win3, (url) => url.startsWith('http://127.0.0.1:')
     ? Promise.resolve({ status: 400, text: async () => 'JSON has no items[]' })
     : Promise.resolve(reply(makePage({ items: [makeItem('r9')], finished: true }))));
-  const msg4 = await H3.send(9999, { timeoutMs: 50 });
+  const msg4 = await H3.send(9999, { timeoutMs: 50, token: TK });
   ok('a 400 from the receiver is NOT DELIVERED', /^NOT DELIVERED: .*replied 400/.test(msg4) && forms3.length === 0, msg4);
 });
 
@@ -1859,7 +1862,8 @@ console.log('\nreceiver.mjs — takes the second send, and its doc says how to c
 await block('receiver defaults', async () => {
   const dir = tmp('ae-rx2-');
   const rx = await startRx({ dir, port: 0 }); // the defaults
-  const post = (q) => fetch('http://127.0.0.1:' + rx.port + '/harvest', { method: 'POST', body: JSON.stringify({ query: q, items: [] }) });
+  ok('startReceiver() makes a token of its own', /^[0-9a-f]{16}$/.test(rx.token), String(rx.token));
+  const post = (q) => fetch('http://127.0.0.1:' + rx.port + '/harvest/' + rx.token, { method: 'POST', body: JSON.stringify({ query: q, items: [] }) });
   const a = await post('one'); const b = await post('two');
   eq('two payloads are both saved by default (it used to exit after one)', [a.status, b.status], [200, 200]);
   await new Promise((r) => setTimeout(r, 120));
@@ -1872,8 +1876,10 @@ await block('receiver defaults', async () => {
   const cp = spawn('node', [join(HERE, 'receiver.mjs'), '--dir', dir, '--port', String(port)]);
   const line = await new Promise((res) => { let b2 = ''; cp.stdout.on('data', (d) => { b2 += d; if (b2.includes('\n')) res(b2); }); });
   ok('the CLI names its limits', /no payload limit, or 3600 s idle/.test(line), line);
-  const c1 = await fetch('http://127.0.0.1:' + port + '/harvest', { method: 'POST', body: '{"query":"x","items":[]}' });
-  const c2 = await fetch('http://127.0.0.1:' + port + '/harvest', { method: 'POST', body: '{"query":"y","items":[]}' });
+  const ctk = (line.match(/ token ([0-9a-f]{16}) /) || [])[1];
+  ok('the CLI prints its token in the listening line', !!ctk, line);
+  const c1 = await fetch('http://127.0.0.1:' + port + '/harvest/' + ctk, { method: 'POST', body: '{"query":"x","items":[]}' });
+  const c2 = await fetch('http://127.0.0.1:' + port + '/harvest/' + ctk, { method: 'POST', body: '{"query":"y","items":[]}' });
   eq('the CLI with no --count takes two payloads', [c1.status, c2.status], [200, 200]);
   cp.kill();
   const bad = spawn('node', [join(HERE, 'receiver.mjs'), '--dir', dir, '--count', 'x']);
@@ -2290,7 +2296,7 @@ await block('dist', async () => {
     const H = win.__aeHarvest;
     H.start({ query: 'wire brush set' });
     const st = await H.step(6);
-    const sent = await H.send(9999);
+    const sent = await H.send(9999, { token: TK });
     const w2 = { localStorage: ls };
     new Function('window', 'fetch', src)(w2, pageFetch(pages));
     const rs = w2.__aeHarvest.restore();
@@ -2319,7 +2325,7 @@ await block('R0 R1', async () => {
     : Promise.resolve(reply(makePage({ items: [makeItem('h1')], finished: true })))));
   H.start({ query: 'wire brush set' });
   await H.step(1);
-  const msg = await H.send(9999, { via: 'fetch', timeoutMs: 20 });
+  const msg = await H.send(9999, { token: TK, via: 'fetch', timeoutMs: 20 });
   ok('a held fetch with via:"fetch" is UNCONFIRMED: it may still arrive', /^UNCONFIRMED: FETCH-HELD/.test(msg), msg);
 });
 
@@ -2853,18 +2859,18 @@ await block('W3', async () => {
   const forms = [];
   const H = await harvestWith({ document: formDoc(forms) }, (url) => url.startsWith('http://127.0.0.1:')
     ? Promise.reject(new TypeError('Failed to fetch')) : Promise.resolve(reply(makePage({ items: [makeItem('s1')], finished: true }))));
-  const m = await H.send(9999);
+  const m = await H.send(9999, { token: TK });
   ok('a refused fetch names the in-app browser and {via:"form"}', /in-app browser always does/.test(m) && /via:"form"/.test(m) && m.length < 1000, m);
   const H2 = await harvestWith({ document: formDoc([]) }, (url) => url.startsWith('http://127.0.0.1:')
     ? new Promise(() => {}) : Promise.resolve(reply(makePage({ items: [makeItem('s2')], finished: true }))));
-  const m2 = await H2.send(9999, { timeoutMs: 20 });
+  const m2 = await H2.send(9999, { token: TK, timeoutMs: 20 });
   ok('a held fetch with no backup is UNCONFIRMED (it may still land)', /^UNCONFIRMED: the fetch is held/.test(m2), m2);
   const longPath = 'saved /private/tmp/' + 'd'.repeat(180) + '/harvest-wire-brush-set-2026-10-18T10-00-00-000Z.json (1234 chars, 3 items)';
   const H3 = await harvestWith({ document: formDoc([]) }, (url) => url.startsWith('http://127.0.0.1:')
     ? Promise.resolve({ status: 200, text: async () => longPath }) : Promise.resolve(reply(makePage({ items: [makeItem('s3')], finished: true }))));
-  const m3 = await H3.send(9999);
+  const m3 = await H3.send(9999, { token: TK });
   ok('a long saved path comes back whole', m3.includes('(1234 chars, 3 items)'), m3);
-  ok('SKILL.md tells the operator to use {via: \'form\'} in both browsers', /In both browsers use `send\(8765, \{via: 'form'\}\)`/.test(skillSrc));
+  ok('SKILL.md tells the operator to use {via: \'form\'} in both browsers', /In both browsers use `send\(8765, \{via: 'form', token: '<token>'\}\)`/.test(skillSrc));
   // Live 2026-10-18: signed-in Chrome refused the loopback fetch (FETCH-ERROR) with the
   // receiver up, so "In Chrome, plain send(8765) is right" sent the operator the wrong way.
   ok('SKILL.md no longer says plain send(8765) is right in Chrome', !/In Chrome, plain\s+`send\(8765\)` is right/.test(skillSrc));
@@ -2878,11 +2884,11 @@ await block('W4', async () => {
   const dir = tmp('ae-rx-w4-');
   const rx = await startRx({ dir, port: 0 });
   const body = JSON.stringify({ query: 'same', items: [] });
-  const rs = await Promise.all(Array.from({ length: 8 }, () => fetch('http://127.0.0.1:' + rx.port + '/harvest', { method: 'POST', body })));
+  const rs = await Promise.all(Array.from({ length: 8 }, () => fetch('http://127.0.0.1:' + rx.port + '/harvest/' + rx.token, { method: 'POST', body })));
   eq('eight posts at once are all saved', rs.map((r) => r.status), Array(8).fill(200));
   eq('as eight files (none overwritten)', fsx.readdirSync(dir).filter((f) => f.startsWith('harvest-same-')).length, 8);
   fsx.rmSync(dir, { recursive: true, force: true });
-  const bad = await fetch('http://127.0.0.1:' + rx.port + '/harvest', { method: 'POST', body });
+  const bad = await fetch('http://127.0.0.1:' + rx.port + '/harvest/' + rx.token, { method: 'POST', body });
   eq('a write error answers 500', bad.status, 500);
   const alive = await fetch('http://127.0.0.1:' + rx.port + '/');
   eq('and the receiver stays up', alive.status, 200);
@@ -3348,13 +3354,13 @@ await block('R-F03', async () => {
 console.log('\nR-F07: the install reply and the receiver header name send(8765, {via:\'form\'})');
 await block('R-F07', async () => {
   const msg = recheckInstall();
-  ok('R-F07: the install reply names send(8765, {via:\'form\'})', /await __aeHarvest\.send\(8765, \{via:'form'\}\)/.test(msg), msg);
+  ok('R-F07: the install reply names send(8765, {via:\'form\'})', /await __aeHarvest\.send\(8765, \{via:'form', token:'<token>'\}\)/.test(msg), msg);
   ok('R-F07: after the curl check', /curl -s http:\/\/127\.0\.0\.1:8765\/ answers ok\), then await __aeHarvest\.send\(8765, \{via/.test(msg), msg);
   ok('R-F07: and never a plain __aeHarvest.send(8765)', !/__aeHarvest\.send\(8765\)/.test(msg), msg);
   ok('R-F07: the install reply fits the Chrome cap and has no "?"', msg.length < 1000 && !msg.includes('?'), String(msg.length));
   const rx = SRC('receiver.mjs');
   ok('R-F07: the receiver.mjs header names {via: \'form\'} and the curl check',
-    /`await __aeHarvest\.send\(<port>, \{via: 'form'\}\)`\s+\* after `curl -s http:\/\/127\.0\.0\.1:<port>\/` answers ok/.test(rx) &&
+    /`await __aeHarvest\.send\(<port>, \{via: 'form', token: '<token>'\}\)` after\s+\* `curl -s http:\/\/127\.0\.0\.1:<port>\/` answers ok/.test(rx) &&
     !/__aeHarvest\.send\(<port>\)/.test(rx));
 });
 
@@ -3368,16 +3374,16 @@ await block('R-F22', async () => {
       (text.match(new RegExp(bare.source + '[^\\n]*', 'g')) || []).join(' | '));
   }
   ok('R-F22: the README receiver row names {via: \'form\'} after a curl check',
-    /\| `scripts\/receiver\.mjs` \| Loopback HTTP receiver: after a `curl` check, `__aeHarvest\.send\(port, \{via: 'form'\}\)`/.test(SRC('../README.md')));
+    /\| `scripts\/receiver\.mjs` \| Loopback HTTP receiver: after a `curl` check, `__aeHarvest\.send\(port, \{via: 'form', token\}\)`/.test(SRC('../README.md')));
   ok('R-F22: the SKILL.md Files table names {via: \'form\'} after a curl check',
-    /\| `scripts\/receiver\.mjs` \| \*\*Primary export\.\*\* Loopback HTTP receiver; after a `curl` check, `__aeHarvest\.send\(port, \{via: 'form'\}\)`/.test(skillSrc));
+    /\| `scripts\/receiver\.mjs` \| \*\*Primary export\.\*\* Loopback HTTP receiver; after a `curl` check, `__aeHarvest\.send\(port, \{via: 'form', token\}\)`/.test(skillSrc));
 });
 
 console.log('\nR-F31: the harvest.js usage header and install reply match SKILL.md');
 await block('R-F31', async () => {
   const head = harvestText.split('\n').slice(0, 16).join('\n');
   ok('R-F31: the usage header shows send(8765, {via: \'form\'}) after the curl check',
-    /await __aeHarvest\.send\(8765, \{via: 'form'\}\)\s+\/\/ payload -> receiver\.mjs, after\s+\*\s+\/\/ curl -s http:\/\/127\.0\.0\.1:8765\/ answers ok/.test(head), head);
+    /await __aeHarvest\.send\(8765, \{via: 'form', token: '<token>'\}\)\s+\/\/ payload -> receiver\.mjs, after\s+\*\s+\/\/ curl -s http:\/\/127\.0\.0\.1:8765\/ answers ok/.test(head), head);
   const msg = recheckInstall();
   ok('R-F31: the install reply no longer says "send(8765) to export"', !/send\(8765\) to export/.test(msg), msg);
   ok('R-F31: the install reply carries no em dash', !msg.includes(String.fromCharCode(0x2014)), msg);
@@ -3694,23 +3700,23 @@ const formBody = (f) => (f.children || []).map((c) => c.name + '=' + c.value).jo
 
 console.log('\nR-F01: the replies under send(8765, {via: \'form\'}) are the form-path replies');
 await block('R-F01', async () => {
-  const fence = (skillSrc.match(/```js\nawait __aeHarvest\.send\(8765, \{via: 'form'\}\)[^\n]*\n([\s\S]*?)```/) || [])[1] || '';
+  const fence = (skillSrc.match(/```js\nawait __aeHarvest\.send\(8765, \{via: 'form', token: '<token>'\}\)[^\n]*\n([\s\S]*?)```/) || [])[1] || '';
   ok('R-F01: SKILL.md lists replies under the via:form call', fence.length > 0);
   ok('R-F01: the list shows no fetch-path reply (DELIVERED: sent, FETCH-ERROR, did NOT navigate, fetch held)',
     fence.length > 0 && !/DELIVERED: sent|FETCH-ERROR|did NOT navigate|fetch held/.test(fence), fence);
   // The real replies of send(port, {via: 'form'}), visible and hidden.
   const v = await docsTab();
-  const mv = await v.H.send(8765, { via: 'form' });
+  const mv = await v.H.send(8765, { token: TK, via: 'form' });
   ok('R-F01: real code, visible tab: UNCONFIRMED: form-posted ...; backup saved (n items)',
     /^UNCONFIRMED: form-posted \d+ chars to http:\/\/127\.0\.0\.1:8765\/harvest; backup saved \(4 items\) - delivered only if the receiver prints "saved <path>" in its own output: read it there/.test(mv), mv);
   ok('R-F01: the documented visible-tab reply has that shape',
     /visible tab: "UNCONFIRMED: form-posted \d+ chars to http:\/\/127\.0\.0\.1:8765\/harvest; backup saved \(\d+ items\)\s*\n\/\/\s+- delivered only if the receiver prints "saved <path>" in its own output: read it there/.test(fence), fence);
   const h = await docsTab({ hidden: true });
-  const mh = await h.H.send(8765, { via: 'form' });
+  const mh = await h.H.send(8765, { token: TK, via: 'form' });
   ok('R-F01: real code, hidden tab: (tab hidden: fetch skipped); backup saved', /^UNCONFIRMED: form-posted \d+ chars to \S+ \(tab hidden: fetch skipped\); backup saved \(4 items\)/.test(mh), mh);
   ok('R-F01: the documented hidden-tab reply has that shape', /hidden tab:\s+"UNCONFIRMED: form-posted … \(tab hidden: fetch skipped\); backup saved \(\d+ items\)/.test(fence), fence);
   const n = await docsTab({ storage: false });
-  const mn = await n.H.send(8765, { via: 'form' });
+  const mn = await n.H.send(8765, { token: TK, via: 'form' });
   ok('R-F01: real code, no backup: NOT DELIVERED: no form posted', /^NOT DELIVERED: no form posted, because the localStorage backup failed/.test(mn) && n.forms.length === 0, mn);
   ok('R-F01: the documented no-backup reply has that shape', /no backup:\s+"NOT DELIVERED: no form posted, because the localStorage backup failed/.test(fence), fence);
   // The receiver's own output is where "saved <path>" shows: post the real form body to a real receiver.
@@ -3718,7 +3724,7 @@ await block('R-F01', async () => {
   const logs = [];
   const rx = await startRx({ dir, port: 0, log: (m) => logs.push(m) });
   try {
-    const res = await fetch('http://127.0.0.1:' + rx.port + '/harvest', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: formBody(v.forms[0]) });
+    const res = await fetch('http://127.0.0.1:' + rx.port + '/harvest/' + rx.token, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: formBody(v.forms[0]) });
     eq('R-F01: the posted form body is saved by the receiver', res.status, 200);
   } finally { await rx.close(); }
   ok('R-F01: the receiver prints "saved <dir>/harvest-<query>-<stamp>.json"', logs.some((l) => /^saved .*\/harvest-wire-brush-set-[^/]+\.json$/.test(l)), JSON.stringify(logs));
@@ -3738,14 +3744,14 @@ await block('R-F05', async () => {
     !/In a visible tab a `send\(\)` to a dead port returns `NOT DELIVERED`\s+and does not navigate/.test(skillSrc));
   ok('R-F05: step 1 says the check is needed in a visible tab as well', /Do not skip this check in a hidden\s+tab, or in a visible one\./.test(rec), rec.slice(0, 200));
   ok('R-F05: step 1 says via:form always posts the form, visible or hidden',
-    /`send\(<port>, \{via: 'form'\}\)` never tries a\s+fetch\. It always posts the form/.test(rec) && /navigates to an error page, visible or\s+hidden/.test(rec));
+    /`send\(<port>, \{via: 'form', token\}\)` never tries a\s+fetch\. It always posts the form/.test(rec) && /navigates to an error page, visible or\s+hidden/.test(rec));
   ok('R-F05: step 1 names the curl check as the only dead-port guard', /The curl check is the only guard against a dead port\./.test(rec));
   // What the doc must match, on the real code: a visible tab, a dead port.
   const p = await docsTab();
-  const plain = await p.H.send(8765);
+  const plain = await p.H.send(8765, { token: TK });
   ok('R-F05: real code: a plain send() to a dead port stays on the page', /^NOT DELIVERED: FETCH-ERROR/.test(plain) && p.forms.length === 0, plain);
   const before = p.lb.n;
-  const viaForm = await p.H.send(8765, { via: 'form' });
+  const viaForm = await p.H.send(8765, { token: TK, via: 'form' });
   ok('R-F05: real code: send(port, {via: \'form\'}) to a dead port in a VISIBLE tab posts the form (navigates)',
     /^UNCONFIRMED: form-posted/.test(viaForm) && p.forms.length === 1, viaForm);
   eq('R-F05: real code: and it never tried the fetch', p.lb.n, before);
@@ -3870,7 +3876,7 @@ await block('R-F23', async () => {
   eq('R-F23: and it is the result the return value holds', JSON.stringify(X.result), raw);
   const js = (fb.match(/```js\n([\s\S]*?)```/) || [])[1] || '';
   const calls = js.split(/\n(?=\S)/).map((c) => c.trim().replace(/\s*\/\/[^\n]*$/, '').trim()).filter(Boolean);
-  ok('R-F23: SKILL.md gives the Chrome pieces: a summary, two items, and send()', calls.length === 3 && /^__aeExtract\.send\(8765\)$/.test(calls[2]), JSON.stringify(calls));
+  ok('R-F23: SKILL.md gives the Chrome pieces: a summary, two items, and send()', calls.length === 3 && /^__aeExtract\.send\(8765, \{token: '<token>'\}\)$/.test(calls[2]), JSON.stringify(calls));
   for (const c of calls.slice(0, 2)) {
     const out = new Function('__aeExtract', 'return (' + c + ')')(X);
     const s = typeof out === 'string' ? out : JSON.stringify(out);
@@ -3878,15 +3884,16 @@ await block('R-F23', async () => {
   }
   // send(): one form to the receiver; the receiver saves it; rank.mjs takes the saved file.
   const port = await freePort();
-  const msg = X.send(port);
-  ok('R-F23: __aeExtract.send(port) posts one text/plain form to the receiver',
-    forms.length === 1 && forms[0].method === 'POST' && forms[0].enctype === 'text/plain' && forms[0].action === 'http://127.0.0.1:' + port + '/harvest');
+  ok('R-F23: __aeExtract.send(port) with no token posts nothing', /^NOT DELIVERED: no token/.test(X.send(port)) && forms.length === 0);
+  const msg = X.send(port, { token: TK });
+  ok('R-F23: __aeExtract.send(port, {token}) posts one text/plain form to the receiver, at the token',
+    forms.length === 1 && forms[0].method === 'POST' && forms[0].enctype === 'text/plain' && forms[0].action === 'http://127.0.0.1:' + port + '/harvest/' + TK);
   ok('R-F23: its reply is UNCONFIRMED, fits the cap and has no "?"', /^UNCONFIRMED: form-posted \d+ chars \(60 items\)/.test(msg) && msg.length < 1000 && !msg.includes('?'), msg);
   const dir = tmp('ae-f23-');
   const logs = [];
-  const rx = await startRx({ dir, port, log: (m) => logs.push(m) });
+  const rx = await startRx({ dir, port, log: (m) => logs.push(m), token: TK });
   try {
-    const res = await fetch('http://127.0.0.1:' + port + '/harvest', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: formBody(forms[0]) });
+    const res = await fetch(forms[0].action, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: formBody(forms[0]) });
     eq('R-F23: the receiver saves the posted extract result', res.status, 200);
   } finally { await rx.close(); }
   const savedPath = ((logs.find((l) => /^saved /.test(l)) || '').match(/^saved (.+)$/) || [])[1];
@@ -3944,8 +3951,8 @@ await block('R-F21', async () => {
   }
   // The code the doc describes: the same visible tab, the same dead port, both calls.
   const t = await docsTab();
-  const a = await t.H.send(8765);
-  const b = await t.H.send(8765, { via: 'form' });
+  const a = await t.H.send(8765, { token: TK });
+  const b = await t.H.send(8765, { token: TK, via: 'form' });
   eq('R-F21: real code: plain send() stays, {via: \'form\'} navigates', [/^NOT DELIVERED/.test(a), /^UNCONFIRMED: form-posted/.test(b), t.forms.length], [true, true, 1]);
 });
 
@@ -4295,8 +4302,10 @@ await block('R-SPEC-MORE', async () => {
   eq('R-SPEC-MORE: a second run finds no button and still reads every row', [g1b.specMore, g1b.spec.Type, p1.clicks.spec], [0, 'Bluetooth Wireless', 1]);
 
   // listing.js: expand() clicks "View more" leaves by text, at most 8. Eight
-  // earlier ones (review images, review list, related items) use up the cap,
-  // so the spec button must be clicked by its class.
+  // earlier ones use up the cap, so the spec button must be clicked by its
+  // class. (The review ones no longer count: since 2026-11-09 expand() skips
+  // the reviews zone, N10-2. These decoys are the seller-points button, which
+  // sat in pdp-info-right on the live page that day.)
   const src = RUN('listing.js');
   const leaf = (tag, p = {}) => ({ tagName: tag, children: [], textContent: p.text || '', className: p.cls || '',
     naturalWidth: 0, naturalHeight: 0, currentSrc: '', src: '', shadowRoot: null, parentElement: null,
@@ -4307,7 +4316,7 @@ await block('R-SPEC-MORE', async () => {
     return [leaf('DIV', { cls: 'specification--prop--J', qsa: [t, v] }), t, v]; };
   const lpage = (decoys) => {
     const els = [];
-    for (let i = 0; i < decoys; i++) els.push(leaf('SPAN', { text: 'View more', cls: 'list-customer-show--mask--G' }));
+    for (let i = 0; i < decoys; i++) els.push(leaf('SPAN', { text: 'View more', cls: 'seo-sellpoints--btnWrap--Bp8WpaD' }));
     els.push(...lrow('Power Type', 'Rechargeable'));
     let specClicks = 0;
     const btn = leaf('BUTTON', { cls: 'comet-v2-btn comet-v2-btn-large specification--btn--Y4pYc4b', text: 'View more',
@@ -4749,18 +4758,18 @@ await block('F31-7', async () => {
 
   const second = mk({ storage, path: '/item/1.html' });
   eq('F31-6: records survive navigation', second.L.captured(), ['1005008896134310']);
-  const reply = second.L.sendAll(8765);
+  const reply = second.L.sendAll(8765, { token: TK });
   ok('F31-6: sendAll posts one form and answers UNCONFIRMED', second.made.length === 1 && /^UNCONFIRMED: form-posted 1 records/.test(reply) && !reply.includes('?'), reply);
   eq('F31-6: and keeps the records', second.L.captured().length, 1);
   eq('F31-6: dropCaptured clears them', [second.L.dropCaptured(), second.L.captured()], ['dropped 1 record(s)', []]);
   const empty = mk({ storage: fakeStorage() });
-  ok('F31-6: nothing captured: no form, no navigation', /^NOT DELIVERED/.test(empty.L.sendAll(8765)) && empty.made.length === 0);
+  ok('F31-6: nothing captured: no form, no navigation', /^NOT DELIVERED/.test(empty.L.sendAll(8765, { token: TK })) && empty.made.length === 0);
 
   const { startReceiver } = await import('./receiver.mjs');
   const { readdirSync } = await import('node:fs');
   const dir = tmpDir('aef-');
   const recv = await startReceiver({ dir, port: 0, idle: 30 });
-  const res = await fetch('http://127.0.0.1:' + recv.port + '/harvest', { method: 'POST', body: 'payload=' + JSON.stringify({ kind: 'details', items: [rec] }) });
+  const res = await fetch('http://127.0.0.1:' + recv.port + '/harvest/' + recv.token, { method: 'POST', body: 'payload=' + JSON.stringify({ kind: 'details', items: [rec] }) });
   // details-<stamp>.json since 2026-11-08: harvest-details-* was caught by `decode.mjs harvest-*.json` (N8-1).
   ok('F31-6: the receiver saves it under the kind', res.status === 200 && readdirSync(dir).some((f) => /^details-/.test(f)) &&
     !readdirSync(dir).some((f) => /^harvest-/.test(f)), readdirSync(dir).join(','));
@@ -4912,7 +4921,7 @@ await block('N8-1', async () => {
   const { assemble, kindError } = await import('./decode.mjs');
   const dir = tmp('aef-n8-1-');
   const recv = await startRx({ dir, port: 0, idle: 30 });
-  const post = (body) => fetch('http://127.0.0.1:' + recv.port + '/harvest', { method: 'POST', body }).then((r) => r.text());
+  const post = (body) => fetch('http://127.0.0.1:' + recv.port + '/harvest/' + recv.token, { method: 'POST', body }).then((r) => r.text());
   const details = { kind: 'details', source: 'listing', items: [{ id: '1005005994445557', price: 11.68, reviews: 638 }] };
   const search = { query: 'dell charger', source: 'harvest-paged', fourStar: false, items: [{ id: '1005005994445557', title: 'dell charger', price: 9.69 }] };
   const r1 = await post(JSON.stringify(details));
@@ -5084,7 +5093,7 @@ await block('N8-7', async () => {
   ok('N8-7: on the receiver page it removes nothing and says to go back', /^NOT CLEANED: this tab is on 127\.0\.0\.1/.test(msg2) && off.length === 8, msg2);
   ok('N8-7: the replies fit the Chrome cap and hold no "?"', [msg, msg2].every((m) => m.length < 1000 && !m.includes('?')));
   ok('N8-7: the old one-key instruction is gone', !/At the end of the run remove the saved code too/.test(skillSrc));
-  const reply = n8Page({ storage: (() => { const s = fakeStorage(); s.setItem('__aeDet:1', JSON.stringify({ id: '1' })); return s; })() }).sendAll(8765);
+  const reply = n8Page({ storage: (() => { const s = fakeStorage(); s.setItem('__aeDet:1', JSON.stringify({ id: '1', capturedAt: Date.now() })); return s; })() }).sendAll(8765, { token: TK });
   ok('N8-7: sendAll() says the tab left AliExpress and where the file goes', /navigate back to https:\/\/he\.aliexpress\.com\//.test(reply) && /details-<stamp>\.json, for rank\.mjs/.test(reply) && reply.length < 1000 && !reply.includes('?'), reply);
 });
 
@@ -5359,7 +5368,7 @@ await block('N9-10', async () => {
   const { refusalOf, assemble } = await import('./decode.mjs');
   const dir = tmp('aef-n9-10-');
   const recv = await startRx({ dir, port: 0, idle: 30 });
-  const post = (body) => fetch('http://127.0.0.1:' + recv.port + '/harvest', { method: 'POST', body: 'payload=' + JSON.stringify(body) }).then((x) => x.text());
+  const post = (body) => fetch('http://127.0.0.1:' + recv.port + '/harvest/' + recv.token, { method: 'POST', body: 'payload=' + JSON.stringify(body) }).then((x) => x.text());
   const page = { url: 'https://he.aliexpress.com/w/wholesale-dell-charger.html', page: 1, source: 'dom', blocked: false, cardCount: 1, items: [{ id: '1', title: 'dell charger', price: 9 }] };
   const search = { query: 'dell charger', source: 'harvest-paged', fourStar: false, pages: [{ page: 1, n: 1 }], coverage: { verdict: 'exhausted-all-results' }, items: [{ id: '2', title: 'dell charger', price: 8 }] };
   const r1 = await post(page);
@@ -5430,6 +5439,154 @@ await block('N9-15', async () => {
   ok('N9-15: and the receiver is still up', /^ok 0 saved/.test(up), up);
   eq('N9-15: an address typed in the browser (Sec-Fetch-Site none) stops it', await get({ 'Sec-Fetch-Site': 'none' }), [200, 'stopping: 0 saved']);
   ok('N9-15: SKILL.md says a web page cannot stop it', /A `\/stop` from a web\s+page/.test(skillSrc));
+});
+
+// ============================================================================
+// N10: the review of 9e11593 (2026-11-09). Each finding has assertions that
+// fail on 9e11593; a few are controls that pass on both (the right token is saved).
+// ============================================================================
+console.log('\nN10-1: only a POST that names the receiver\'s token is saved');
+await block('N10-1', async () => {
+  const http = await import('node:http');
+  const dir = tmp('aef-n10-1-');
+  const logs = [];
+  const recv = await startRx({ dir, port: 0, idle: 30, token: TK, log: (m) => logs.push(m) });
+  const post = (path, headers = {}, body = JSON.stringify({ query: 'wired usb mouse', source: 'harvest-paged', items: [{ id: '999', title: 'Forged Mouse' }] })) =>
+    new Promise((res, rej) => {
+      const rq = http.request({ host: '127.0.0.1', port: recv.port, path, method: 'POST', headers: { 'Content-Type': 'text/plain', ...headers } }, (x) => {
+        let b = ''; x.on('data', (c) => (b += c)); x.on('end', () => res([x.statusCode, b]));
+      });
+      rq.on('error', rej); rq.end(body);
+    });
+  // The review's own reproduction: a cross-site POST to /harvest was saved.
+  const evil = await post('/harvest', { Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site' });
+  eq('N10-1: a POST with no token is refused with 403', evil[0], 403);
+  const nul = await post('/harvest/wrongtoken99', { Origin: 'null' });
+  eq('N10-1: a wrong token too (a form POST from https carries Origin: null)', nul[0], 403);
+  ok('N10-1: a refusal never shows the token', !evil[1].includes(TK) && !nul[1].includes(TK) && /listening/.test(evil[1]), evil[1]);
+  eq('N10-1: and nothing was written', fsx.readdirSync(dir), []);
+  ok('N10-1: the receiver logs each refusal', logs.filter((l) => /^refused a POST with (no|a wrong) token/.test(l)).length === 2, JSON.stringify(logs));
+  const good = await post('/harvest/' + TK);
+  ok('N10-1: the right token is saved', good[0] === 200 && /^saved .*\/harvest-wired-usb-mouse-/.test(good[1]), good[1]);
+  const up = await fetch('http://127.0.0.1:' + recv.port + '/').then((x) => x.text());
+  ok('N10-1: GET / (open to any page by CORS) never shows the token', /^ok 1 saved/.test(up) && !up.includes(TK), up);
+  await recv.close();
+  const dir2 = tmp('aef-n10-1b-');
+  const small = await startRx({ dir: dir2, port: 0, idle: 30, token: TK, maxBytes: 200 });
+  const big = await fetch('http://127.0.0.1:' + small.port + '/harvest/' + TK, { method: 'POST', body: JSON.stringify({ items: [], pad: 'x'.repeat(400) }) });
+  eq('N10-1: a body over maxBytes is refused with 413, and not saved', [big.status, fsx.readdirSync(dir2)], [413, []]);
+  eq('N10-1: and the receiver stays up', (await fetch('http://127.0.0.1:' + small.port + '/')).status, 200);
+  await small.close();
+  let threw = '';
+  try { await startRx({ dir, port: 0, token: 'short' }); } catch (e) { threw = String(e.message); }
+  ok('N10-1: startReceiver() refuses a weak token', /8 to 64 letters or digits/.test(threw), threw);
+  const { spawn } = await import('node:child_process');
+  const weak = spawn(process.execPath, [join(HERE, 'receiver.mjs'), '--dir', dir, '--token', 'abc']);
+  eq('N10-1: the CLI refuses a weak --token with exit 2', await new Promise((res) => weak.on('exit', res)), 2);
+  const port = await freePort();
+  const cp = spawn(process.execPath, [join(HERE, 'receiver.mjs'), '--dir', dir, '--port', String(port), '--token', TK]);
+  // Resolved on exit too: a receiver that refuses the flag must fail here, not hang the suite.
+  const line = await new Promise((res) => { let b = ''; cp.stdout.on('data', (d) => { b += d; if (b.includes('\n')) res(b); }); cp.on('exit', () => res(b)); });
+  ok('N10-1: --token keeps a given token, and the listening line names it', line.includes(' token ' + TK + ' '), line);
+  cp.kill();
+
+  // The page side: no token, nothing leaves the page and nothing navigates.
+  const forms = [];
+  let loopback = 0;
+  const H = await harvestWith({ document: formDoc(forms), localStorage: fakeStorage() }, (url) => {
+    if (url.startsWith('http://127.0.0.1:')) { loopback++; return Promise.resolve({ status: 200, text: async () => 'saved /tmp/x.json' }); }
+    return Promise.resolve(reply(makePage({ items: [makeItem('t1')], finished: true })));
+  });
+  const none = await H.send(8765, { via: 'form' });
+  ok('N10-1: send() with no token posts nothing and says how to pass it', /^NOT DELIVERED: no token/.test(none) && forms.length === 0 && loopback === 0 &&
+    /token: '<token>'/.test(none), none);
+  ok('N10-1: send() refuses a token that is not 8-64 letters or digits', /^NOT DELIVERED: the token is not/.test(await H.send(8765, { via: 'form', token: 'a/b' })) && forms.length === 0);
+  const sent = await H.send(8765, { via: 'form', token: TK });
+  ok('N10-1: with the token the form goes to /harvest/<token>', forms.length === 1 && forms[0].action === 'http://127.0.0.1:8765/harvest/' + TK, forms.length ? forms[0].action : 'no form');
+  ok('N10-1: and the reply does not repeat the token', !sent.includes(TK) && /to http:\/\/127\.0\.0\.1:8765\/harvest/.test(sent), sent);
+  ok('N10-1: SKILL.md says every send names the token from the listening line',
+    /\*\*Every send names that token\*\*/.test(skillSrc) && /`\/harvest\/<token>`/.test(skillSrc));
+  ok('N10-1: no SKILL.md instruction calls send(…, {via: \'form\'}) without the token',
+    !/await __aeHarvest\.send\([^)]*\{via: 'form'\}\)/.test(skillSrc) && !/__aeListing\.sendAll\(8765\)/.test(skillSrc) && !/__aeExtract\.send\(8765\)/.test(skillSrc));
+});
+
+const n10Page = (els, storage = fakeStorage()) => {
+  const forms = [];
+  const document = { title: 'Laptop Charger', body: { scrollHeight: 100, innerText: 'x'.repeat(2500), appendChild: () => {} }, documentElement: { outerHTML: '' },
+    querySelectorAll: (sel) => (/ld\+json/.test(sel || '') ? [] : els),
+    createElement: (tag) => ({ tag, appendChild(c) { (this.children = this.children || []).push(c); }, submit() { forms.push(this); } }) };
+  const L = new Function('window', 'document', 'location', `${RUN('listing.js')}; return window.__aeListing;`)({ scrollTo() {}, document, localStorage: storage }, document,
+    { href: 'https://he.aliexpress.com/item/1005005994445557.html', pathname: '/item/1005005994445557.html', origin: 'https://he.aliexpress.com' });
+  return { L, forms, storage };
+};
+
+console.log('\nN10-2: buyers\' review text is never this listing\'s size or rating (live 2026-11-09)');
+await block('N10-2', async () => {
+  // The live shapes: #nav-review.review--wrap--, review items list--itemBox--,
+  // and the modal its "View more" opens (comet-v2-modal, outside #nav-review).
+  const node = (id, cls, parent = null) => ({ tagName: 'DIV', id, className: cls, parentElement: parent });
+  const navReview = node('nav-review', 'review--wrap--U5X0TgT');
+  const item = node('', 'list--itemBox--je_KNzb', navReview);
+  const reviewLine = leEl('DIV', { cls: 'list--itemContent--_RMYb2Q', text: 'Works, output 9V 2A, size 12 x 7 x 4 cm', parent: item });
+  const modalItem = node('', 'list--itemBox--je_KNzb', node('', 'comet-v2-modal-body', node('', 'comet-v2-modal-content')));
+  const modalLine = leEl('DIV', { cls: 'list--itemContent--_RMYb2Q', text: 'MacBook saw it as 65W and 20V', parent: modalItem });
+  const strip = node('', 'list-customer-show--item--y63ec55', node('', 'list-customer-show--box--v_1IdwP', navReview));
+  const stripMore = leEl('SPAN', { text: 'View more', parent: node('', 'list-customer-show--mask--GJmwFTe', strip) });
+  const reviewMore = leEl('SPAN', { text: 'View more', parent: node('', 'comet-v2-btn comet-v2-btn-slim', navReview) });
+  const desc = node('nav-description', 'description--wrap--LscZ0He');
+  const descMore = leEl('SPAN', { text: 'View more', parent: node('', 'extend--wrap--yXwoDbO', desc) });
+  const own = leEl('DIV', { cls: 'detail-desc-decorate-richtext', text: 'Size: 10 x 5 x 3 cm', parent: desc });
+  const ownRating = leEl('DIV', { cls: 'detail-desc-decorate-richtext', text: 'OUTPUT: 20V 3.25A', parent: desc });
+  // The header beside the title (reviewer--wrap--) is the listing's own: not a review.
+  const head = leEl('SPAN', { cls: 'reviewer--sold--ytPeoEy', text: 'Max 65W', parent: node('', 'reviewer--wrap--vGS7G6P') });
+  const clicks = { review: 0, strip: 0, desc: 0 };
+  reviewMore.click = () => { clicks.review++; };
+  stripMore.click = () => { clicks.strip++; };
+  descMore.click = () => { clicks.desc++; };
+  const { L } = n10Page([reviewLine, modalLine, stripMore, reviewMore, descMore, own, ownRating, head]);
+  const r = await L.read({ description: false });
+  eq('N10-2: the review\'s size is not a product size', r.productSizeLines, ['Size: 10 x 5 x 3 cm']);
+  ok('N10-2: review text, in the section and in the modal, is not a rating line',
+    !r.ratingLines.some((t) => /9V 2A|65W and 20V/.test(t)), JSON.stringify(r.ratingLines));
+  ok('N10-2: the listing\'s own lines and its header still are', r.ratingLines.includes('OUTPUT: 20V 3.25A') && r.ratingLines.includes('Max 65W'), JSON.stringify(r.ratingLines));
+  eq('N10-2: expand() leaves the reviews\' "View more" alone and opens the description\'s', [clicks.review, clicks.strip, clicks.desc], [0, 0, 1]);
+  ok('N10-2: SKILL.md says reviews are not this listing\'s text', /\*\*Reviews are not this listing's text\.\*\*/.test(skillSrc));
+});
+
+console.log('\nN10-3: sendAll() sends this run\'s records, not an earlier run\'s');
+await block('N10-3', async () => {
+  const now = Date.now();
+  const seed = () => {
+    const s = fakeStorage();
+    s.setItem('__aeDet:1', JSON.stringify({ id: '1', title: 'fan', capturedAt: now - 3600e3 }));
+    s.setItem('__aeDet:2', JSON.stringify({ id: '2', title: 'charger', capturedAt: now - 30 * 3600e3 }));
+    s.setItem('__aeDet:3', JSON.stringify({ id: '3', title: 'charger' })); // captured before capturedAt existed
+    return s;
+  };
+  const p = n10Page([], seed());
+  ok('N10-3: no token, no form', /^NOT DELIVERED: no token/.test(p.L.sendAll(8765)) && p.forms.length === 0);
+  const reply = p.L.sendAll(8765, { token: TK });
+  const sentIds = p.forms.length ? JSON.parse(p.forms[0].children[0].value).items.map((x) => x.id) : null;
+  eq('N10-3: only the record of the last 8 hours is sent', sentIds, ['1']);
+  ok('N10-3: to /harvest/<token>', p.forms[0].action === 'http://127.0.0.1:8765/harvest/' + TK, p.forms[0].action);
+  ok('N10-3: the reply names the records left out, with their age', /Left out: 2 record\(s\) of an earlier run \(2 30 h old, 3 no capture time\)/.test(reply) &&
+    /all: true/.test(reply) && !reply.includes(TK) && !reply.includes('?'), reply);
+  eq('N10-3: every record stays saved', p.L.captured().length, 3);
+  const q = n10Page([], seed());
+  q.L.sendAll(8765, { token: TK, all: true });
+  eq('N10-3: {all: true} sends them all', JSON.parse(q.forms[0].children[0].value).items.map((x) => x.id).sort(), ['1', '2', '3']);
+  const old = fakeStorage(); old.setItem('__aeDet:2', JSON.stringify({ id: '2', capturedAt: now - 30 * 3600e3 }));
+  const o = n10Page([], old);
+  const oReply = o.L.sendAll(8765, { token: TK });
+  ok('N10-3: only old records: nothing is posted, and they are named', /^NOT DELIVERED: nothing captured in the last 8 h\. Left out: 1 record/.test(oReply) && o.forms.length === 0, oReply);
+  // capture() stamps its record and counts the old ones.
+  const c = n10Page([], seed());
+  const brief = await c.L.capture({ description: false });
+  const rec = JSON.parse(c.storage.getItem('__aeDet:1005005994445557'));
+  ok('N10-3: capture() stamps capturedAt', typeof rec.capturedAt === 'number' && Math.abs(rec.capturedAt - Date.now()) < 60e3, String(rec.capturedAt));
+  eq('N10-3: the summary counts the records of an earlier run', brief.olderRecords, 2);
+  ok('N10-3: and still fits the Chrome cap', JSON.stringify(brief).length < 1000, String(JSON.stringify(brief).length));
+  ok('N10-3: SKILL.md says sendAll() sends this run\'s records only', /\*\*`sendAll\(\)` sends this run's records only\.\*\*/.test(skillSrc));
 });
 
 // ---------------------------------------------- the whole suite on dist/

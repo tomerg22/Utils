@@ -189,7 +189,7 @@ this list is so you do not fight the symptoms:
 
 | Limit | Symptom | What to do |
 |---|---|---|
-| Result cut at **1,000 characters** | `…[TRUNCATED]` | Never return `payload()`. Export with `await __aeHarvest.send(<port>, {via: 'form'})` to `receiver.mjs` (step 3). `expose(i)` + `get_page_text` is the fallback, visible tab only. |
+| Result cut at **1,000 characters** | `…[TRUNCATED]` | Never return `payload()`. Export with `await __aeHarvest.send(<port>, {via: 'form', token: '<token>'})` to `receiver.mjs` (step 3; the token is in its `listening` line). `expose(i)` + `get_page_text` is the fallback, visible tab only. |
 | Result with a cookie or a **query string** is replaced | `[BLOCKED: Cookie/query string data]` | Never return `document.cookie`, `location.href` of a search page, or any URL with `?`. `start()`/`status()`/`payload()` are already clean; `debugUrl()` is in-app only. |
 | An async IIFE returns `{}` | `(async () => {...})()` → `{}` | Use a **top-level `await`**: `await __aeHarvest.step(6)`. |
 | Call timeout between 25 s and 45 s | `CDP Runtime.evaluate timed out after 45000ms` | Keep `step(6)`; 25 s passed, 45 s failed. In-app died at 30 s (2026-09-14) and at 45 s (2026-09-29), so the unit of work is the same. |
@@ -223,7 +223,7 @@ NOT close the tab first: the harvest lives in that tab's `window`. Since
 1. Check the receiver is up: `curl -s http://127.0.0.1:8765/` must answer
    `ok …`. It has no payload limit and exits after 60 idle minutes; if it is
    gone, start it again (step 3). **Do not skip this check in a hidden
-   tab, or in a visible one.** `send(<port>, {via: 'form'})` never tries a
+   tab, or in a visible one.** `send(<port>, {via: 'form', token})` never tries a
    fetch. It always posts the form, and a form POST is a navigation. So
    with the receiver gone, the tab navigates to an error page, visible or
    hidden. The curl check is the only guard against a dead port. Then
@@ -231,7 +231,7 @@ NOT close the tab first: the harvest lives in that tab's `window`. Since
    `send()` posts the form at once in a hidden tab too, because it cannot
    test the port there (the test needs a timer).
 2. In the stuck tab, `__aeHarvest.status()` still answers. Export what you
-   have: `await __aeHarvest.send(<port>, {via: 'form'})`. It posts the form
+   have: `await __aeHarvest.send(<port>, {via: 'form', token: '<token>'})`. It posts the form
    and needs no fetch and no timer. The reply starts with `UNCONFIRMED`:
    the receiver's own output must print `saved <path>`. For a detail page,
    `__aeListing.last` holds everything but the description.
@@ -281,7 +281,7 @@ What to do:
   `suspect` wall, step 2), headline it: "The AliExpress tab is hidden: please
   bring that Chrome window to the front." Until then, report the wall as
   unresolved. Never report "not blocked".
-- **Exports still work.** `__aeHarvest.send(<port>, {via: 'form'})` posts
+- **Exports still work.** `__aeHarvest.send(<port>, {via: 'form', token})` posts
   the form in a hidden tab as in a visible one, after saving the harvest to
   `localStorage`. (A plain `send()` sees `hidden` and skips its fetch race,
   which needs a timer, so it posts the form too.) The reply starts with
@@ -566,7 +566,7 @@ current harvest.
 __aeHarvest.forceEnglish()                      // in-app browser ONLY, once
 __aeHarvest.start({ query: 'wire brush set' })  // returns the plan (path, flags — no URL)
 await __aeHarvest.step(6)                       // repeat until .done (top-level await)
-await __aeHarvest.send(8765, {via: 'form'})     // export to receiver.mjs (below; curl it first)
+await __aeHarvest.send(8765, {via: 'form', token: '<token>'})  // export to receiver.mjs (below; curl it first)
 __aeHarvest.restore()                           // a fresh tab: reload the saved harvest (a stop: resume() first)
 __aeHarvest.payload()                           // in-app browser: JSON string for decode.mjs
 ```
@@ -799,11 +799,11 @@ connector cuts it at 1,000 characters**, so the result also stays on
 [__aeExtract.result.source, __aeExtract.result.cardCount, __aeExtract.result.withRating,
  __aeExtract.result.blocked, __aeExtract.result.suspectedWall, __aeExtract.result.visibility]
 JSON.stringify(__aeExtract.result.items.slice(0, 2))   // a look at two items
-__aeExtract.send(8765)   // all of it to receiver.mjs, after: curl -s http://127.0.0.1:8765/
+__aeExtract.send(8765, {token: '<token>'})   // all of it to receiver.mjs, after: curl -s http://127.0.0.1:8765/
 ```
 
-`__aeExtract.send(8765)` is the same form POST as `__aeHarvest.send(8765,
-{via: 'form'})`, so it navigates, to a dead port too: run the curl check
+`__aeExtract.send(8765, {token})` is the same form POST as `__aeHarvest.send(8765,
+{via: 'form', token})`, so it navigates, to a dead port too: run the curl check
 first. Its reply starts with `UNCONFIRMED`; only `saved <path>` in the
 receiver's own output means the file exists. The saved file goes to
 `rank.mjs` as it is. If the receiver printed nothing, navigate back to the
@@ -826,6 +826,20 @@ tracks it:
 node ~/.claude/skills/aliexpress-finder/scripts/receiver.mjs --dir <scratchpad> --port 8765
 ```
 
+Its first line is `listening http://127.0.0.1:8765 dir <dir> token <token> …`.
+**Every send names that token**: `send(8765, {via: 'form', token: '<token>'})`,
+`__aeExtract.send(8765, {token: '<token>'})`, `__aeListing.sendAll(8765,
+{token: '<token>'})`. The receiver saves a payload only at
+`/harvest/<token>`, and a send with no token posts nothing (`NOT DELIVERED:
+no token`). Until 2026-11-09 any web page open in the browser could write a
+`harvest-*.json` there, which `decode.mjs harvest-*.json` then merged into
+the pool (a test POST with `Origin: https://evil.example` was saved). The
+`Origin` header cannot tell the pages apart: a form POST from an https page to
+`http://127.0.0.1` carries `Origin: null` (the Fetch standard), AliExpress or
+not. The token is new on each start; after a restart read the new one, or
+start it with `--token <token>` to keep the old one. A body over 64 MiB is
+refused (413).
+
 It takes any number of payloads and exits after 60 minutes without a
 request to it (`--count N` / `--idle S` change that). A flag with no value,
 an empty `--dir`, an unknown flag or a stray word exits 2 with a message.
@@ -841,7 +855,7 @@ exits 0. A killed receiver shows as a failed background task.
 
 then in the browser:
 
-**In both browsers use `send(8765, {via: 'form'})`, after the curl
+**In both browsers use `send(8765, {via: 'form', token: '<token>'})`, after the curl
 check.** Measured 2026-10-18 in both:
 
 - In-app browser (Chromium 152): every `fetch()` from an https page to
@@ -863,7 +877,7 @@ curl check before `send()` is the guard against a dead port, and
 `restore()` is the way back.
 
 ```js
-await __aeHarvest.send(8765, {via: 'form'})   // both browsers, after: curl -s http://127.0.0.1:8765/
+await __aeHarvest.send(8765, {via: 'form', token: '<token>'})   // both browsers, after: curl -s http://127.0.0.1:8765/
 // visible tab: "UNCONFIRMED: form-posted 91234 chars to http://127.0.0.1:8765/harvest; backup saved (400 items)
 //               - delivered only if the receiver prints "saved <path>" in its own output: read it there, …"
 // hidden tab:  "UNCONFIRMED: form-posted … (tab hidden: fetch skipped); backup saved (400 items) - …"
@@ -1305,7 +1319,7 @@ under `detail`.
 (0,eval)(localStorage.getItem('__aeSrc:listing'))
 await __aeListing.capture()        // pick() first when another option is needed
 __aeListing.captured()             // the ids saved so far
-__aeListing.sendAll(8765)          // after: curl -s http://127.0.0.1:8765/ (navigates; saved as details-<stamp>.json)
+__aeListing.sendAll(8765, {token: '<token>'})  // after: curl -s http://127.0.0.1:8765/ (navigates; saved as details-<stamp>.json)
 __aeListing.dropCaptured()         // after the receiver printed "saved <path>"
 ```
 
@@ -1314,6 +1328,17 @@ as in step 2. A record also holds `store`, the seller's store name (`null` when
 the page text had none: unknown), and `storeOfficial`, for step 6. After
 `sendAll()` the tab is on the receiver, not AliExpress: navigate back to
 `https://he.aliexpress.com/` before the next read.
+
+**`sendAll()` sends this run's records only.** A record holds `capturedAt`,
+and `sendAll()` sends the ones captured in the last 8 hours. Older ones, and
+ones with no `capturedAt` (captured before 2026-11-09), are named in its reply
+(`Left out: …`) and stay saved; `sendAll(8765, {token, all: true})` sends them
+too, and `dropCaptured()` removes every record. The `capture()` summary says
+`olderRecords: N` while such records exist: at the first capture of a run,
+that means a past run ended without the cleanup. Read their ids before
+deciding. Found in the review of 9e11593 (2026-11-09, in the code): every
+`__aeDet:` record of the site was sent, so the finalists of an earlier search
+that skipped the cleanup were ranked with this run's, with no warning.
 
 When tiles share a name (`pick(name, n)`), a record also holds `selectedTiles`,
 `{ name, n }` per selected tile, and the summary holds `selectedN`: the n of
@@ -1401,6 +1426,15 @@ its count.
   `galleryScope: 'unscoped'` means the product container was not found and
   the old "every big image" list came back instead, with a warning: then
   check every image before trusting it.
+- **Reviews are not this listing's text.** `sizeLines` and `ratingLines`
+  leave out the review section (`#nav-review`), its review items
+  (`list--itemBox--`, also in the modal its "View more" opens) and the buyer
+  photo strip; their big photos count in `excludedImages.reviews`. `read()`
+  no longer clicks a "View more" there, or in related items. Measured live
+  2026-11-09: reviews are pooled across sellers, and one read "MacBook זיהה
+  אותו כ-65W ו-20V", a buyer's reading that `ratingLines` took as this
+  listing's rating. Review text stays in `text`; quote it only as a buyer's
+  claim.
 - **The description is read** (`description.source`): `rendered` from its
   shadow tree under `#nav-description`, or `fetched` from the URL the page
   already requested when nothing is rendered (a hidden tab never renders
@@ -1736,7 +1770,7 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 | File | Role |
 |------|------|
 | `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until an empty page or a page with no new ids (never on `finished`), reports `coverage.verdict`, `endSignal`, `relevance` (off-query streams) and `visibility`. Runs unchanged in both browsers; `forceEnglish()` (in-app only), `send()` (outcome-first reply; `send(port, {via: 'form'})` always posts the form, so it navigates even to a dead port: curl the receiver first; a plain `send()` never navigates after a refused fetch; a backup is saved before any form POST; the fetch race is skipped in a hidden tab), `restore()`/`backups()`/`dropBackup()` (localStorage backup per page, the run saved last first), `resume()` (clears a stop, keeps the items), `startPage`, `maxPages` capped at the site's last page (60), one `step()` loop at a time (`running` in `status()`), `expose()`/`chunks()` (Chrome export, visible tab only), `debugUrl()` (in-app only); `fourStar` off by default since 2026-10-20 (`true`, or an `extra` that carries the 4★ switch, makes `start()` `note`, `status()` `note` and a `four-star-switch` payload warning say so); a `step()` that reads the last allowed page ends with its stop set (`done: true`). |
-| `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; after a `curl` check, `__aeHarvest.send(port, {via: 'form'})` POSTs the payload to it and it writes `harvest-<query>-<stamp>.json` and prints `saved <path>` in its own output (a fetch gets the same line as its reply). A payload with a `kind` (the `sendAll()` detail records) is written as `<kind>-<stamp>.json`, so `details-<stamp>.json`, and any other payload that is not a search payload (the one page of `extract.js`) as `page-<stamp>.json`. No payload limit by default; exits after 60 idle minutes; `GET /` answers `ok …`; `GET /stop` ends it with exit 0, and is refused (403) when a web page sends it. |
+| `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; after a `curl` check, `__aeHarvest.send(port, {via: 'form', token})` POSTs the payload to it (it saves only at `/harvest/<token>`, the token of its `listening` line) and it writes `harvest-<query>-<stamp>.json` and prints `saved <path>` in its own output (a fetch gets the same line as its reply). A payload with a `kind` (the `sendAll()` detail records) is written as `<kind>-<stamp>.json`, so `details-<stamp>.json`, and any other payload that is not a search payload (the one page of `extract.js`) as `page-<stamp>.json`. No payload limit by default; exits after 60 idle minutes; `GET /` answers `ok …`; `GET /stop` ends it with exit 0, and is refused (403) when a web page sends it. |
 | `scripts/decode.mjs` | **Fallback decoder and merger.** Reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps (any order, refuses a partial set), or from a plain payload JSON or an array of them. Several payloads are merged, deduped by id, never dropped. A file that is not a search payload (a `kind`, the one page of `extract.js`, another source, a merged file that holds one) is refused with exit 2, naming the file: it goes to `rank.mjs`. |
 | `scripts/dist/bootstrap-harvest.min.js`, `bootstrap-listing.min.js` | **The one paste per script per run.** Generated. The min copy, which also saves its own text in `localStorage`; later pages run `(0,eval)(localStorage.getItem('__aeSrc:harvest'))`. |
 | `scripts/build.mjs` | Writes `scripts/dist/*.min.js`: the three browser files without comments, for the install paste, and the two `bootstrap-*.min.js` files. `--check` reports a stale copy; `test.mjs` fails on one. |
@@ -1759,6 +1793,27 @@ matches `lib.mjs` on every fixture — keep them in sync, the test will catch yo
 if you don't. A drifted `wallVerdict` means one entry point silently stops
 detecting walls; a drifted `SOLD_RE` means best sellers silently lose their
 sold count.
+
+### Defects fixed 2026-11-09 (review of 9e11593)
+
+A code review of the second round below found 3 defects. Each has a test
+(`N10`) that fails on 9e11593. The review zone was read on a live page
+(he.aliexpress.com/item/1005005994445557); the token and the record filter
+are checked in `test.mjs` only.
+
+1. **Any web page could write into the harvest folder.** `receiver.mjs` saved
+   any payload-shaped POST, and `decode.mjs harvest-*.json` merged it. The
+   `Origin` header cannot help: a form POST from https to `http://127.0.0.1`
+   carries `Origin: null` from AliExpress too. Guard: a token per run, printed
+   in the `listening` line; a payload is saved only at `/harvest/<token>`, and
+   every send names it. A body over 64 MiB is refused.
+2. **Review text became this listing's size and rating.** `listing.js` had no
+   review zone, and `expand()` opened the reviews' modal. Guard: a `reviews`
+   zone, left out of `sizeLines`, `ratingLines` and `expand()`.
+3. **`sendAll()` sent the records of an earlier run.** A record said nothing
+   about its run. Guard: `capturedAt`; `sendAll()` sends the last 8 hours and
+   names the rest; `{all: true}` sends all; `olderRecords` in the `capture()`
+   summary.
 
 ### Defects fixed 2026-11-08, second round (review of 58c8a00)
 

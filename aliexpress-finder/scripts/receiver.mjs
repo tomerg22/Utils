@@ -2,13 +2,28 @@
 /* Local receiver for harvest payloads — the export channel that needs no
  * retyping and no chunking, in either browser.
  *
- *   node receiver.mjs --dir <outdir> [--port 8765] [--count 0] [--idle 3600]
+ *   node receiver.mjs --dir <outdir> [--port 8765] [--count 0] [--idle 3600] [--token <token>] [--max-bytes N]
  *
- * Prints one line, `listening http://127.0.0.1:<port> dir <dir>`, then waits.
- * The page POSTs its payload with `await __aeHarvest.send(<port>, {via: 'form'})`
- * after `curl -s http://127.0.0.1:<port>/` answers ok (a plain send() fetch
- * was refused by both browsers on 2026-10-18; see SKILL.md step 3). The body is
- * validated as a payload and written to
+ * Prints one line, `listening http://127.0.0.1:<port> dir <dir> token <token>`,
+ * then waits. The page POSTs its payload with
+ * `await __aeHarvest.send(<port>, {via: 'form', token: '<token>'})` after
+ * `curl -s http://127.0.0.1:<port>/` answers ok (a plain send() fetch was
+ * refused by both browsers on 2026-10-18; see SKILL.md step 3).
+ *
+ * THE TOKEN (added 2026-11-09, review of 9e11593). A payload is saved only
+ * when it is POSTed to /harvest/<token>. The token is random per run (or
+ * --token), printed only in the "listening" line, and never in a reply. Any
+ * web page open in the browser could POST here: CORS is open, and the
+ * receiver answers Chrome's private-network preflight. A test POST with
+ * `Origin: https://evil.example` was saved as harvest-wired-usb-mouse-….json,
+ * which `decode.mjs harvest-*.json` then merges into the search pool. The
+ * Origin header cannot tell the two apart: a form POST from an https page to
+ * http://127.0.0.1 carries `Origin: null` (Fetch standard, "append a request
+ * Origin header": a downgrade to http under the default referrer policy), so
+ * the real AliExpress form and a hostile one look the same. Only a secret the
+ * page cannot read tells them apart. A body over --max-bytes is refused (413).
+ *
+ * The body is validated as a payload and written to
  *   <dir>/harvest-<query-slug>-<timestamp>.json   a search payload (harvest.js, decode.mjs)
  *   <dir>/<kind>-<timestamp>.json                 a payload that names its `kind` (the detail
  *                                                 records of __aeListing.sendAll(): details-…)
@@ -46,8 +61,17 @@
  * straight from the page to disk.
  */
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+
+/* A token: letters and digits only, so it can be typed into a send() call
+ * and sits in a URL path with no escaping. 16 hex digits are 64 random bits. */
+export const TOKEN_RE = /^[0-9A-Za-z]{8,64}$/;
+export const newToken = () => randomBytes(8).toString('hex');
+/* 64 MiB. A full 60-page harvest is about 2 MB (500 chars per item, 3,600
+ * items), and the detail records of 40 finalists a few MB more. */
+export const MAX_BYTES = 64 * 1024 * 1024;
 
 /* --name value or --name=value. An unknown flag is an error: "--idle=1"
  * and typos used to be ignored, so the receiver ran with the defaults.
@@ -58,7 +82,7 @@ import { join, resolve } from 'node:path';
  * and saved into the cwd. A value that starts with "--" is taken only in the
  * --name=value form. When a flag is given twice, the first one counts.
  * Returns { opts, error }: error is null or the message to print. */
-const FLAGS = ['dir', 'port', 'count', 'idle'];
+const FLAGS = ['dir', 'port', 'count', 'idle', 'token', 'max-bytes'];
 export function parseArgs(argv) {
   const opts = {};
   for (let i = 0; i < argv.length; i++) {
@@ -125,7 +149,14 @@ export function validate(text) {
   return { payload: j, body };
 }
 
-export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () => {} }) {
+/** The token a POST names: /harvest/<token>, '' when it names none. */
+export function tokenOf(url) {
+  const path = String(url || '').split('?')[0].replace(/\/+$/, '');
+  return path.startsWith('/harvest/') ? path.slice('/harvest/'.length) : '';
+}
+
+export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () => {}, token = newToken(), maxBytes = MAX_BYTES }) {
+  if (!TOKEN_RE.test(String(token))) throw new Error('the token must be 8 to 64 letters or digits');
   mkdirSync(dir, { recursive: true });
   let received = 0;
   let timer = null;
@@ -161,10 +192,29 @@ export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () 
       res.end('ok ' + received + (count > 0 ? '/' + count : '') + ' saved, idle ' + idle + ' s from now');
       return;
     }
-    if (req.method !== 'POST') { res.writeHead(405, cors); res.end('POST /harvest'); return; }
+    if (req.method !== 'POST') { res.writeHead(405, cors); res.end('POST /harvest/<token>'); return; }
+    // Checked before the body is read. The reply never holds the token.
+    const given = tokenOf(req.url);
+    if (given !== token) {
+      res.writeHead(403, cors);
+      res.end('not saved: ' + (given ? 'wrong' : 'no') + ' token. Post to the address with the token printed in the ' +
+        'receiver\'s "listening" line: send(<port>, {via: \'form\', token: \'<token>\'})');
+      log('refused a POST with ' + (given ? 'a wrong token' : 'no token') + ' (origin ' + (req.headers.origin || 'none') + ')');
+      req.resume();
+      return;
+    }
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    let size = 0, over = false;
+    req.on('data', (c) => {
+      if (over) return; // drained, never kept
+      size += c.length;
+      if (size <= maxBytes) { chunks.push(c); return; }
+      over = true; chunks.length = 0;
+      res.writeHead(413, cors); res.end('not saved: the body is over ' + maxBytes + ' bytes');
+      log('refused a body over ' + maxBytes + ' bytes');
+    });
     req.on('end', () => {
+      if (over) return;
       const text = Buffer.concat(chunks).toString('utf8');
       const v = validate(text);
       if (v.err) { res.writeHead(400, cors); res.end(v.err); log('rejected: ' + v.err); return; }
@@ -201,7 +251,7 @@ export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () 
     server.on('error', reject);
     server.listen(port, '127.0.0.1', () => {
       arm();
-      resolveP({ port: server.address().port, close: () => new Promise((r) => server.close(r)), server });
+      resolveP({ port: server.address().port, token, close: () => new Promise((r) => server.close(r)), server });
     });
   });
 }
@@ -229,8 +279,15 @@ if (isMain) {
   const port = whole('port', arg('port', 8765), 0, 65535);
   const count = whole('count', arg('count', 0), 0, 1e9);
   const idle = whole('idle', arg('idle', 3600), 1, 2147483);
-  startReceiver({ dir, port, count, idle, log: (m) => console.log(m) })
-    .then(({ port: p }) => console.log('listening http://127.0.0.1:' + p + ' dir ' + dir +
-      (count > 0 ? ' (exits after ' + count + ' payload(s)' : ' (no payload limit') + ', or ' + idle + ' s idle)'))
+  const maxBytes = whole('max-bytes', arg('max-bytes', MAX_BYTES), 1, 1024 * 1024 * 1024);
+  // --token keeps one token across a restart; without it, a new one per run.
+  if (opts.token != null && !TOKEN_RE.test(opts.token)) {
+    console.error('receiver: --token must be 8 to 64 letters or digits, got ' + JSON.stringify(opts.token)); process.exit(2);
+  }
+  const token = opts.token != null ? opts.token : newToken();
+  startReceiver({ dir, port, count, idle, token, maxBytes, log: (m) => console.log(m) })
+    .then(({ port: p }) => console.log('listening http://127.0.0.1:' + p + ' dir ' + dir + ' token ' + token +
+      (count > 0 ? ' (exits after ' + count + ' payload(s)' : ' (no payload limit') + ', or ' + idle + ' s idle)' +
+      '. Send with token: \'' + token + '\''))
     .catch((e) => { console.error('receiver: ' + e.message); process.exit(1); });
 }

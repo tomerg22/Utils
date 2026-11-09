@@ -3138,7 +3138,7 @@ await block('W11', async () => {
   const libText = SRC('lib.mjs');
   const blockOf = (text, name) => (text.match(new RegExp('/\\* @shared:' + name + ':start \\*/([\\s\\S]*?)/\\* @shared:' + name + ':end \\*/')) || [])[1];
   const pairs = [['parseSold', ['harvest.js', 'extract.js']], ['soldRe', ['harvest.js', 'extract.js']], ['wallVerdict', ['harvest.js', 'extract.js', 'listing.js']],
-    ['queryRelevance', ['harvest.js']], ['reviewBlock', ['listing.js']]];
+    ['queryRelevance', ['harvest.js']], ['reviewBlock', ['listing.js']], ['reqLog', ['harvest.js', 'listing.js']]];
   for (const [name, files] of pairs) {
     const want = norm(blockOf(libText, name) || '');
     for (const f of files) {
@@ -3294,7 +3294,8 @@ await block('R-F02', async () => {
   new Function('window', 'fetch', harvestSrc)(wd, pageFetch({ 1: ['q1'], 2: [] }));
   wd.__aeHarvest.start({ query: 'wire brush set' });
   await wd.__aeHarvest.step(3);
-  const saveLen = [...dry._m.values()][0].length;
+  // The backup's size, by its key: the request log (__aeReq:log, 2026-11-09) is in the store too.
+  const saveLen = [...dry._m.entries()].find(([k]) => k.startsWith('__aeHarvest:'))[1].length;
   const filler = 'x'.repeat(800);
   const old1 = JSON.stringify({ v: 2, savedAt: Date.now() - 1000, query: 'worked on', items: [], pad: filler });
   const old2 = JSON.stringify({ v: 2, savedAt: 5, query: 'left alone', items: [], pad: filler });
@@ -4751,7 +4752,8 @@ await block('F31-7', async () => {
   eq('F31-5: rank.mjs reads a record as it is, with no off-query warning', [ranked.ranked.length, ranked.ranked[0].ratingUsed, ranked.warnings], [1, 4.7, []]);
 
   const wall = await mk({ bodyText: 'Please slide to verify. unusual traffic', storage }).L.capture({ description: false });
-  eq('F31-5: a wall saves nothing and says so', [wall.saved, wall.blocked, storage.length], [false, true, 1]);
+  // Records only: the request log (__aeReq:log) counts the wall page too, and that is right.
+  eq('F31-5: a wall saves nothing and says so', [wall.saved, wall.blocked, [...storage._m.keys()].filter((k) => k.startsWith('__aeDet:')).length], [false, true, 1]);
   const full = fakeStorage(); full.setItem = () => { throw new Error('QuotaExceededError'); };
   const fullR = await mk({ ld: LD, bodyText: body, storage: full }).L.capture({ description: false });
   ok('F31-5: a full store is reported, never "saved"', fullR.saved === false && /Quota/.test(fullR.err), JSON.stringify(fullR));
@@ -5587,6 +5589,198 @@ await block('N10-3', async () => {
   eq('N10-3: the summary counts the records of an earlier run', brief.olderRecords, 2);
   ok('N10-3: and still fits the Chrome cap', JSON.stringify(brief).length < 1000, String(JSON.stringify(brief).length));
   ok('N10-3: SKILL.md says sendAll() sends this run\'s records only', /\*\*`sendAll\(\)` sends this run's records only\.\*\*/.test(skillSrc));
+});
+
+// ============================================================================
+// 2026-11-09, the bluetooth-mouse session: four gaps found in a live run.
+// Each block fails on the code before the fix (c0f80c6).
+// ============================================================================
+/* listing.js on a stub detail page that can share a localStorage with other
+ * "documents" (each call is a new document) and answer a description fetch. */
+const n11L = ({ els = [], storage = fakeStorage(), path = '/item/1005009916144912.html', desc = null, win = {} } = {}) => {
+  const DESC = 'https://pdp.aliexpress-media.com/product/description/pc/v2/en_US/desc.htm?productId=1';
+  const count = { fetches: 0 };
+  const document = { title: 'Mouse', body: { scrollHeight: 5000, innerText: 'x'.repeat(2500), appendChild() {} }, documentElement: { outerHTML: '' },
+    querySelectorAll: (sel) => (/ld\+json/.test(sel || '') ? [] : els) };
+  const w = { scrollTo() {}, document, localStorage: storage, ...win };
+  if (desc) Object.assign(w, {
+    performance: { getEntriesByType: () => [{ name: DESC }] },
+    fetch: async () => { count.fetches++; return { url: DESC, status: 200, ok: true, text: async () => '<html>' + desc.body + '</html>' }; },
+    DOMParser: class { parseFromString() {
+      const p = leEl('P', { text: desc.body });
+      const imgs = (desc.images || []).map((u) => leEl('IMG', { attrs: { src: u } }));
+      return { body: leEl('BODY', { qsa: [p, ...imgs], nodes: [p] }), querySelectorAll: () => [p, ...imgs] };
+    } },
+  });
+  const L = new Function('window', 'document', 'location', `${RUN('listing.js')}; return window.__aeListing;`)(w, document,
+    { href: 'https://he.aliexpress.com' + path, pathname: path, origin: 'https://he.aliexpress.com' });
+  return { L, w, storage, count };
+};
+const n11Tile = (name, sel) => leEl('DIV', { cls: 'sku-item--text--Q' + (sel ? ' sku-item--selected--I' : ''), text: name });
+const n11Row = (k, val) => { const kt = leEl('DIV', { cls: 'specification--title--S', text: k }), vt = leEl('DIV', { cls: 'specification--desc--D', text: val });
+  return leEl('DIV', { cls: 'specification--prop--J', children: [kt, vt], qsa: [kt, vt] }); };
+
+console.log('\nN11-1: no result is shaped like a cookie: specLine() (measured on the connector 2026-11-09)');
+await block('N11-1', async () => {
+  /* What the Chrome connector replaced with [BLOCKED: Cookie/query string
+   * data], measured 2026-11-09 on example.com, one javascript_tool result
+   * each. BLOCK_RE is a rule that fits all 17: a name=value, a ";" or "&",
+   * and another "=" (D shows the second name may hold spaces). */
+  const BLOCK_RE = /[^\s=;&]+\s*=\s*[^;&]*[;&][^=;&]*=/;
+  const blocked = ['B: a=b; c=d', 'C: Power Type=Rechargeable; DPI=1600',
+    'D: High-concerned chemical=None; Power Type=Rechargeable; Number of Rollers=1 pcs; Hand Orientation=Right',
+    'E: x=1&y=2', 'G: a = b; c = d', 'P: a=b;c=d', 'Q: text before; a=b and later; c=d'];
+  const passed = ['A: a=b', 'F: 1+1=2', 'H: Power Type: Rechargeable / DPI: 1600', '{"I":"price=3.84"}', 'J: Type=Bluetooth Wireless',
+    'K: a=b c=d', 'L: a=b, c=d', 'M: a=b\nc=d', '["N: a=b","c=d"]', 'O: a=b / c=d', 'R: a: b; c: d'];
+  eq('N11-1: the rule fits every measured case', [blocked.filter((s) => !BLOCK_RE.test(s)), passed.filter((s) => BLOCK_RE.test(s))], [[], []]);
+
+  const rows = [['Type', 'Bluetooth Wireless'], ['Power Type', 'Rechargeable'], ['Brand Name', 'SMAILWOLF'], ['Origin', 'Mainland China'],
+    ['Connection', 'mode=BT; mode=2.4G'], ['Package & Box', 'a=1&b=2'], ['DPI', '12000']];
+  const { L } = n11L({ els: rows.map(([k, v]) => n11Row(k, v)) });
+  eq('N11-1: before a read it says so', L.specLine(), 'no rows: await __aeListing.read() first');
+  await L.read({ description: false });
+  const line = L.specLine();
+  eq('N11-1: one line, "Name: value / Name: value", the SKIP rows left out',
+    line, 'Type: Bluetooth Wireless / Power Type: Rechargeable / Connection: mode=BT, mode=2.4G / Package , Box: a=1,b=2 / DPI: 12000');
+  ok('N11-1: it never holds the blocked shape, even when a value does', !BLOCK_RE.test(line) && line.length < 1000, line);
+  ok('N11-1: {all: true} keeps the SKIP rows', /Brand Name: SMAILWOLF/.test(L.specLine({ all: true })) && /Origin: Mainland China/.test(L.specLine({ all: true })));
+  const big = n11L({ els: Array.from({ length: 40 }, (_, i) => n11Row('Row name ' + String(i).padStart(2, '0'), 'v'.repeat(40))) }).L;
+  await big.read({ description: false });
+  const cut = big.specLine();
+  const keptRows = cut.replace(/ \.\.\. cut: .*$/, '').split(' / ');
+  ok('N11-1: a long table is cut at a whole row, under 1,000, and says how many rows it kept',
+    cut.length < 1000 && keptRows.every((p) => /^Row name \d{2}: v{40}$/.test(p)) && cut.endsWith(' ... cut: ' + keptRows.length + ' of 40 rows'), cut.slice(-80));
+  eq('N11-1: a smaller max is honoured', big.specLine({ max: 200 }).length <= 200, true);
+  const none = n11L({}).L; await none.read({ description: false });
+  eq('N11-1: no rows says where it looked', none.specLine(), 'no rows (specsSource none)');
+  const table = skillSrc.slice(skillSrc.indexOf('### Chrome connector rules'), skillSrc.indexOf('### A hidden tab'));
+  ok('N11-1: the connector table names the name=value rule', /two `name=value` pairs joined by `;` or `&`/.test(table), table.slice(0, 200));
+  const link = skillSrc.split(/^## One given listing/m)[1].split(/^## /m)[0];
+  ok('N11-1: the link flow reads the rows with specLine()', /__aeListing\.specLine\(\)/.test(link));
+});
+
+console.log('\nN11-2: capturing again keeps the description images (Baseus F01B, 2026-11-09)');
+await block('N11-2', async () => {
+  const CDN = 'https://ae-pic-a1.aliexpress-media.com/kf/';
+  const desc = { body: 'Bluetooth 3.0 / 5.0 and 2.4G, 1 x AA battery, size 100 x 58 x 36 mm', images: [CDN + 'Sd1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg', CDN + 'Sd2bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.jpg'] };
+  const storage = fakeStorage();
+  const id = '1005006782986446';
+  const page = n11L({ els: [n11Tile('2.4G Grey', true), n11Tile('BT3.0 BT5.0 and 2.4G')], storage, path: '/item/' + id + '.html', desc });
+  const first = await page.L.capture();
+  eq('N11-2: the first capture fetches the description and saves its images', [first.description, first.descriptionImages, page.count.fetches], ['fetched', 2, 1]);
+  // pick() then capture({ description: false }), on the same page.
+  const again = await page.L.capture({ description: false });
+  const rec = JSON.parse(storage.getItem('__aeDet:' + id));
+  eq('N11-2: the same page: the read is used again, nothing is fetched, the images stay',
+    [again.descriptionReused, again.descriptionImages, rec.descriptionImages.length, page.count.fetches, page.L.last.description.reused], [true, 2, 2, 1, true]);
+  ok('N11-2: and its text is still in `text`', /\[DESCRIPTION\] Bluetooth 3\.0/.test(page.L.last.text));
+  // Another page (a new document) on the same listing, read with no description.
+  const later = n11L({ storage, path: '/item/' + id + '.html' });
+  const third = await later.L.capture({ description: false });
+  const rec3 = JSON.parse(storage.getItem('__aeDet:' + id));
+  eq('N11-2: a new page with no description keeps the record\'s images, and says from when',
+    [third.descriptionKept, third.descriptionImages, rec3.descriptionImages, rec3.descriptionKeptFrom], [true, 2, desc.images, rec.capturedAt]);
+  eq('N11-2: that read itself still says skipped', later.L.last.description.source, 'skipped');
+  // Another listing's description is never reused.
+  const other = n11L({ storage, path: '/item/1.html' });
+  const o = await other.L.capture({ description: false });
+  eq('N11-2: another listing: nothing kept, nothing reused', [o.descriptionImages, 'descriptionKept' in o, 'descriptionReused' in o], [0, false, false]);
+  // A new description replaces the old images.
+  const newer = n11L({ storage, path: '/item/' + id + '.html', desc: { body: 'Size 100 x 58 x 36 mm, new copy', images: [CDN + 'Sd9zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.jpg'] } });
+  const fresh = await newer.L.capture();
+  eq('N11-2: a description read now replaces the kept images', [fresh.descriptionImages, 'descriptionKept' in fresh, JSON.parse(storage.getItem('__aeDet:' + id)).descriptionImages],
+    [1, false, [CDN + 'Sd9zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.jpg']]);
+  ok('N11-2: SKILL.md says a second capture keeps the description', /\*\*Capturing again keeps the description\.\*\*/.test(skillSrc));
+});
+
+console.log('\nN11-3: specs-vs-option compares mouse sensors (SMAILWOLF RS7, 2026-11-09)');
+await block('N11-3', async () => {
+  const warn = async (opts, rows) => (await n11L({ els: [...opts.map(([n, s]) => n11Tile(n, s)), ...rows.map(([k, v]) => n11Row(k, v))] }).L.read({ description: false }))
+    .warnings.filter((w) => w.startsWith('specs-vs-option'));
+  const RS7 = [['RS7 Black', true], ['RS7 White'], ['RS7 Black PAW3311'], ['RS7 Red'], ['RS7 White PAW3311']];
+  const ROW = [['Sensor model', 'Pixart 3311 (12000 DPI|300 IPS|35G)'], ['DPI', '12000'], ['Type', 'Bluetooth Wireless']];
+  const live = await warn(RS7, ROW);
+  eq('N11-3: the live listing: one warning', live.length, 1);
+  ok('N11-3: it names the row, the option that names that sensor, and the selected one',
+    live.length === 1 && live[0].includes('"Sensor model"') && live[0].includes('"RS7 Black PAW3311"') && live[0].includes('"RS7 Black" names no sensor') && live[0].includes('selectedImages'), live[0]);
+  eq('N11-3: the PAW3311 option selected: no warning', await warn(RS7.map(([n]) => [n, n === 'RS7 Black PAW3311']), ROW), []);
+  const differs = await warn([['Mouse PAW3311', true], ['Mouse PAW3104']], [['Sensor', 'Pixart 3395']]);
+  ok('N11-3: a selected option naming another sensor warns', differs.length === 1 && /"Mouse PAW3311" names another sensor than spec row "Sensor": Pixart 3395/.test(differs[0]), JSON.stringify(differs));
+  const none = [
+    [[['Black', true], ['White']], [['Sensor model', 'Pixart 3311']], 'no option names a sensor'],
+    [[['RS7 Black', true], ['RS7 Black PAW3311']], [['Feature 3', 'PAW3311 sensor']], 'a row not named for the sensor'],
+    [[['RS7 Black', true], ['RS7 Black PAW3311']], [['Sensor', 'Optical']], 'a sensor row with no code'],
+    [[['X8 PAW3395SE', true]], [['Sensor model', 'Pixart 3395 (26000 DPI|650 IPS|50G)']], 'the same 4 digits: a suffix is not compared (a limit)'],
+    [[['Mouse PAW3311', true]], [['Sensor', '3311']], 'a bare number in a sensor row'],
+    [[['Black', true], ['PAW3311 version', true], ['PAW3104 version']], [['Sensor model', 'Pixart 3311']], 'another selected property names the sensor'],
+    [[['RS7 Black', true], ['RS7 Black PMW3389']], [['Sensor model', 'Pixart 3311']], 'the other option names another sensor'],
+  ];
+  for (const [opts, rows, why] of none) eq('N11-3: no warning: ' + why, await warn(opts, rows), []);
+  eq('N11-3: PMW codes count too', (await warn([['M PMW3389', true]], [['Sensor', 'PixArt PAW3311']])).length, 1);
+  eq('N11-3: a bare number in the row against another code warns', (await warn([['Mouse PAW3104', true]], [['Image Sensors', '3311']])).length, 1);
+  const link = skillSrc.split(/^## One given listing/m)[1].split(/^## /m)[0];
+  ok('N11-3: SKILL.md says the check compares sensor codes', /sensor codes/.test(link) && !/It compares only voltage, power, current, RPM and mAh\./.test(link));
+});
+
+console.log('\nN11-4: one log counts the site requests of every tab and script');
+await block('N11-4', async () => {
+  const { REQ_KEY, reqLogAdd, reqLogRead, reqLogSummary } = await import('./lib.mjs');
+  const t0 = 1_800_000_000_000;
+  const ls = fakeStorage();
+  reqLogAdd(ls, 'page', t0 - 25 * 3600e3);
+  reqLogAdd(ls, 'page', t0 - 30 * 60e3);
+  reqLogAdd(ls, 'search', t0 - 5 * 60e3);
+  reqLogAdd(ls, 'desc', t0 - 60e3);
+  const log = reqLogRead(ls);
+  eq('N11-4: an entry older than 24 h is dropped on the next add', log.length, 3);
+  eq('N11-4: the windows, desc apart', reqLogSummary(log, t0), { last10min: { site: 1, desc: 1 }, last60min: { site: 2, desc: 1 }, last24h: { site: 2, desc: 1 }, firstMinAgo: 30 });
+  for (let i = 0; i < 600; i++) reqLogAdd(ls, 'search', t0 - 600 + i);
+  eq('N11-4: at most 500 entries are kept', reqLogRead(ls).length, 500);
+  const near = fakeStorage();
+  for (let i = 0; i < 45; i++) reqLogAdd(near, 'search', t0 - i * 1000);
+  ok('N11-4: 45 site requests in 60 min warn', /^near the wall: 45 site requests in 60 min/.test(reqLogSummary(reqLogRead(near), t0).warn || ''), JSON.stringify(reqLogSummary(reqLogRead(near), t0)));
+  ok('N11-4: 44 do not', !('warn' in reqLogSummary(reqLogRead(near).slice(1), t0)));
+  const bad = fakeStorage(); bad.setItem(REQ_KEY, '{not json');
+  eq('N11-4: a broken log reads as empty and is rewritten', [reqLogRead(bad), reqLogAdd(bad, 'page', t0), reqLogRead(bad).length], [[], true, 1]);
+  eq('N11-4: no storage, no throw', [reqLogAdd(null, 'page'), reqLogRead(null)], [false, []]);
+
+  // harvest.js and listing.js write the same log.
+  const shared = fakeStorage();
+  const kinds = () => reqLogRead(shared).map((e) => e[1]);
+  const w1 = { localStorage: shared };
+  const site = pageFetch({ 1: ['m1', 'm2'], 2: ['m3'], 3: [] });
+  new Function('window', 'fetch', harvestSrc)(w1, site);
+  new Function('window', 'fetch', harvestSrc)(w1, site);
+  eq('N11-4: installing harvest.js counts its page once, a second install on that page does not', kinds(), ['page']);
+  w1.__aeHarvest.start({ query: 'bluetooth mouse' });
+  const st = await w1.__aeHarvest.step(5);
+  eq('N11-4: each search fetch is one entry', kinds(), ['page', 'search', 'search', 'search']);
+  eq('N11-4: status() gives the 60-min site count beside this run\'s requests', [st.requests, st.siteRequests60m, 'nearWall' in st], [3, 4, false]);
+  eq('N11-4: requests() is the summary', w1.__aeHarvest.requests().last60min, { site: 4, desc: 0 });
+  // listing.js on the same window: the same page, not counted again.
+  new Function('window', 'document', 'location', `${RUN('listing.js')}; return window.__aeListing;`)(w1, { body: { innerText: '' }, querySelectorAll: () => [] }, { href: 'https://he.aliexpress.com/' });
+  eq('N11-4: listing.js beside harvest.js on one page: still one page entry', kinds().filter((k) => k === 'page').length, 1);
+  // A detail page: a new document, and a description fetch.
+  const d = n11L({ storage: shared, path: '/item/7.html', desc: { body: 'Size 100 x 58 x 36 mm', images: [] } });
+  const brief = await d.L.capture();
+  eq('N11-4: the detail page counts its page and its description apart', [kinds().slice(-2), brief.siteRequests60m, d.L.requests().last60min], [['page', 'desc'], 5, { site: 5, desc: 1 }]);
+  ok('N11-4: the capture summary still fits the connector', JSON.stringify(brief).length < 1000, String(JSON.stringify(brief).length));
+  for (let i = 0; i < 40; i++) reqLogAdd(shared, 'search');
+  const nearBrief = await n11L({ storage: shared, path: '/item/8.html' }).L.capture({ description: false });
+  eq('N11-4: near the wall, capture() and status() say so with a flag', [nearBrief.nearWall, w1.__aeHarvest.status().nearWall], [true, true]);
+  ok('N11-4: and status() still fits the connector', JSON.stringify(w1.__aeHarvest.status()).length < 1000);
+
+  // The cleanup removes the log, and says its count first.
+  const code = (skillSrc.match(/<!-- @snippet:cleanup:start -->\s*```js\n([\s\S]*?)\n```\s*<!-- @snippet:cleanup:end -->/) || [])[1];
+  const run = (hostname, s) => new Function('location', 'localStorage', 'return (' + code + '\n)')({ hostname }, s);
+  const cl = fakeStorage();
+  cl.setItem('__aeSrc:listing', '1');
+  reqLogAdd(cl, 'page'); reqLogAdd(cl, 'search'); reqLogAdd(cl, 'desc'); reqLogAdd(cl, 'page', Date.now() - 2 * 3600e3);
+  const msg = run('he.aliexpress.com', cl);
+  ok('N11-4: the cleanup removes the log and reports its 60-min site count',
+    /^removed 2 key\(s\) on he\.aliexpress\.com \{"__aeSrc":1,"__aeReq":1\}; none left on he\.aliexpress\.com\. The request log held 2 site request\(s\) of the last 60 min$/.test(msg) && cl.length === 0, msg);
+  const step2 = skillSrc.slice(skillSrc.indexOf('## Step 2'), skillSrc.indexOf('## Step 3'));
+  ok('N11-4: step 2 tells the operator to read the count', /`__aeHarvest\.requests\(\)`/.test(step2) && /`__aeListing\.requests\(\)`/.test(step2) && /siteRequests60m/.test(step2));
 });
 
 // ---------------------------------------------- the whole suite on dist/

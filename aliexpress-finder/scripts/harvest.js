@@ -579,6 +579,50 @@ function queryRelevance(query, titles) {
 }
 /* @shared:queryRelevance:end */
 
+/* @shared:reqLog:start */
+/* The site requests of this browser, across tabs, scripts and runs, in
+ * localStorage (it belongs to the origin, so every tab of he.aliexpress.com
+ * sees one log). The wall (SKILL.md step 2) was measured near 50-60 requests
+ * in one session, and nothing counted them: the harvester counted its own
+ * fetches only, and the detail pages of step 5 were counted by hand (about 52
+ * on 2026-11-09). Each entry is [time in ms, kind]:
+ *   page    a page load on which a skill script was installed (once per
+ *           document; a page with no script installed is not seen)
+ *   search  a harvest.js search-page fetch
+ *   desc    a listing.js description fetch (another host: counted apart)
+ * Entries older than 24 h are dropped, and at most 500 are kept. */
+const REQ_KEY = '__aeReq:log';
+function reqLogRead(ls) {
+  try {
+    const a = JSON.parse((ls && ls.getItem(REQ_KEY)) || '[]');
+    return Array.isArray(a) ? a.filter((e) => Array.isArray(e) && typeof e[0] === 'number' && typeof e[1] === 'string') : [];
+  } catch (e) { return []; }
+}
+function reqLogAdd(ls, kind, now) {
+  if (!ls) return false;
+  const t = now == null ? Date.now() : now;
+  const a = reqLogRead(ls).filter((e) => t - e[0] <= 24 * 3600e3).slice(-499);
+  a.push([t, kind]);
+  try { ls.setItem(REQ_KEY, JSON.stringify(a)); return true; } catch (e) { return false; }
+}
+/* Counts in the last 10 and 60 minutes and 24 hours. `site` is pages plus
+ * search fetches; `desc` is the description host, counted apart. */
+function reqLogSummary(log, now) {
+  const t = now == null ? Date.now() : now;
+  const win = (min) => {
+    const o = { site: 0, desc: 0 };
+    for (const [at, kind] of log) if (t - at >= 0 && t - at <= min * 60e3) o[kind === 'desc' ? 'desc' : 'site']++;
+    return o;
+  };
+  const s = { last10min: win(10), last60min: win(60), last24h: win(1440) };
+  s.firstMinAgo = log.length ? Math.round((t - log[0][0]) / 60e3) : null;
+  if (s.last60min.site >= 45) {
+    s.warn = 'near the wall: ' + s.last60min.site + ' site requests in 60 min, and the wall was measured near 50-60 in one session (SKILL.md step 2)';
+  }
+  return s;
+}
+/* @shared:reqLog:end */
+
   /* Visible-ish text of a fetched page: the HTML without scripts, styles and
    * tags. wallVerdict's "big HTML, no content" rule compares HTML size with
    * TEXT size. Passing the HTML as the text (as this file used to) made the
@@ -1196,6 +1240,8 @@ function queryRelevance(query, titles) {
           const p = s.page + 1;
           let html = '', finalUrl = '', status = null;
           s.requests++;
+          // The shared log counts it too, with the pages and the detail reads.
+          reqLogAdd(storage(), 'search');
           try {
             const r = await fetch(s.base + '&page=' + p, { credentials: 'include' });
             finalUrl = r.url;
@@ -1375,6 +1421,7 @@ function queryRelevance(query, titles) {
       const s = this.st;
       if (!s) return { err: 'not started' };
       const rel = queryRelevance(s.query, s.items.map((i) => i.title));
+      const req = reqLogSummary(reqLogRead(storage()));
       return {
         query: s.query, startPage: s.startPage || 1, pagesRead: s.page, requests: s.requests,
         maxRequests: s.maxRequests,
@@ -1392,9 +1439,23 @@ function queryRelevance(query, titles) {
         done: s.stop !== null,
         running: !!s.running,
         visibility: visibility(),
+        // Site requests of the last 60 min in this browser, every tab and
+        // script (requests() has the rest). `requests` above is this run's.
+        siteRequests60m: req.last60min.site,
+        // A flag, not the sentence (requests().warn): status() must stay short.
+        ...(req.warn ? { nearWall: true } : {}),
         // Last, so a cut at 1,000 characters loses the marker, not a field.
         ...(switchOn(s) ? { note: FOUR_STAR_SHORT } : {}),
       };
+    },
+
+    /* The site requests this browser made, from the shared log (see reqLog):
+     * pages with a skill script installed, search fetches and description
+     * fetches, in the last 10 and 60 minutes and 24 hours, with a `warn` from
+     * 45 site requests in 60 minutes. The same numbers as
+     * __aeListing.requests(). */
+    requests() {
+      return reqLogSummary(reqLogRead(storage()));
     },
 
     /* JSON string ready to pipe into rank.mjs. `coverage` is deliberately
@@ -1466,6 +1527,10 @@ function queryRelevance(query, titles) {
     H.st.backup = persist(H.st);
   }
   window.__aeHarvest = H;
+  /* This page load, once per document, in the shared request log. A flag on
+   * `window` and not in storage: a navigation clears it, a second install
+   * on the same page (or listing.js beside this file) does not count twice. */
+  if (!window.__aeReqPage) { window.__aeReqPage = true; reqLogAdd(storage(), 'page'); }
   /* The export named here is the one SKILL.md step 3 gives: a plain
    * send(8765) was refused by both browsers on 2026-10-18, so naming it
    * cost one wasted call per export (review, 2026-10-18). */

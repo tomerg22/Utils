@@ -167,12 +167,14 @@ public class MainActivity extends Activity {
                     // holding, cancels the touch, and sending stops mid-press.
                     v.getParent().requestDisallowInterceptTouchEvent(true);
                     v.setPressed(true);
-                    startSending(src.get());
+                    startSending(src.get(), 0, v);
                     return true;
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
                     v.setPressed(false);
-                    stopSending();
+                    // Only this button's own send: with two fingers down, lifting the
+                    // first one must not stop the button the second one still holds.
+                    stopSending(v);
                     return true;
                 default:
                     return true;
@@ -181,24 +183,24 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    /** Sends the code until stopSending() is called. */
-    private synchronized void startSending(IrCodes.Code code) {
-        startSending(code, 0);
-    }
-
     /** MUTE: VOL- for MUTE_MS. A second tap, or any other button, stops it. */
     private synchronized void toggleMute() {
         if (sender != null && muting) {
             stopSending();
             return;
         }
-        startSending(kitCode(false), MUTE_MS);
+        startSending(kitCode(false), MUTE_MS, null);
     }
 
     private volatile boolean muting;
+    /** The held button that started the current send; null for MUTE. */
+    private Object sendOwner;
 
-    /** Sends the code until stopSending() is called, or for durationMs when it is above 0. */
-    private synchronized void startSending(IrCodes.Code code, int durationMs) {
+    /**
+     * Sends the code until stopSending() is called, or for durationMs when it is above 0.
+     * At least one chunk always goes out, even when the stop comes before the thread runs.
+     */
+    private synchronized void startSending(IrCodes.Code code, int durationMs, Object owner) {
         stopSending();
         brandTestRunning = false;
         if (ir == null || !ir.hasIrEmitter()) return;
@@ -206,21 +208,28 @@ public class MainActivity extends Activity {
         final IrCodes.Signal sig = IrCodes.encode(code, rc5Toggle);
         final long end = durationMs > 0 ? System.currentTimeMillis() + durationMs : Long.MAX_VALUE;
         muting = durationMs > 0;
+        sendOwner = owner;
         Thread t = new Thread(() -> {
-            boolean first = true;
-            while (sender == Thread.currentThread() && System.currentTimeMillis() < end) {
-                if (!transmit(sig, first)) break;
-                first = false;
-                if (durationMs > 0) {
+            String error;
+            do {
+                error = transmit(sig);
+                if (error == null && durationMs > 0) {
                     long left = (end - System.currentTimeMillis() + 999) / 1000;
-                    setStatus("MUTE: VOL− for " + Math.max(left, 0) + " s more (tap MUTE to stop)");
+                    synchronized (MainActivity.this) {
+                        if (sender == Thread.currentThread()) {
+                            setStatus("MUTE: VOL− for " + Math.max(left, 0) + " s more (tap MUTE to stop)");
+                        }
+                    }
                 }
-            }
+            } while (error == null && sender == Thread.currentThread()
+                    && System.currentTimeMillis() < end);
             synchronized (MainActivity.this) {
                 if (sender == Thread.currentThread()) {
                     sender = null;
+                    sendOwner = null;
                     muting = false;
-                    setStatus("Ready. Hold a button to keep sending.");
+                    // A failure stays on screen until the next press.
+                    setStatus(error != null ? error : READY);
                 }
             }
         }, "ir-send");
@@ -229,21 +238,33 @@ public class MainActivity extends Activity {
         t.start();
     }
 
+    private static final String READY = "Ready. Hold a button to keep sending.";
+
     private synchronized void stopSending() {
         muting = false;
+        sendOwner = null;
         if (sender != null) {
             sender = null;
-            setStatus("Ready. Hold a button to keep sending.");
+            setStatus(READY);
         }
     }
 
-    private boolean transmit(IrCodes.Signal sig, boolean first) {
+    /** Stops the send only when this button started it. */
+    private synchronized void stopSending(Object owner) {
+        if (sendOwner == owner) stopSending();
+    }
+
+    /**
+     * One chunk. Every chunk starts with the full frame: a NEC repeat frame carries no
+     * command, so a receiver that missed the one full frame would ignore the whole hold.
+     * Returns null, or the error text.
+     */
+    private String transmit(IrCodes.Signal sig) {
         try {
-            ir.transmit(sig.carrierHz, IrCodes.chunk(sig, first, CHUNK_US));
-            return true;
+            ir.transmit(sig.carrierHz, IrCodes.chunk(sig, true, CHUNK_US));
+            return null;
         } catch (RuntimeException e) {
-            setStatus("Transmit failed: " + e.getMessage());
-            return false;
+            return "Transmit failed: " + e.getMessage();
         }
     }
 
@@ -257,6 +278,7 @@ public class MainActivity extends Activity {
         brandTestRunning = true;
         brandTestButton.setText("Stop brand test");
         new Thread(() -> {
+            String error = null;
             for (IrCodes.Code[] pair : IrCodes.BRANDS) {
                 if (!brandTestRunning) break;
                 IrCodes.Code c = pair[0];
@@ -264,16 +286,15 @@ public class MainActivity extends Activity {
                 rc5Toggle = !rc5Toggle;
                 IrCodes.Signal sig = IrCodes.encode(c, rc5Toggle);
                 long end = System.currentTimeMillis() + BRAND_TEST_MS;
-                boolean first = true;
-                while (brandTestRunning && System.currentTimeMillis() < end) {
-                    if (!transmit(sig, first)) break;
-                    first = false;
+                while (error == null && brandTestRunning && System.currentTimeMillis() < end) {
+                    error = transmit(sig);
                 }
+                if (error != null) break;
                 sleep(700);
             }
             brandTestRunning = false;
             runOnUiThread(() -> brandTestButton.setText("Send every brand's VOL+ for 3 s"));
-            setStatus("Brand test done.");
+            setStatus(error != null ? error : "Brand test done.");
         }, "brand-test").start();
     }
 

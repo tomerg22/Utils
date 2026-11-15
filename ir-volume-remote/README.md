@@ -27,9 +27,13 @@ address and does not work).
 
 `app/` is plain Java, no Gradle and no AndroidX.
 
-- **VOL+ / VOL-**: square buttons. Hold to keep sending (one frame, then NEC
-  repeat frames, in 450 ms transmit calls so a release stops the motor
-  quickly). The address and the two commands are editable (hex) and remembered.
+- **VOL+ / VOL-**: square buttons. Hold to keep sending, in 450 ms transmit
+  calls so a release stops the motor quickly. Each call is the full frame, then
+  NEC repeat frames. The full frame goes out again in every call because a
+  repeat frame carries no command: a receiver that missed the one full frame
+  would ignore the whole hold. A tap always sends one call. A release stops
+  only the send its own button started. The address and the two commands are
+  editable (hex) and remembered.
 - **MUTE**: one tap sends VOL- for 10 s, enough to run the motor pot down to
   its end stop. A second tap, or any other button, stops it.
 - **Brand test**: sends every brand's VOL+ for 3 s each and shows which one is

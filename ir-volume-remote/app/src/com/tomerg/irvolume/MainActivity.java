@@ -14,6 +14,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -123,6 +124,18 @@ public class MainActivity extends Activity {
             scroll.setFitsSystemWindows(true);
         }
         setContentView(scroll);
+        // The theme is light, so ask for dark system bar icons. Without this the navigation
+        // buttons are white on the light background when the phone is in dark mode.
+        if (Build.VERSION.SDK_INT >= 30) {
+            int light = WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+                    | WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS;
+            WindowInsetsController c = getWindow().getInsetsController();
+            if (c != null) c.setSystemBarsAppearance(light, light);
+        } else {
+            View decor = getWindow().getDecorView();
+            decor.setSystemUiVisibility(decor.getSystemUiVisibility()
+                    | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR | View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+        }
     }
 
     @Override

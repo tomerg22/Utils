@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Add a HeBits torrent to qBittorrent on media1 from its page URL or id.
+
+  hebits-add https://hebits.net/torrents.php?torrentid=130148
+  hebits-add 130148 133940            # several at once
+  hebits-add --dry-run 130148         # fetch + show, do not add
+  hebits-add --tv 130148 / --movie    # force the category
+
+The tracker keys are read at run time from the HeBits RSS feed that
+qBittorrent already has; they are never printed or stored here.
+TV (SxxEyy / season pack) goes to category "tv" (/mnt/kingston1/tv),
+anything else to the default save path (/mnt/kingston1/movies).
+"""
+import hashlib, json, re, subprocess, sys, tempfile, time, os
+import urllib.parse as up
+import urllib.request
+
+API = "http://192.168.0.11:8080/api/v2"
+UA = "Mozilla/5.0 (Macintosh) hebits-add"
+
+
+def bdecode(b, i=0):
+    c = b[i:i + 1]
+    if c == b"i":
+        j = b.index(b"e", i); return int(b[i + 1:j]), j + 1
+    if c == b"l":
+        i += 1; out = []
+        while b[i:i + 1] != b"e":
+            v, i = bdecode(b, i); out.append(v)
+        return out, i + 1
+    if c == b"d":
+        i += 1; out = {}
+        while b[i:i + 1] != b"e":
+            k, i = bdecode(b, i); s = i; v, i = bdecode(b, i); out[k] = (v, s, i)
+        return out, i + 1
+    j = b.index(b":", i); n = int(b[i:j]); return b[j + 1:j + 1 + n], j + 1 + n
+
+
+def api_get(path):
+    return json.load(urllib.request.urlopen(API + path, timeout=20))
+
+
+def tracker_keys():
+    def feeds(node):
+        for v in node.values():
+            if isinstance(v, dict) and "articles" in v:
+                yield v
+            elif isinstance(v, dict):
+                yield from feeds(v)
+    for f in feeds(api_get("/rss/items?withData=true")):
+        for a in f.get("articles", []):
+            u = up.urlparse(a.get("torrentURL", ""))
+            q = up.parse_qs(u.query)
+            if u.netloc.endswith("hebits.net") and "authkey" in q and "torrent_pass" in q:
+                return q["authkey"][0], q["torrent_pass"][0]
+    sys.exit("no HeBits RSS article with download keys found in qBittorrent")
+
+
+def torrent_id(arg):
+    if arg.isdigit():
+        return arg
+    q = up.parse_qs(up.urlparse(arg).query)
+    if "torrentid" in q:
+        return q["torrentid"][0]
+    if q.get("action") == ["download"] and "id" in q:
+        return q["id"][0]
+    sys.exit(f"cannot find a torrent id in: {arg}  (need ...torrentid=NNN or a bare number)")
+
+
+def pretty(name):
+    n = name.replace(".", " ").replace("_", " ")
+    m = re.match(r"(.+?\b(?:19|20)\d\d\b|.+?\bS\d\d(?:E\d\d)?\b)", n)
+    return (m.group(1) if m else n)[:70]
+
+
+def main(argv):
+    dry = "--dry-run" in argv
+    force = "tv" if "--tv" in argv else "movie" if "--movie" in argv else None
+    args = [a for a in argv if not a.startswith("--")]
+    if not args:
+        sys.exit(__doc__)
+    authkey, passkey = tracker_keys()
+    have = {t["hash"].lower() for t in api_get("/torrents/info")}
+    rc = 0
+    for arg in args:
+        tid = torrent_id(arg)
+        url = "https://hebits.net/torrents.php?" + up.urlencode(
+            {"action": "download", "id": tid, "authkey": authkey, "torrent_pass": passkey})
+        try:
+            data = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=30).read()
+        except Exception as e:
+            print(f"[{tid}] download failed: {type(e).__name__}"); rc = 1; continue
+        if not data.startswith(b"d"):
+            print(f"[{tid}] HeBits did not return a torrent file ({len(data)} bytes); wrong id or keys expired"); rc = 1; continue
+        d, _ = bdecode(data)
+        info, s, e = d[b"info"]
+        h = hashlib.sha1(data[s:e]).hexdigest()
+        name = info[b"name"][0].decode("utf-8", "replace")
+        if b"length" in info:
+            size = info[b"length"][0]
+        else:
+            size = sum(fd[b"length"][0] for fd in info[b"files"][0])
+        comment = d.get(b"comment", (b"",))[0].decode("utf-8", "replace")
+        cat = force or ("tv" if re.search(r"\bS\d\d(E\d\d)?\b|\bSeason\b", name.replace(".", " "), re.I) else "movie")
+        print(f"[{tid}] {pretty(name)} | {size / 1e9:.1f} GB | {cat} | comment id match: "
+              f"{'yes' if tid in comment else 'no (' + comment[:60] + ')'}")
+        if h in have:
+            print(f"[{tid}]   already in qBittorrent, skipped"); continue
+        if dry:
+            print(f"[{tid}]   dry run, not added"); continue
+        with tempfile.NamedTemporaryFile(suffix=".torrent", delete=False) as tf:
+            tf.write(data); path = tf.name
+        try:
+            cmd = ["curl", "-s", "-m", "30", "-F", f"torrents=@{path}"] + (["-F", "category=tv"] if cat == "tv" else []) + [API + "/torrents/add"]
+            out = subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+        finally:
+            os.unlink(path)
+        t = None
+        for _ in range(10):
+            time.sleep(1)
+            t = next((x for x in api_get("/torrents/info") if x["hash"].lower() == h), None)
+            if t:
+                break
+        if t:
+            print(f"[{tid}]   added: state={t['state']} category={t['category'] or '-'} save_path={t['save_path']}")
+        else:
+            print(f"[{tid}]   NOT added (API said: {out[:80]})"); rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

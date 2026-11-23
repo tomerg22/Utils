@@ -109,6 +109,21 @@ cmd_crop() {
   local f="$1" top="$2" left="$3" h="$4" w="$5" edge="${6:-900}"
   [ -f "$f" ] || die "no such file: $f"
   have sips || die "sips not found (macOS only)"
+  # A region outside the image is refused, naming the order. Measured
+  # 2026-11-23: "crop img.png 0 1000 900 380" (meant as x y w h) cropped from
+  # left 1000 on a 900-wide image and wrote an all-black file, exit 0.
+  local v
+  for v in "$top" "$left" "$h" "$w"; do
+    [[ "$v" =~ ^[0-9]+$ ]] || die "crop numbers must be whole pixels, got '$v' (order: <top> <left> <h> <w>)"
+  done
+  [ "$h" -gt 0 ] && [ "$w" -gt 0 ] || die "crop height and width must be above 0 (order: <top> <left> <h> <w>)"
+  local iw ih
+  iw="$(sips -g pixelWidth "$f" 2>/dev/null | awk '/pixelWidth/{print $2}')"
+  ih="$(sips -g pixelHeight "$f" 2>/dev/null | awk '/pixelHeight/{print $2}')"
+  [ -n "$iw" ] && [ -n "$ih" ] || die "cannot read the size of $f"
+  if [ $((top + h)) -gt "$ih" ] || [ $((left + w)) -gt "$iw" ]; then
+    die "the region top $top + height $h, left $left + width $w is outside the image (${iw} wide, ${ih} high). The order is <top> <left> <h> <w>."
+  fi
   local out="${f%.png}-crop.png"
   # NOTE the argument order: -c HEIGHT WIDTH, then --cropOffset TOP LEFT.
   sips -c "$h" "$w" --cropOffset "$top" "$left" "$f" --out "$out" >/dev/null

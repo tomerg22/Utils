@@ -724,9 +724,14 @@ function wallVerdict(sig) {
   const BOX_QUAL_HE = /^(מתנה|מקורית|מקורי|צבעונית|חיצונית|פנימית|לבנה|חומה|משלוח|קמעונאית|ה?אריזה)$/;
   // null: no title known; set by read() from document.title and the <h1>.
   let titleSaysBox = null;
+  /* The site's own summary of the SHIPPING data, "Weighing only 0.070 kg and
+   * measuring 20 x 16 x 5 cm" (a mouse, 1005007439751313, 2026-11-23), came
+   * back in productSizeLines. All three lines of this form seen that day gave
+   * the weight in kg with three decimals; the product's own one said "96g". */
+  const LOGISTICS_RE = /weigh(?:s|ing)?\s+(?:only\s+|about\s+)*\d+\.\d{3}\s*kg(?![a-z])/i;
   function isPackageText(s) {
     s = String(s || '');
-    if (PACKAGE_RE.test(s)) return true;
+    if (PACKAGE_RE.test(s) || LOGISTICS_RE.test(s)) return true;
     const he = /קופס[\u05d0-\u05ea]*/g;
     let h;
     while ((h = he.exec(s))) {

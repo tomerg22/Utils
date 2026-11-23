@@ -7,6 +7,7 @@
  *   node rank.mjs --mode final --require 'מקציף|קצף' < finalists.json
  *   node rank.mjs --mode shortlist --class 'gan' --require 'wire' < harvest.json
  *   node rank.mjs --mode final --criterion noise:low --criterion airflow:high < finalists.json
+ *   node rank.mjs --mode shortlist --class 'mouse' --exclude 'wireless|bluetooth' --max-price 14.99 < harvest.json
  *
  * stdin: a JSON array of items, or {items:[...]}, or an array of extractor
  *        payloads (multiple pages) — all are accepted and merged/deduped by id.
@@ -57,7 +58,8 @@ import { median, parseSold, queryRelevance, fourStarWarning } from './lib.mjs';
  * skipped with exit 0, and the hard requirement was dropped (recheck,
  * 2026-10-19). */
 const FLAGS = ['mode', 'top', 'min-rating', 'min-evidence', 'w-quality', 'w-volume', 'w-brand', 'prior',
-  'brand-default', 'class', 'require', 'spread', 'constraint', 'criterion', 'w-criterion'];
+  'brand-default', 'class', 'require', 'spread', 'constraint', 'criterion', 'w-criterion', 'exclude', 'max-price',
+  'currency'];
 /* A flag with no value (last on the line, or followed by another --flag)
  * is an error, never a silent NaN. Measured 2026-10-18: `--spread x`, a bare
  * `--spread` or `--top abc` made headCount NaN, slice(0, NaN) returned [],
@@ -118,6 +120,33 @@ const CLASS = arg('class', null);
 // A blank regex (an unset $VAR) would filter nothing, with no word.
 if (REQUIRE != null && !/\S/.test(REQUIRE)) die('--require needs a regex, got a blank value');
 if (CLASS != null && !/\S/.test(CLASS)) die('--class needs a regex, got a blank value');
+/* --exclude drops the titles a regex MATCHES (added 2026-11-23, the
+ * wired-mouse session). Without it, "wired mice only" out of a pool where 598
+ * of 819 titles named wireless, Bluetooth or a dual mode needed a negative
+ * lookahead in --class, and one word of it ("feet") dropped a real wired
+ * Logitech G102 ("PTFE Glide Feet"); it was caught only by listing the drops
+ * by hand. The output's `excluded` names every dropped title with the words
+ * the regex matched in it: read it before trusting the cut. */
+const EXCLUDE = arg('exclude', null);
+if (EXCLUDE != null && !/\S/.test(EXCLUDE)) die('--exclude needs a regex, got a blank value');
+/* --max-price N (added 2026-11-23): the user said "must be <15$" and this file
+ * had no price cap, so the cap was a hand filter on the GRID price. That is not
+ * the price paid: on the item pages of that run it was higher by up to 31%
+ * ($3.09 on the grid, $4.05 on the page) and lower by up to 4.5% ($3.09, $2.95).
+ *   final mode: the cap is a hard requirement on the item-page price, the same
+ *     as a --constraint. Over it is dropped as violates:max-price and counted in
+ *     constraintViolations; no price, or a price in another currency, is held
+ *     out as unverified.
+ *   shortlist mode: over N x 1.05 on the grid is dropped (over-max-price);
+ *     between N and N x 1.05 is kept and flagged price-over-cap-on-grid, as its
+ *     page may be under the cap (the 5% is the largest drop measured that day).
+ * The cap is inclusive: "under $15" is --max-price 14.99. --currency names the
+ * currency of N; without it every priced item must share one currency. */
+const MAX_PRICE = numArg('max-price', null, { min: 0 });
+const CURRENCY = arg('currency', null);
+if (CURRENCY != null && !/^[A-Za-z]{3}$/.test(CURRENCY)) die(`--currency must be a 3-letter code such as USD, got ${JSON.stringify(CURRENCY)}`);
+if (CURRENCY != null && MAX_PRICE == null) die('--currency names the currency of --max-price: pass --max-price too');
+const GRID_MARGIN = 1.05;
 const SPREAD = numArg('spread', 0, { min: 0, int: true });
 
 /* All occurrences of a repeatable flag, e.g. --constraint wires --constraint 9v */
@@ -302,6 +331,25 @@ for (const i of all) {
 }
 const soldUnparsed = (i) => i.sold == null && !!(i.soldText || i.soldRaw);
 
+// The cap's currency (see --max-price above).
+let capCurrency = CURRENCY ? CURRENCY.toUpperCase() : null;
+if (MAX_PRICE != null && !capCurrency) {
+  const curs = [...new Set(all.filter((i) => typeof i.price === 'number' && i.currency).map((i) => String(i.currency).toUpperCase()))];
+  if (curs.length > 1) die(`--max-price: the prices are in ${curs.join(' and ')}; pass --currency to say which one the cap is in`);
+  capCurrency = curs[0] || null;
+}
+/* 'pass', 'fail', 'near' (shortlist: over the cap by at most 5%) or 'unknown'. */
+const priceCap = (i) => {
+  if (MAX_PRICE == null) return 'pass';
+  if (typeof i.price !== 'number') return 'unknown';
+  if (capCurrency && i.currency && String(i.currency).toUpperCase() !== capCurrency) return 'unknown';
+  if (i.price <= MAX_PRICE) return 'pass';
+  if (MODE !== 'final' && i.price <= MAX_PRICE * GRID_MARGIN) return 'near';
+  return 'fail';
+};
+// The requirements of final mode: every --constraint, and the cap.
+const REQS = MODE === 'final' && MAX_PRICE != null ? [...CONSTRAINTS, 'max-price'] : CONSTRAINTS;
+
 /* WHY own-reviews-unknown EXISTS (measured 2026-09-25)
  *
  * The JSON-LD reviewCount is usually POOLED across other sellers' similar
@@ -336,6 +384,7 @@ const titleRegex = (name, src) => {
 };
 const classRe = titleRegex('class', CLASS);
 const reqRe = titleRegex('require', REQUIRE);
+const excludeRe = titleRegex('exclude', EXCLUDE);
 
 const kept = [];
 const dropped = [];
@@ -344,11 +393,16 @@ for (const i of all) {
   const ev = evidenceOf(i);
   const violated = CONSTRAINTS.filter((n) => constraintStatus(i, n) === 'fail');
   const unknown = CONSTRAINTS.filter((n) => constraintStatus(i, n) === 'unknown');
+  const cap = priceCap(i);
+  if (MODE === 'final' && cap === 'fail') violated.push('max-price');
+  if (MODE === 'final' && cap === 'unknown') unknown.push('max-price');
   if (i.notANumber) dropped.push({ ...i, why: 'not-a-number:' + i.notANumber.join('+') });
   else if (badBrands.includes(i)) dropped.push({ ...i, why: 'brandScore-out-of-range' });
   else if (classRe && !classRe.test(i.title || '')) dropped.push({ ...i, why: 'off-class' });
+  else if (excludeRe && excludeRe.test(i.title || '')) dropped.push({ ...i, why: 'excluded' });
   else if (reqRe && !reqRe.test(i.title || '')) dropped.push({ ...i, why: 'off-category' });
   else if (violated.length) dropped.push({ ...i, why: `violates:${violated.join('+')}` });
+  else if (MODE !== 'final' && cap === 'fail') dropped.push({ ...i, why: 'over-max-price' });
   /* With no own count the only rating is the pooled one, so it is not
    * judged on it: set aside as unknown, never "rating<4" (review,
    * 2026-10-18). This comes BEFORE "no rating" in final mode: a finalist
@@ -397,8 +451,11 @@ for (const i of all) {
  */
 const warnings = [];
 const titled = (re, list) => list.filter((i) => re.test(i.title || ''));
-const classKept = classRe ? titled(classRe, all) : all;
-if (classRe && all.length && !classKept.length) {
+const classKept = (classRe ? titled(classRe, all) : all).filter((i) => !excludeRe || !excludeRe.test(i.title || ''));
+if (excludeRe && all.length && !classKept.length && (!classRe || titled(classRe, all).length)) {
+  warnings.push(`excluded-all: --exclude dropped every title${classRe ? ' that --class kept' : ''}. Check the regex.`);
+}
+if (classRe && all.length && !titled(classRe, all).length) {
   warnings.push(`absence-is-not-evidence: the --class regex matched none of the ${all.length} titles. Check the ` +
     'regex and the language the titles came back in. Do NOT report that the class does not exist from titles alone.');
 }
@@ -490,9 +547,29 @@ if (noAttr.length) {
     noAttr.slice(0, 6).map((i) => `${i.id}: ${i.why.slice('criterion-unknown:'.length)}`).join('; ') +
     '). They were set aside, NOT ranked: read the number from the spec rows, the description or the photo, or report it as unknown.');
 }
-if (CONSTRAINTS.length && unverified.length)
+if (REQS.length && unverified.length)
   warnings.push(`unverified-constraint: ${unverified.length} item(s) were NOT ranked because ` +
-    `their status for [${CONSTRAINTS.join(', ')}] is unknown. Check them, do not assume they pass.`);
+    `their status for [${REQS.join(', ')}] is unknown. Check them, do not assume they pass.`);
+if (MAX_PRICE != null && MODE !== 'final') {
+  const over = dropped.filter((d) => d.why === 'over-max-price').length;
+  const near = all.filter((i) => priceCap(i) === 'near').length;
+  const noPrice = all.filter((i) => priceCap(i) === 'unknown').length;
+  warnings.push(`max-price: ${over} item(s) over ${MAX_PRICE}${capCurrency ? ' ' + capCurrency : ''} x ${GRID_MARGIN} on the search grid ` +
+    `were dropped; ${near} just over the cap were kept (flag price-over-cap-on-grid)` +
+    (noPrice ? `, and ${noPrice} with no price or another currency were kept (flag price-unknown)` : '') +
+    '. The grid price is not the item-page price (measured 2026-11-23: +31% to -4.5%). Pass --max-price again in final mode, ' +
+    'on the item-page prices.');
+}
+
+// The cap and the --exclude cut, as they go in the output.
+const capOut = () => (MAX_PRICE == null ? {} : { maxPrice: { cap: MAX_PRICE, currency: capCurrency,
+  appliedTo: MODE === 'final' ? 'item-page price' : 'search-grid price, ' + Math.round((GRID_MARGIN - 1) * 100) + '% margin' } });
+const excludedOut = () => {
+  if (!excludeRe) return {};
+  const ex = dropped.filter((d) => d.why === 'excluded');
+  const words = (t) => [...new Set([...String(t || '').matchAll(new RegExp(excludeRe.source, 'gi'))].map((m) => m[0]).filter(Boolean))];
+  return { excluded: { count: ex.length, items: ex.map((d) => ({ id: d.id, matched: words(d.title), title: String(d.title || '').slice(0, 80) })) } };
+};
 
 if (!all.length) {
   warnings.push('empty-input: no items were found in the input. An in-app harness file must go through ' +
@@ -510,21 +587,21 @@ if (!kept.length) {
    * the user's requirement (review, 2026-10-18). */
   const failed = dropped.filter((d) => d.why.startsWith('violates:')).length;
   let note = 'no candidates survived filters';
-  if (CONSTRAINTS.length && unverified.length) {
+  if (REQS.length && unverified.length) {
     note = 'no candidate is VERIFIED to satisfy the stated constraints: ' + unverified.length + ' are unchecked';
     warnings.push(`unverified-only: ${unverified.length} item(s) passed every other filter but their status for ` +
-      `[${CONSTRAINTS.join(', ')}] is unknown. Check them; do NOT report that nothing satisfies the requirement.`);
-  } else if (CONSTRAINTS.length && failed && failed === dropped.length) {
+      `[${REQS.join(', ')}] is unknown. Check them; do NOT report that nothing satisfies the requirement.`);
+  } else if (REQS.length && failed && failed === dropped.length) {
     note = 'no candidate satisfies the stated constraints';
     warnings.push('no candidate satisfies the stated constraints. Report that plainly. ' +
       'NEVER substitute an item that fails a constraint, not even as an alternative, ' +
       'without saying in the same sentence that it fails it.');
-  } else if (CONSTRAINTS.length && failed) {
+  } else if (REQS.length && failed) {
     note = 'no candidates survived filters; ' + failed + ' of ' + dropped.length + ' dropped items fail a stated constraint';
   }
   const out = JSON.stringify({
-    mode: MODE, constraints: CONSTRAINTS, constraintViolations: failed, unverifiedCount: unverified.length,
-    ranked: [], unverified, warnings,
+    mode: MODE, constraints: REQS, ...capOut(), constraintViolations: failed, unverifiedCount: unverified.length,
+    ranked: [], unverified, warnings, ...excludedOut(),
     considered: all.length, dropped,
     droppedReasons: dropped.reduce((a, d) => ({ ...a, [d.why]: (a[d.why] || 0) + 1 }), {}),
     note,
@@ -601,6 +678,12 @@ const scored = kept
     // The brand weight can only demote by 0.075, so a counterfeit with strong
     // evidence can stay in the top 4: name it so the report says so.
     if (typeof i.brandScore === 'number' && i.brandScore < 0.2) flags.push('brand-implausible');
+    if (MODE !== 'final' && priceCap(i) === 'near') flags.push('price-over-cap-on-grid');
+    if (MODE !== 'final' && MAX_PRICE != null && priceCap(i) === 'unknown') flags.push('price-unknown');
+    /* Two options that are different products (listing.js optionsDiffer): the
+     * own rating and count are pooled over both (measured 2026-11-23: the X1
+     * listing sold a 3-key and a 7-button mouse under one 414-rating count). */
+    if (MODE === 'final' && i.optionsDiffer) flags.push('rating-shared-by-options');
 
     return {
       ...i,
@@ -749,6 +832,14 @@ if (sameProduct.length) {
     'name the other listings and their prices.');
 }
 
+const shared = ranked.filter((r) => r.flags.includes('rating-shared-by-options'));
+if (shared.length) {
+  warnings.push(`rating-shared-by-options: ${shared.length} ranked item(s) sell different products as options (` +
+    shared.slice(0, 6).map((r) => r.id + (r.optionsDiffer && r.optionsDiffer.a ? ' "' + String(r.optionsDiffer.a).slice(0, 24) +
+      '" vs "' + String(r.optionsDiffer.b).slice(0, 24) + '"' : '')).join('; ') +
+    '). Their own rating and count are for the whole listing, not the option in the table: say so in the report.');
+}
+
 console.log(
   JSON.stringify(
     {
@@ -764,7 +855,8 @@ console.log(
       spreadTiers: SPREAD
         ? ranked.filter((r) => r.pick === 'spread').map((r) => r.spreadTier)
         : [],
-      constraints: CONSTRAINTS,
+      constraints: REQS,
+      ...capOut(),
       constraintViolations: dropped.filter((d) => d.why.startsWith('violates:')).length,
       unverifiedCount: unverified.length,
       unverified,
@@ -775,6 +867,7 @@ console.log(
       sameProduct,
       droppedCount: dropped.length,
       droppedReasons: dropped.reduce((a, d) => ({ ...a, [d.why]: (a[d.why] || 0) + 1 }), {}),
+      ...excludedOut(),
       // Final mode names them: each one was read in step 5.
       ...(MODE === 'final' ? { droppedItems: dropped.map((d) => ({ id: d.id, title: String(d.title || '').slice(0, 60), why: d.why })) } : {}),
       ranked,

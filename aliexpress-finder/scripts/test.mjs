@@ -5783,6 +5783,250 @@ await block('N11-4', async () => {
   ok('N11-4: step 2 tells the operator to read the count', /`__aeHarvest\.requests\(\)`/.test(step2) && /`__aeListing\.requests\(\)`/.test(step2) && /siteRequests60m/.test(step2));
 });
 
+// ============================================================================
+// 2026-11-23, the wired-mouse session: ten gaps found in a live run (wired
+// mice, then a $15 cap, then each mouse's weight). Each block fails on the
+// code before the fix (2cfb9ba).
+// ============================================================================
+/* A capture() record as listing.js saves it, with the fields the checks read. */
+const n12Rec = (id, { title = 'Mouse', selected = [], options = [], specs = {}, desc = null, sizeLines = [], page = '' } = {}) => ({
+  id, title, selected, options, specs, price: 3, currency: 'USD', reviews: 100, ownRating: 4.8, soldRaw: '1,000+',
+  detail: { text: page + (desc != null ? ' [DESCRIPTION] ' + desc : ''), sizeLines: sizeLines.map((t) => ({ text: t, isPackage: false })),
+    description: { source: desc != null ? 'fetched' : 'skipped' } },
+});
+
+console.log('\nN12-1: checks.mjs: option vs table counts and models, shared ratings, wired vs wireless');
+await block('N12-1', async () => {
+  const { checkRecord, specCountConflicts, modelConflicts, optionsDiffer, connectionOf } = await import('./checks.mjs');
+  const kind = (r) => r.checkWarnings.map((w) => w.split(':')[0]);
+  // KEBIDUMEI 1005006982650767, the live rows.
+  const keb = checkRecord(n12Rec('1005006982650767', { title: 'KEBIDUMEI RGB Wired Gaming Mouse 7200DPI 6 Buttons',
+    selected: ['7 Buttons 2400dpi'], options: ['7 Buttons 2400dpi', '6 Buttons 7200dpi'],
+    specs: { 'Number of Buttons': '6', DPI: '6400', Type: 'Wired', 'Battery Included': 'no' } }));
+  eq('N12-1: KEBIDUMEI: the buttons row and the DPI row disagree with the selected option, and its options differ',
+    kind(keb).filter((k) => k !== 'weight-not-in-text'), ['specs-vs-option', 'specs-vs-option', 'options-differ']);
+  ok('N12-1: the warning names the option, the row and the value', /"7 Buttons 2400dpi" disagrees with spec row "Number of Buttons": 6 \(buttons\)/.test(keb.checkWarnings[0]), keb.checkWarnings[0]);
+  eq('N12-1: the option the table describes gives no count warning', specCountConflicts(['6 Buttons 6400dpi'], { 'Number of Buttons': '6', DPI: '6400' }), []);
+  eq('N12-1: a DPI inside the row\'s range fits', specCountConflicts(['26000 DPI'], { DPI: '100 - 44,000' }), []);
+  eq('N12-1: a DPI outside it does not', specCountConflicts(['50000 DPI'], { 'Max. DPI': '100 - 44,000' }).length, 1);
+  eq('N12-1: a row not named for the count says nothing', specCountConflicts(['7 Buttons'], { 'Feature 1': '7-Buttons DPI Adjustable', DPI: '1600' }), []);
+  // Inphic 1005009916191936: "inphic Model: B1" beside the selected "B2 White".
+  const inp = modelConflicts(['B2 White'], ['B2 White', 'B1 White', 'B1 Black', 'B2 Black'], { 'inphic Model': 'B1', Type: 'Wired' });
+  eq('N12-1: Inphic: the model row names another option\'s model', inp.map((c) => [c.option, c.other, c.why]), [['B2 White', 'B1 White', 'differs']]);
+  eq('N12-1: the selected model in the row: no warning', modelConflicts(['G102-black'], ['G102-black', 'G102-white'], { 'Logitech Model': 'G102' }), []);
+  eq('N12-1: a family row and a full option name agree ("G502" and "G502HERO")', modelConflicts(['G502HERO'], ['G502HERO', 'G502SE'], { 'Logitech Model': 'G502' }), []);
+  eq('N12-1: a colour option and a model row no option names: no warning', modelConflicts(['black'], ['black', 'WHITE'], { 'SKYLION Model': 'F1' }), []);
+  eq('N12-1: a sensor row is not a model row', modelConflicts(['RS7 Black'], ['RS7 Black', 'RS7 Black PAW3311'], { 'Sensor model': 'PAW3311' }), []);
+  eq('N12-1: ports are not models (USB3, WIN10)', modelConflicts(['USB3 cable'], ['USB3 cable', 'WIN10 pack'], { Model: 'WIN10' }), []);
+  // optionsDiffer: different products under one rating.
+  eq('N12-1: B1 and B2 differ on the model', optionsDiffer(['B2 White', 'B1 White']), { a: 'B2 White', b: 'B1 White', why: 'model' });
+  eq('N12-1: G502HERO and G502SE differ (full tokens)', optionsDiffer(['G502HERO', 'G502SE']).why, 'model');
+  eq('N12-1: colours do not differ', optionsDiffer(['G102-black', 'G102-white', 'G102-Purple']), null);
+  eq('N12-1: pack counts do not differ', optionsDiffer(['1pcs', '2pcs', '5pcs']), null);
+  eq('N12-1: the X1 listing names no model: a known limit, not caught', optionsDiffer(['X1 Wired Mouse', 'Set 1', 'Only Mouse', 'Set 2']), null);
+  // wired vs wireless.
+  const vert = checkRecord(n12Rec('1005006743691875', { title: 'Wired Right Hand Vertical RGB Mouse',
+    specs: { DPI: '3200', 'Battery Included': 'Yes', Type: '2.4Ghz Wireless', 'Power Source': 'Rechargeable' } }));
+  ok('N12-1: the vertical mouse: wired in the title, wireless and a battery in the table',
+    kind(vert).includes('wired-vs-wireless') && /wired \(title: wired\)/.test(vert.checkWarnings.find((w) => /^wired-vs/.test(w))), JSON.stringify(vert.checkWarnings));
+  const g502 = checkRecord(n12Rec('1005007539842734', { title: 'Logitech G502hero Master Wired Gaming Mouse', selected: ['G502HERO'],
+    options: ['G502HERO', 'G502SE'], specs: { 'Power Type': 'Rechargeable', Type: 'Wired', 'Battery Included': 'no', 'Logitech Model': 'G502' } }));
+  ok('N12-1: G502: Type Wired beside Power Type Rechargeable', kind(g502).includes('wired-vs-wireless'), JSON.stringify(g502.checkWarnings));
+  const razer = connectionOf('Razer DeathAdder Essential Wired Gaming Mouse', { Type: 'Wired', 'Connect to the computer': 'Wired',
+    'Wireless transmission frequency': 'Wired', 'Battery Included': 'no', 'Power Type': 'USB' });
+  eq('N12-1: Razer: a row NAMED "wireless" with the value Wired, no battery: wired only', razer.wireless, []);
+  eq('N12-1: a dual-mode title says both', connectionOf('Wireless/Wired 2.4G RGB Gaming Mouse', {}).wired.length > 0 && connectionOf('Wireless/Wired 2.4G RGB Gaming Mouse', {}).wireless.length > 0, true);
+});
+
+console.log('\nN12-2: checks.mjs: the weight, the product apart from the shipping weight');
+await block('N12-2', async () => {
+  const { checkRecord, weightLinesOf, productWeight } = await import('./checks.mjs');
+  const office = checkRecord(n12Rec('1005007439751313', { desc: 'Specifications: Interface:USB(no need driver) Key buttons:3 DPI:1200DPI ' +
+    'Size:118*58*32mm (Mini Mouse) Netweight: about 90g Cable length:Approx 1.5m Total weight:about 100g Package include: 1x wired computer mouse',
+    sizeLines: ['Compact and lightweight build Weighing only 0.070 kg and measuring 20 x 16 x 5 cm'] }));
+  eq('N12-2: the plain office mouse: 90 g, the total and the 0.070 kg summary are shipping',
+    [office.productWeightG, office.weightLines.map((w) => [w.text, w.grams, w.isPackage])],
+    [90, [['Netweight: about 90g', 90, false], ['Total weight:about 100g', 100, true], ['Weighing only 0.070 kg', 70, true]]]);
+  ok('N12-2: "lightweight" is not a weight label', !office.weightLines.some((w) => /lightweight|build/.test(w.text)), JSON.stringify(office.weightLines));
+  const inp = checkRecord(n12Rec('1005009916191936', { desc: 'Product model: B2 Product size: 122x65.5x38.5mm Product weight: 110 ± 5g Resolution: 1200/2400' }));
+  eq('N12-2: Inphic "110 ± 5g"', inp.productWeightG, 110);
+  const raz = checkRecord(n12Rec('1005013510638920', { specs: { 'Product weight': '96g', Type: 'Wired' },
+    sizeLines: ['Compact and lightweight design Weighing only 96g and measuring 127 x 70 x 44 mm'],
+    desc: 'The product comes in a compact package measuring 28 x 16 x 6 cm and weighing 0.180 kg' }));
+  eq('N12-2: Razer: 96 g from the row and the summary, 0.180 kg is the package', [raz.productWeightG, raz.weightLines.filter((w) => w.isPackage).map((w) => w.grams)], [96, [180]]);
+  const gross = checkRecord(n12Rec('1005006727693525', { specs: { 'Gross Weight': '150', Type: 'Wired' }, desc: '' }));
+  eq('N12-2: "Gross Weight: 150" has no unit: grams null, shipping, and no product weight',
+    [gross.productWeightG, gross.weightLines.map((w) => [w.grams, w.isPackage])], [null, [[null, true]]]);
+  ok('N12-2: no product weight says so, and points at the photos', gross.checkWarnings.some((w) => /^weight-not-in-text: .*Read the photos/.test(w)), JSON.stringify(gross.checkWarnings));
+  const review = checkRecord(n12Rec('1', { page: 'Reviews (12) Color:Black it weighs 75g, very light', desc: 'Size: 10 x 6 x 3 cm' }));
+  eq('N12-2: a review in the page text is not read: no weight', review.productWeightG, null);
+  eq('N12-2: units: kg, oz and lb become grams', weightLinesOf(['Weight: 0.2 kg', 'Item weight: 4 oz', 'weighs 1 lb'], {}).map((w) => w.grams), [200, 113.4, 453.6]);
+  eq('N12-2: lines that disagree by more than 10% give no weight', productWeight([{ grams: 90 }, { grams: 135 }].map((w) => ({ ...w, isPackage: false }))), { grams: null, disagree: [90, 135] });
+  eq('N12-2: within 10% they agree', productWeight([{ grams: 96, isPackage: false }, { grams: 100, isPackage: false }]).grams, 96);
+  ok('N12-2: a description fetched with images only is not "not read"', !/not read/.test(checkRecord(n12Rec('2', { desc: '' })).checkWarnings.join(' ')));
+  // The CLI on a details file.
+  const dir = tmp('aef-n12-2-');
+  const f = join(dir, 'details-1.json');
+  fsx.writeFileSync(f, JSON.stringify({ kind: 'details', source: 'listing', items: [n12Rec('1005009916191936', { desc: 'Product weight: 110 ± 5g' })] }));
+  const out = join(dir, 'checked.json');
+  const run = (args) => spawnSyncX(process.execPath, [join(HERE, 'checks.mjs'), ...args], { encoding: 'utf8' });
+  const r = run(['--out', out, f]);
+  ok('N12-2: the CLI prints the weight and writes the records with the checks added', r.status === 0 && /weight: 110 g/.test(r.stdout) &&
+    JSON.parse(fsx.readFileSync(out, 'utf8')).items[0].productWeightG === 110, r.stdout + r.stderr);
+  const j = JSON.parse(run(['--json', f]).stdout);
+  eq('N12-2: --json gives the fields', Object.keys(j[0]).sort(), ['checkWarnings', 'connection', 'id', 'optionsDiffer', 'productWeightG', 'title', 'weightLines']);
+  fsx.writeFileSync(join(dir, 'harvest.json'), JSON.stringify({ query: 'mouse', items: [{ id: '1', title: 'x' }] }));
+  eq('N12-2: a search payload is refused, exit 2', run([join(dir, 'harvest.json')]).status, 2);
+  eq('N12-2: an unknown flag is refused, exit 2', run(['--jsn', f]).status, 2);
+  // The record from rank.mjs's view: checked.json goes to --mode final.
+  const ranked = rankRun(JSON.parse(fsx.readFileSync(out, 'utf8')), ['--mode', 'final', '--min-evidence', '1']);
+  eq('N12-2: rank.mjs reads the checked file', [ranked.code, ranked.out && ranked.out.ranked.length], [0, 1]);
+});
+
+console.log('\nN12-3: rank.mjs --max-price, --currency and --exclude; a rating shared by options');
+await block('N12-3', async () => {
+  const it = (id, price, over = {}) => ({ id, title: 'Wired Mouse ' + id, price, currency: 'USD', rating: 4.8, ownRating: 4.8,
+    reviews: 200, sold: 2000, soldRaw: '2,000+', constraints: { wired: 'pass' }, ...over });
+  const fin = rankRun([it('a', 4.25), it('b', 15.69), it('c', null), it('d', 14.99)], ['--mode', 'final', '--constraint', 'wired', '--max-price', '14.99']);
+  eq('N12-3: final: over the cap fails, no price is unverified, the cap itself passes',
+    [fin.out.ranked.map((r) => r.id).sort(), fin.out.droppedItems.map((d) => [d.id, d.why]), fin.out.unverified.map((u) => [u.id, u.why])],
+    [['a', 'd'], [['b', 'violates:max-price']], [['c', 'unverified:max-price']]]);
+  eq('N12-3: the cap is listed with the constraints, and says what it was applied to',
+    [fin.out.constraints, fin.out.maxPrice, fin.out.constraintViolations], [['wired', 'max-price'], { cap: 14.99, currency: 'USD', appliedTo: 'item-page price' }, 1]);
+  const sl = rankRun([it('a', 4.25), it('b', 15.69), it('e', 16), it('f', 30)], ['--mode', 'shortlist', '--max-price', '14.99', '--min-evidence', '1']);
+  eq('N12-3: shortlist: the grid price gets a 5% margin, flagged', [sl.out.ranked.map((r) => [r.id, r.flags.includes('price-over-cap-on-grid')]).sort(), sl.out.droppedReasons],
+    [[['a', false], ['b', true]], { 'over-max-price': 2 }]);
+  ok('N12-3: and warns that the grid is not the page price', sl.out.warnings.some((w) => /^max-price: 2 item\(s\) over 14\.99 USD x 1\.05 .* item-page price/.test(w)), JSON.stringify(sl.out.warnings));
+  eq('N12-3: two currencies with no --currency: exit 2', rankRun([it('a', 3), { ...it('b', 10), currency: 'ILS' }], ['--max-price', '5']).code, 2);
+  const cur = rankRun([it('a', 3), { ...it('b', 10), currency: 'ILS' }], ['--mode', 'final', '--max-price', '5', '--currency', 'usd']);
+  eq('N12-3: --currency: a price in another currency is unverified', cur.out.unverified.map((u) => [u.id, u.why]), [['b', 'unverified:max-price']]);
+  eq('N12-3: --currency alone is refused', rankRun([it('a', 3)], ['--currency', 'USD']).code, 2);
+  eq('N12-3: a bad --currency is refused', rankRun([it('a', 3)], ['--max-price', '5', '--currency', 'dollars']).code, 2);
+  // --exclude names what it dropped, with the words that matched.
+  const pool = [it('g', 3, { title: 'Logitech G102 Wired Gaming Mouse PTFE Glide Feet' }), it('h', 3, { title: 'Wireless Mouse 2.4G' }), it('i', 3, { title: 'Office Wired Mouse' })];
+  const ex = rankRun(pool, ['--mode', 'shortlist', '--min-evidence', '1', '--exclude', 'wireless|feet']);
+  eq('N12-3: --exclude drops the titles it matches and names the words', [ex.out.ranked.map((r) => r.id), ex.out.excluded.count, ex.out.excluded.items.map((x) => [x.id, x.matched])],
+    [['i'], 2, [['g', ['Feet']], ['h', ['Wireless']]]]);
+  ok('N12-3: excluding every title warns', rankRun(pool, ['--min-evidence', '1', '--exclude', 'mouse']).out.warnings.some((w) => /^excluded-all/.test(w)));
+  eq('N12-3: a blank --exclude is refused', rankRun(pool, ['--exclude', ' ']).code, 2);
+  // A rating shared by options (checks.mjs optionsDiffer).
+  const sh = rankRun([it('k', 3, { optionsDiffer: { a: '7 Buttons 2400dpi', b: '6 Buttons 7200dpi', why: 'buttons' } }), it('l', 3)], ['--mode', 'final']);
+  ok('N12-3: rating-shared-by-options: flagged and named', sh.out.ranked.find((r) => r.id === 'k').flags.includes('rating-shared-by-options') &&
+    !sh.out.ranked.find((r) => r.id === 'l').flags.includes('rating-shared-by-options') &&
+    sh.out.warnings.some((w) => /^rating-shared-by-options: 1 ranked item\(s\) .*k "7 Buttons 2400dpi" vs "6 Buttons 7200dpi"/.test(w)), JSON.stringify(sh.out.warnings));
+});
+
+/* A PNG of any pattern: fn(x, y) -> [r, g, b]. */
+const pngPattern = async (w, h, fn) => {
+  const zlib = await import('node:zlib');
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, 'latin1'), data]);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(body));
+    return Buffer.concat([len, body, crc]);
+  };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const raw = Buffer.alloc((w * 3 + 1) * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) fn(x, y).forEach((v, k) => { raw[y * (w * 3 + 1) + 1 + x * 3 + k] = Math.max(0, Math.min(255, Math.round(v))); });
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+};
+
+console.log('\nN12-4: same.mjs: a re-encoded copy is the same photo; a flat image is not');
+await block('N12-4', async () => {
+  const { photoGroups, dhashFromBmp, hamming, textured } = await import('./same.mjs');
+  const H = (bits) => bits.match(/.{4}/g).map((b) => parseInt(b, 2).toString(16)).join('');
+  const base = '01'.repeat(128);
+  const flip = (b, n) => b.split('').map((c, i) => (i < n ? (c === '0' ? '1' : '0') : c)).join('');
+  const L = (name, hs) => ({ name, hashes: hs.map((dh, i) => ({ md5: name + i, dh })) });
+  const near = photoGroups([L('A', [H(base), H(flip(base.split('').reverse().join(''), 0))]), L('B', [H(flip(base, 8)), H(flip(base.split('').reverse().join(''), 3))])]);
+  eq('N12-4: 8 bits apart is a near copy; two near copies make one product', [near.groups, near.pairs[0].near], [[['A', 'B']], 2]);
+  eq('N12-4: 9 bits apart is not', photoGroups([L('A', [H(base)]), L('B', [H(flip(base, 9))])]).pairs, []);
+  eq('N12-4: --near 0 (opts.near 0) compares bytes only', photoGroups([L('A', [H(base), H(base)]), L('B', [H(base)])], { near: 0 }).pairs, []);
+  const flat = '0'.repeat(64);
+  eq('N12-4: a flat hash (no texture) never matches as a near copy', [textured(flat), photoGroups([L('A', [flat, flat]), L('B', [flat, flat])]).pairs], [false, []]);
+  eq('N12-4: strings are still md5s, as before', photoGroups([{ name: 'A', hashes: ['1', '2'] }, { name: 'B', hashes: ['1', '2'] }]).groups, [['A', 'B']]);
+  // A 2 x 1 BMP: 24 bits, bottom-up, one row padded to 8 bytes.
+  const bmp = Buffer.alloc(54 + 8); bmp.write('BM', 0, 'latin1'); bmp.writeUInt32LE(54, 10); bmp.writeInt32LE(2, 18); bmp.writeInt32LE(1, 22); bmp.writeUInt16LE(24, 28);
+  bmp.set([10, 10, 10, 200, 200, 200], 54);
+  eq('N12-4: dhashFromBmp: a darker pixel left of a lighter one is a 1', dhashFromBmp(bmp), '8');
+  eq('N12-4: not a BMP is null', dhashFromBmp(Buffer.from('PNG...')), null);
+  eq('N12-4: hamming', hamming('f0', '0f'), 8);
+  // The CLI on real files: one pattern saved again as JPEG and resized is the same photo.
+  const { execFileSync: ex } = await import('node:child_process');
+  const root = tmp('aef-n12-4-');
+  const pat = (s) => (x, y) => { const v = 128 + 110 * Math.sin(x / (5 + s) + s) * Math.cos(y / (7 + s) - s); return [v, v * 0.8, 255 - v]; };
+  for (const d of ['A', 'B', 'C']) fsx.mkdirSync(join(root, d));
+  for (const [i, s] of [[1, 1], [2, 2], [3, 3]]) fsx.writeFileSync(join(root, 'A', 'img' + i + '.png'), await pngPattern(240, 200, pat(s)));
+  for (const i of [1, 2, 3]) {
+    const jpg = join(root, 'B', 'x' + i + '.jpg');
+    ex('sips', ['-s', 'format', 'jpeg', '-s', 'formatOptions', '60', join(root, 'A', 'img' + i + '.png'), '--out', jpg], { stdio: 'ignore' });
+    ex('sips', ['-s', 'format', 'png', '-Z', '170', jpg, '--out', join(root, 'B', 'img' + i + '.png')], { stdio: 'ignore' });
+    fsx.rmSync(jpg);
+  }
+  for (const [i, s] of [[1, 9], [2, 11], [3, 13]]) fsx.writeFileSync(join(root, 'C', 'img' + i + '.png'), await pngPattern(240, 200, pat(s)));
+  const run = (args) => spawnSyncX(process.execPath, [join(HERE, 'same.mjs'), ...args], { encoding: 'utf8' });
+  const r = run(['A', 'B', 'C'].map((d) => join(root, d)));
+  ok('N12-4: the re-encoded listing is the same product, its photos named as near copies',
+    r.status === 0 && /^same product: A B {3}-> "product": "A" on each$/m.test(r.stdout) && /A = B: 3 shared \(of 3 and 3 distinct photos; 3 of them near copies/.test(r.stdout) && !/\bC\b/.test(r.stdout.split('\n').filter((l) => /same product|in common/.test(l)).join(' ')), r.stdout + r.stderr);
+  ok('N12-4: the output says how it compared', /^compared: byte-identical photos and near copies \(8 of 256 bits or fewer apart\)$/m.test(r.stdout), r.stdout);
+  const r0 = run(['--near', '0', ...['A', 'B'].map((d) => join(root, d))]);
+  ok('N12-4: --near 0: bytes only, so no product', r0.status === 0 && !/^same product/m.test(r0.stdout) && /--near 0/.test(r0.stdout), r0.stdout);
+  eq('N12-4: a bad --near is refused, exit 2', run(['--near', 'x', join(root, 'A'), join(root, 'B')]).status, 2);
+  ok('N12-4: no temp folder is left', !fsx.readdirSync(tmpdir()).some((f) => /^aef-same-/.test(f)), fsx.readdirSync(tmpdir()).filter((f) => /^aef-same-/.test(f)).join(','));
+});
+
+console.log('\nN12-5: labels.sh crop refuses a region outside the image');
+await block('N12-5', async () => {
+  const dir = tmp('aef-n12-5-');
+  const f = join(dir, 'img1.png');
+  fsx.writeFileSync(f, await pngPattern(90, 143, (x, y) => [x, y, 100]));
+  const wrong = await labelsRun(['crop', f, '0', '100', '90', '38']);
+  ok('N12-5: x y w h by mistake (left 100 on a 90-wide image): exit 1, the order named, no file',
+    wrong.code === 1 && /outside the image \(90 wide, 143 high\)\. The order is <top> <left> <h> <w>\./.test(wrong.err) && !fsx.existsSync(join(dir, 'img1-crop.png')), wrong.err);
+  const right = await labelsRun(['crop', f, '90', '0', '16', '90']);
+  ok('N12-5: a region inside it is cropped', right.code === 0 && fsx.existsSync(join(dir, 'img1-crop.png')), right.err + right.out);
+  eq('N12-5: a number that is not whole pixels is refused', (await labelsRun(['crop', f, '1', '2', 'x', '4'])).code, 1);
+});
+
+console.log('\nN12-6: start() names harvest backups an earlier run left');
+await block('N12-6', async () => {
+  const ls = fakeStorage();
+  const week = Date.now() - 7 * 24 * 3600e3;
+  for (const [i, q] of ['rotak', 'rotak 40 lawnmower blade 40cm', 'F016800273'].entries()) {
+    ls.setItem('__aeHarvest:' + q.replace(/\W+/g, '-') + ':' + (week + i).toString(36),
+      JSON.stringify({ v: 2, savedAt: week + i * 1000, query: q, slug: q, items: [{ id: String(i) }], page: 1, requests: 1, stop: null, fourStar: false }));
+  }
+  const w = { localStorage: ls };
+  new Function('window', 'fetch', harvestSrc)(w, async () => reply(''));
+  const plan = w.__aeHarvest.start({ query: 'wired mouse', fourStar: true });
+  eq('N12-6: the three old ones are named, and the one this save dropped is marked',
+    [plan.olderBackups.length, plan.olderBackups.filter((b) => b.dropped).length, w.__aeHarvest.backups().length], [3, 1, 3]);
+  ok('N12-6: the note says so first', /^olderBackups: 3 saved harvest\(s\) older than 8 h were in storage .* 1 were dropped by this save/.test(plan.note), plan.note);
+  ok('N12-6: the reply still fits the connector, with the four-star note too', JSON.stringify(plan).length < 1000, String(JSON.stringify(plan).length));
+  const again = w.__aeHarvest.start({ query: 'silent wired mouse' });
+  ok('N12-6: a run that finds only this hour\'s backups says nothing', !('olderBackups' in again) || again.olderBackups.every((b) => b.query !== 'wired mouse'), JSON.stringify(again));
+});
+
+console.log('\nN12-7: the site\'s shipping summary is the carton, not the product size');
+await block('N12-7', async () => {
+  const carton = await leListing([], { desc: { body: 'Compact and lightweight build Weighing only 0.070 kg and measuring 20 x 16 x 5 cm', images: [] }, title: 'USB Optical Wired Mouse' });
+  eq('N12-7: "Weighing only 0.070 kg and measuring 20 x 16 x 5 cm" is a package size', leSizes(carton), [[], ['Compact and lightweight build Weighing only 0.070 kg and measuring 20 x 16 x 5 cm']]);
+  const own = await leListing([], { desc: { body: 'Compact and lightweight design Weighing only 96g and measuring 127 x 70 x 44 mm', images: [] }, title: 'Razer Mouse' });
+  eq('N12-7: "Weighing only 96g and measuring 127 x 70 x 44 mm" stays the product', leSizes(own), [['Compact and lightweight design Weighing only 96g and measuring 127 x 70 x 44 mm'], []]);
+});
+
+console.log('\nN12-8: SKILL.md says how to use the new parts');
+await block('N12-8', async () => {
+  ok('N12-8: the crop example names its order', /labels\.sh crop <out>\/<id>\/img1\.png 295 328 150 175[^\n]*top 295, left 328, height 150, width 175/.test(skillSrc));
+  const step7 = skillSrc.slice(skillSrc.indexOf('## Step 7'), skillSrc.indexOf('## Step 8'));
+  ok('N12-8: step 7: sources that disagree make it unknown, and a cable in a photo is not proof', /Sources that disagree make it `unknown`/.test(step7) && /cable in a photo is not proof/.test(step7));
+  ok('N12-8: step 5 runs checks.mjs on the details file', /node ~\/\.claude\/skills\/aliexpress-finder\/scripts\/checks\.mjs --out/.test(skillSrc));
+  const step4 = skillSrc.slice(skillSrc.indexOf('## Step 4'), skillSrc.indexOf('## Step 5'));
+  ok('N12-8: step 4 shows --exclude and --max-price', /--exclude '/.test(step4) && /--max-price 14\.99/.test(step4) && /`excluded`/.test(step4));
+  ok('N12-8: the files table lists checks.mjs', /\| `scripts\/checks\.mjs` \|/.test(skillSrc));
+  ok('N12-8: the defects of this run are recorded', /### Defects fixed 2026-11-23 \(the wired-mouse session\)/.test(skillSrc));
+});
+
 // ---------------------------------------------- the whole suite on dist/
 /* The operator pastes dist/*.min.js, so the suite runs again on them: every
  * scenario above, not a handful (review, 2026-10-18: only 4 assertions

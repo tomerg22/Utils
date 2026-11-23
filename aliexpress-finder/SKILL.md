@@ -92,6 +92,13 @@ descriptions before writing a word about absence. A regex that picks one
 product class out of a merged pool (a brand, a type) goes in `--class`
 instead, which warns only when it matches no title (step 4).
 
+**The photo settles a printed number, not every feature.** A cable in a photo
+does not prove a mouse is wired only: a wireless mouse is shown with its
+charging cable. When the title, the spec rows and the photos disagree on such a
+feature, its status is `unknown` (step 7), and the user decides. Measured
+2026-11-23: a vertical mouse titled "Wired" had a cable in all 17 photos and a
+table saying "Type: 2.4Ghz Wireless", "Battery Included: Yes".
+
 ## One given listing — a link, not a search
 
 When the user gives an item link and asks about that item ("read this", "does
@@ -135,6 +142,9 @@ and the end-of-run cleanup (step 9 below).
      "RS7 Black" at $13.39 showed PAW3111 on its photo, and the table said
      3311, the sensor of "RS7 Black PAW3311" at $18.67). Compare the plug, the
      bearing and the airflow yourself.
+   - `checks.mjs` (step 5, "Then run the record checks") on the `sendAll()`
+     file adds button and DPI counts, model codes (`B1` against `B2`), the
+     weight, `options-differ` and `wired-vs-wireless`.
    - The product photo outranks a text row (the third rule).
    - **Two photos that disagree leave that value unknown.** Report both values
      and do not pick one.
@@ -593,6 +603,13 @@ __aeHarvest.restore()                           // a fresh tab: reload the saved
 __aeHarvest.payload()                           // in-app browser: JSON string for decode.mjs
 ```
 
+`start()` also names harvest backups older than 8 hours (`olderBackups`, and a
+note first): a past run skipped the cleanup, and this run's saves drop the
+oldest of them to keep 3 runs; `dropped: true` marks those its first save
+removed. To keep one, `restore(query)` and `send()` it before the next
+`start()`. Measured 2026-11-23: three harvests of 2026-11-16 were in storage,
+and nothing said so.
+
 `start()` deliberately returns the search **path** and flags, not the URL —
 the Chrome connector blocks any result carrying a query string.
 `__aeHarvest.debugUrl()` has the full URL when you are in the in-app browser.
@@ -1050,6 +1067,30 @@ Until the review of 58c8a00 class splits went in `--require`, and to keep those
 quiet the warning was cut to "fewer than 10 titles": an attribute regex that
 matched 12 of 900 said nothing. Both together: `--class 'gan' --require 'wire'`.
 
+**`--exclude` drops the titles it matches.** "Wired only" out of a pool where
+598 of 819 titles named wireless, Bluetooth or a dual mode needs it. The output's
+`excluded` lists every dropped title with the words that matched it: read it
+before trusting the cut. Measured 2026-11-23: a hand-made negative regex in
+`--class` held the word "feet", which dropped a real wired Logitech G102 ("PTFE
+Glide Feet"); only listing the drops by hand caught it. A title is still only a
+title: an item kept by `--exclude` is checked on its page in step 7.
+
+**A price cap is `--max-price`, in both modes.** "Under $15" is `--max-price
+14.99`: the cap is inclusive. In shortlist mode it reads the search-grid price,
+which is not the price paid (measured 2026-11-23: the item page was up to 31%
+higher, $3.09 to $4.05, and up to 4.5% lower, $3.09 to $2.95). So an item up to
+5% over the cap is kept and flagged `price-over-cap-on-grid`, and the `max-price`
+warning counts the drops. In final mode it is a hard requirement on the
+item-page price, the same as a `--constraint`: over the cap is
+`violates:max-price`, no price is `unverified:max-price`, and `constraints`
+lists `max-price`. Prices in two currencies stop it (exit 2): pass `--currency
+USD`.
+
+```bash
+node ~/.claude/skills/aliexpress-finder/scripts/rank.mjs --mode shortlist --top 18 --spread 6 \
+  --class 'mouse|mice' --exclude 'wireless|bluetooth|tri-?mode|dual-?mode|rechargeable|jiggler' --max-price 14.99 < harvest.json
+```
+
 The no-rating filter removes AliExpress's SEO keyword-stuffing links (titles
 like "milk frother containeraliexpress milk frother…", all fields null).
 In `final` mode no finalist is dropped as junk: see step 7. (The 4★ URL
@@ -1345,6 +1386,36 @@ __aeListing.sendAll(8765, {token: '<token>'})  // after: curl -s http://127.0.0.
 __aeListing.dropCaptured()         // after the receiver printed "saved <path>"
 ```
 
+**Then run the record checks.** `checks.mjs` reads the `details-<stamp>.json`
+that `sendAll()` saved, and adds what `listing.js` has no room for (its paste
+copy must stay under 45,000 characters):
+
+```bash
+node ~/.claude/skills/aliexpress-finder/scripts/checks.mjs --out <dir>/checked.json <dir>/details-<stamp>.json
+```
+
+It prints, per listing, and adds to each record:
+
+- `productWeightG` and `weightLines`: the product's own weight, from the
+  description text, the spec rows and the size lines, with the shipping weight
+  (`Gross Weight`, `Total weight`, the site's "Weighing only 0.070 kg and
+  measuring …") marked apart. `null` is unknown (`weight-not-in-text`): it may be
+  on a photo only (F1: "Weight 135G±10G"). Read the photos before writing "not
+  stated". Page text before the description is not read: it holds reviews,
+  pooled across sellers.
+- `specs-vs-option` for button and DPI counts and for model codes: KEBIDUMEI
+  "7 Buttons 2400dpi" against "Number of Buttons: 6"; Inphic "B2 White" against
+  "inphic Model: B1".
+- `optionsDiffer`, with an `options-differ` warning: two options name different
+  models or counts, so they are different products and the own rating is
+  pooled over both. `rank.mjs --mode final` flags it `rating-shared-by-options`.
+  Options that name no model ("X1 Wired Mouse", "Only Mouse") are not caught:
+  only the photos tell.
+- `connection`, with a `wired-vs-wireless` warning when the title and the rows
+  say both: its wired status is `unknown` (step 7).
+
+`checked.json` goes to `rank.mjs --mode final` in place of the details file.
+
 `capture()` saves nothing on a wall and returns `blocked` or `suspectedWall`: stop
 as in step 2. A record also holds `store`, the seller's store name (`null` when
 the page text had none: unknown), and `storeOfficial`, for step 6. After
@@ -1569,8 +1640,12 @@ to PNG (`sips`; PIL is not installed here). If the case text is too small to
 read in the 800x800 shot — and it usually is — crop and upscale:
 
 ```bash
-~/.claude/skills/aliexpress-finder/scripts/labels.sh crop <out>/<id>/img1.png 295 328 150 175
+~/.claude/skills/aliexpress-finder/scripts/labels.sh crop <out>/<id>/img1.png 295 328 150 175   # top 295, left 328, height 150, width 175
 ```
+
+The order is `<top> <left> <height> <width>`. A region outside the image is
+refused, naming the image size and the order (2026-11-23: x, y, width, height by
+mistake gave an all-black crop with exit 0).
 
 Reading the uncropped image is exactly how `OUTPUT: 9V1.6A` went unnoticed on
 the first pass.
@@ -1617,6 +1692,18 @@ eye and set no `product` on them. A folder with no `img<N>.png`, and anything
 that is not a folder (a file in `<out>/*`), is skipped and named. All three were
 found in the review of 58c8a00: description banners joined two products, a chain
 was one group, and one stray file stopped the whole comparison.
+
+**Near copies count too** (since 2026-11-23). Sellers re-encode the same photo,
+so its bytes differ: two listings of one office mouse showed the same banners
+and the same 110 x 55 x 33 mm drawing with no byte-identical file. `same` also
+compares a 256-bit difference hash of each photo (17 x 16 grey pixels, made by
+`sips`); photos 8 bits apart or fewer are near copies, and the pair line says
+how many matches were near. Measured on 180 gallery photos of 20 listings: the
+re-encoded copies were 1 to 16 bits apart, different mice 19 or more; the one
+pair under 8 that was not a copy (5 bits) was two brands' photos of one generic
+shell, and one shared photo never makes a group. A flat image (one colour)
+matches by its bytes only. `--near 0` compares bytes only; without `sips` that
+is all it does, and the first line says so.
 
 **Detail price often differs from search price** — the grid shows one option's
 price or a promo figure, not always the cheapest one (measured 2026-10-31:
@@ -1734,12 +1821,22 @@ never named), and it named a cheapest across two currencies.
 **Set each constraint from the spec rows, never from the title alone:**
 
 1. `pass` needs a positive statement in a spec row (step-5 `spec`, or
-   `listing.js` `specs`), the description, or the product photo. A title
-   "Wired" with a spec row `Type: 2.4Ghz Wireless`, `Power Type:
-   Rechargeable` or `Power Source: Rechargeable` is a `fail`: say the two disagree.
-2. `fail` needs a statement that contradicts the requirement.
-3. Anything else is `unknown`, including `specFrom: 'none'` and a
+   `listing.js` `specs`), the description, or the product photo, and no source
+   that contradicts it.
+2. `fail` needs a statement that contradicts the requirement, and none that
+   supports it.
+3. **Sources that disagree make it `unknown`.** A title "Wired" with a row
+   `Type: 2.4Ghz Wireless`, or a row `Type: Wired` beside `Power Type:
+   Rechargeable` (`checks.mjs` says `wired-vs-wireless`): report both sides
+   and let the user decide. A cable in a photo is not proof of wired only: a
+   wireless mouse is shown with its charging cable. Until 2026-11-23 this rule
+   called the first case a `fail` while the third rule said the photo wins; a
+   vertical mouse with a cable in all 17 photos and a wireless table met both.
+4. Anything else is `unknown`, including `specFrom: 'none'` and a
    description that was not read. `unknown` is held out of `ranked`.
+
+A price cap is `--max-price` here too (step 4): in final mode it reads the
+item-page price and is a hard requirement.
 
 ```bash
 node ~/.claude/skills/aliexpress-finder/scripts/rank.mjs --mode final --top 4 --constraint wires < finalists.json
@@ -1776,6 +1873,9 @@ Then, briefly:
 - **which specs came from the product photo** rather than a text field, and any
   place where the two disagree. The photo wins; say so.
 - **dimensions**, and whether the figure is the product or the shipping carton.
+- **weight**, when the user asks or it matters: `productWeightG` with its line
+  and source, or "not stated" only after the photos were read. Never a
+  shipping weight (`Gross Weight`, `Total weight`).
 - why each won (cite the actual numbers)
 - **coverage, honestly**: whether the harvest was `exhausted-all-results`,
   `truncated` or `off-query`, how many unique items and how many pages. Never
@@ -1788,12 +1888,16 @@ Then, briefly:
   sold count, not a "1,000+" floor), `few-reviews-for-sales` (reviews under
   2% of a sold count of 1,000 or more), `brand-unresearched`, `brand-implausible`
   (a `brandScore` under 0.2: the brand weight can only demote it a little,
-  so say it is likely a counterfeit), `rating-may-be-pooled`), and any
+  so say it is likely a counterfeit), `rating-may-be-pooled`,
+  `rating-shared-by-options` (the own rating covers several products),
+  `price-over-cap-on-grid`, `price-unknown`), and any
   `sold-unparsed`, `own-reviews-unknown`, `no-rating`, `below-evidence-floor`, `criterion-unknown`,
   `brandScore-out-of-range`, `not-a-number`, `off-query-results`,
   `off-query-connector`, `off-query-keywords`,
-  `tie-at-cutoff`, `tie-in-spread`, `same-product`, `unverified-only` or
-  `empty-input` warning, with the items it names
+  `tie-at-cutoff`, `tie-in-spread`, `same-product`, `unverified-only`,
+  `max-price`, `excluded-all` or `empty-input` warning, and any `checks.mjs`
+  warning (`options-differ`, `wired-vs-wireless`, `weight-disagrees`,
+  `specs-vs-option`), with the items it names
 - which option the detail price belongs to (the selected one in `options`)
 - any large search-vs-detail price gap
 - anything dropped for a notable reason (off-category, SEO junk, thin evidence)
@@ -1826,10 +1930,11 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 | `scripts/dist/*.min.js` | Generated install copies. Never edit them; edit the source and run `build.mjs`. |
 | `scripts/extract.js` | Single-page extractor for the currently loaded page. `_init_data_` first, DOM fallback, reports `source`, `blocked` and `visibility`. The result also stays on `window.__aeExtract` (Chrome cuts the return at 1,000 characters): return pieces of `.result`, or `.send(port)` posts it to `receiver.mjs`. |
 | `scripts/listing.js` | **Detail-page reader.** `await read()`: expands, then returns text AND images in one call. Shadow-DOM aware, block-aware; `gallery` is the product's own photos only (other products counted in `excludedImages`); reads the description (from its shadow tree, or fetched when a hidden tab left it unrendered) into `text`, `sizeLines` and `descriptionImages`; separates product size from carton size, reads options only from the option selector (`selectedVariant` too; `optionTiles` and a `same-name-options` warning when tiles share a name), returns the own vs pooled review counts and the seller's `store`, reports `visibility` and `warnings`, keeps the result in `last` before the description fetch, `changed()` proves a re-read is owed. `options()`, `pick(name, n)` (exact name; `n` for a name on several tiles; `selectedTiles` and `selectedN` say which tile is selected), `price()`, `capture()`, `captured()`, `sendAll()`, `dropCaptured()`. `specLine()` returns the spec rows as one `Name: value / Name: value` line the Chrome connector does not block; `specs-vs-option` also compares mouse sensor codes; a `read({ description: false })` on a page whose description was read uses that read again, and `capture()` keeps the earlier record's description images when it reads none; `requests()` reads the shared request log, where its page and its description fetches go. |
-| `scripts/labels.sh` | Downloads a listing's images into its own folder and makes their printed text readable (WebP→PNG, crop + upscale). The label on the case is the spec sheet. `fetch` numbers on after the files already there (`--fresh` starts over), description images with `--desc` as `desc<N>.png`. `sheet` puts a folder's images on numbered contact sheets (`sheet.swift`), names an image it cannot read and exits 3; `same` runs `same.mjs` on several listing folders. |
+| `scripts/labels.sh` | Downloads a listing's images into its own folder and makes their printed text readable (WebP→PNG, crop + upscale). The label on the case is the spec sheet. `fetch` numbers on after the files already there (`--fresh` starts over), description images with `--desc` as `desc<N>.png`. `sheet` puts a folder's images on numbered contact sheets (`sheet.swift`), names an image it cannot read and exits 3; `same` runs `same.mjs` on several listing folders. `crop` takes `<top> <left> <h> <w>` and refuses a region outside the image. |
 | `scripts/sheet.swift` | Contact-sheet maker for `labels.sh sheet`: AppKit, compiled once into `~/.cache/aliexpress-finder`. 12 images per sheet, 4 per row, each tile labelled with its file (`3` is `img3.png`, `d3` is `desc3.png`); prints the labels of the images it could not decode. |
-| `scripts/same.mjs` | Which listings are one product: md5 of each listing's gallery photos (`img<N>.png` only), a pair sharing at least half of the smaller one's distinct photos (and at least 2) is one product, and a group only when every pair in it is. Prints the groups to put as `product` on the finalists, the chains to check by eye and the skipped arguments; `--json` for a machine. |
-| `scripts/rank.mjs` | Ranker. Bayesian shrinkage (own rating in final mode), log volume, neutral brand default, `--class` split (warns only when it matches no title), `--require` filter (absence warning at 10% of the titles or fewer, with the counts), `--spread` tier stratification, `--constraint` hard filters, off-query (`off-query-results`, `-connector`, `-keywords`) and `tie-at-cutoff` warnings, `sold-unparsed` and `own-reviews-unknown` set-asides with warnings, one product ranked once (`product`; `sameProduct`, `otherListings` and a `same-product` warning for the ranked products, set-aside listings included), strict flag values. |
+| `scripts/checks.mjs` | Checks on the `details-<stamp>.json` of `sendAll()` (step 5): the product weight apart from the shipping weight (`productWeightG`, `weightLines`), button, DPI and model codes against the spec rows (`specs-vs-option`), options that are different products (`optionsDiffer`, read by `rank.mjs` as `rating-shared-by-options`), and wired against wireless (`connection`, `wired-vs-wireless`). `--out` writes the records with these fields for `rank.mjs --mode final`; `--json` for a machine. |
+| `scripts/same.mjs` | Which listings are one product: md5 and a 256-bit difference hash (near copies, `--near`, default 8 bits) of each listing's gallery photos (`img<N>.png` only), a pair sharing at least half of the smaller one's distinct photos (and at least 2) is one product, and a group only when every pair in it is. Prints the groups to put as `product` on the finalists, the chains to check by eye and the skipped arguments; `--json` for a machine. |
+| `scripts/rank.mjs` | Ranker. Bayesian shrinkage (own rating in final mode), log volume, neutral brand default, `--class` split (warns only when it matches no title), `--require` filter (absence warning at 10% of the titles or fewer, with the counts), `--spread` tier stratification, `--constraint` hard filters, off-query (`off-query-results`, `-connector`, `-keywords`) and `tie-at-cutoff` warnings, `sold-unparsed` and `own-reviews-unknown` set-asides with warnings, one product ranked once (`product`; `sameProduct`, `otherListings` and a `same-product` warning for the ranked products, set-aside listings included), `--exclude` (drops what it matches, names the words in `excluded`), `--max-price` and `--currency` (a 5% grid margin in shortlist mode, a hard requirement on the item-page price in final mode), `rating-shared-by-options`, strict flag values. |
 | `scripts/lib.mjs` | Pure helpers (`parseSold`, `SOLD_RE`, `parseReviewBlock`, `median`, `clean`, **`wallVerdict`**, `queryRelevance`, and the request log: `reqLogAdd`, `reqLogRead`, `reqLogSummary`) shared by ranker, browser files, the step-5 reader and tests. |
 | `scripts/test.mjs` | Assertion suite incl. regression guards for every defect below. It also runs the step-5 reader, pulled out of this file. |
 | `scripts/fixtures/` | Real titles for the relevance tests: `real-titles-2026-10-17.json` (craft wire served for `wired usb mouse`, a real mouse stream), `real-streams-2026-10-19.json` (POCO phones for `poco f7 ultra wallet case`, cables for `type c iem`, three correct streams), `live-streams-2026-10-19.json` (18 labelled live captures). |
@@ -1842,6 +1947,48 @@ matches `lib.mjs` on every fixture — keep them in sync, the test will catch yo
 if you don't. A drifted `wallVerdict` means one entry point silently stops
 detecting walls; a drifted `SOLD_RE` means best sellers silently lose their
 sold count.
+
+### Defects fixed 2026-11-23 (the wired-mouse session)
+
+Found in a live run (wired mice: 819 listings, 20 detail pages, 266 photos),
+then a $15 cap the user added, then each mouse's weight. The user asked for a
+map of the skill's bugs. Each has a test (`N12`) that fails on 2cfb9ba. The
+`checks.mjs` checks were replayed on that run's real details file and gave the
+findings made by hand that day.
+
+1. **Two rules disagreed on "wired".** Step 7 called a title "Wired" with a
+   wireless table a `fail`; the third rule said the photo wins, and the photos
+   showed a cable. Guard: sources that disagree are `unknown` (step 7), a
+   cable in a photo is not proof, and `checks.mjs` warns `wired-vs-wireless`.
+2. **`specs-vs-option` missed counts and models.** It compared V, W, A, RPM,
+   mAh and sensor codes only; KEBIDUMEI (7 buttons selected, the table's 6)
+   and Inphic (B2 selected, the table's B1) passed. Guard: `checks.mjs`.
+3. **A rating shared by different products looked like one product's.** The
+   own count belongs to the listing; KEBIDUMEI and Inphic sell two mice under
+   one count (and the X1 listing too, which no text check can see). Guard:
+   `optionsDiffer` and `rating-shared-by-options`.
+4. **No price cap.** A "<$15" rule needed a hand filter on the grid price,
+   which differs from the page price (+31% to -4.5%). Guard: `--max-price`.
+5. **No exclude.** A negative regex in `--class` dropped a real wired G102
+   ("feet"). Guard: `--exclude` and the `excluded` list with the words matched.
+6. **`same` saw bytes only.** Two listings of one office mouse with
+   re-encoded photos were not grouped. Guard: near copies (a 256-bit difference
+   hash), flat images excluded.
+7. **A carton line came back as the product size.** "Weighing only 0.070 kg
+   and measuring 20 x 16 x 5 cm" was in `productSizeLines`. Guard: weight in kg
+   with three decimals in that form marks the shipping data (`listing.js`).
+8. **No weight.** Weights came from a text search and two photo crops by hand,
+   with "Gross Weight" rows (no unit) mixed in. Guard: `checks.mjs`
+   `productWeightG` and `weightLines`.
+9. **The crop example did not name its order.** x, y, w, h by mistake gave an
+   all-black crop, exit 0. Guard: the example says it, and `crop` refuses a
+   region outside the image.
+10. **Old harvest backups were dropped with no word.** Three of 2026-11-16 were
+    in storage. Guard: `start()` names them (`olderBackups`).
+
+Also found: listing.js could not hold these checks. Its paste copy had 346
+characters to spare under the 45,000 cap, and the first version added 8,400;
+so they live in `checks.mjs`, which reads the saved records.
 
 ### Defects fixed 2026-11-09 (the bluetooth-mouse session)
 

@@ -891,6 +891,14 @@ function reqLogSummary(log, now) {
       }
       const note = maxPages > LAST_PAGE ? capNote(maxPages) : null;
       if (note) maxPages = LAST_PAGE;
+      /* Backups left by an earlier run (saved over OLD_HOURS ago). Measured
+       * 2026-11-23: three "rotak" harvests of 2026-11-16 were still in storage
+       * (a past run skipped the cleanup), and the first start() of the new run
+       * began dropping them to keep MAX_BACKUPS, with no word. capture() in
+       * listing.js already says olderRecords; start() now says which old
+       * backups it found and which of them its save dropped. */
+      const OLD_HOURS = 8;
+      const oldBackups = this.backups().filter((b) => b.savedAt && Date.now() - Date.parse(b.savedAt) > OLD_HOURS * 3600e3);
       let base = 'https://he.aliexpress.com/w/wholesale-' + slug +
                  '.html?SortType=total_tranpro_desc';
       if (opts.fourStar === true) base += '&selectedSwitches=filterCode%3A4StarRating';
@@ -912,12 +920,29 @@ function reqLogSummary(log, now) {
        * connector replaces a whole result with "[BLOCKED: Cookie/query string
        * data]" when it contains one (measured 2026-09-14); the in-app browser
        * does not care. debugUrl() has the full URL for the in-app browser. */
-      const notes = [note, switchOn(this.st) ? FOUR_STAR_NOTE : null].filter(Boolean);
-      return Object.assign({ query: this.st.query,
+      let older = null;
+      if (oldBackups.length) {
+        const left = new Set(this.backups().map((b) => b.query + '|' + b.savedAt));
+        older = oldBackups.slice(0, MAX_BACKUPS).map((b) => ({ query: String(b.query || '').slice(0, 30),
+          savedAt: String(b.savedAt).slice(0, 10), items: b.items, dropped: !left.has(b.query + '|' + b.savedAt) }));
+      }
+      const notes = [older ? 'olderBackups: ' + oldBackups.length + ' saved harvest(s) older than ' + OLD_HOURS +
+        ' h were in storage (a past run skipped the cleanup); ' + older.filter((b) => b.dropped).length +
+        ' were dropped by this save (' + MAX_BACKUPS + ' runs are kept). To keep one, restore(query) and send() it before the next start().' : null,
+        note, switchOn(this.st) ? FOUR_STAR_NOTE : null].filter(Boolean);
+      const plan = (ns, old) => Object.assign({ query: this.st.query,
                searchPath: '/w/wholesale-' + slug + '.html',
                sort: 'total_tranpro_desc', fourStar: this.st.fourStar,
                extraApplied: !!this.st.extra,
-               startPage, maxPages, maxRequests }, notes.length ? { note: notes.join(' ') } : {});
+               startPage, maxPages, maxRequests }, old ? { olderBackups: old } : {}, ns.length ? { note: ns.join(' ') } : {});
+      // Under the Chrome connector's 1,000 characters: the short four-star
+      // marker first, then the old backups' item counts.
+      let out = plan(notes, older);
+      if (JSON.stringify(out).length > 990) out = plan(notes.map((n) => (n === FOUR_STAR_NOTE ? FOUR_STAR_SHORT : n)), older);
+      if (JSON.stringify(out).length > 990 && older) {
+        out = plan(notes.map((n) => (n === FOUR_STAR_NOTE ? FOUR_STAR_SHORT : n)), older.map((b) => ({ query: b.query, dropped: b.dropped })));
+      }
+      return out;
     },
 
     /* Reload a harvest saved in localStorage (see BACKUP above), in this tab

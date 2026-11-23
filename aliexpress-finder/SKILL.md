@@ -1086,9 +1086,17 @@ item-page price, the same as a `--constraint`: over the cap is
 lists `max-price`. Prices in two currencies stop it (exit 2): pass `--currency
 USD`.
 
+**A floor is `--min-price`** (since the second run of 2026-11-23, when the user
+asked for "$5<price<$15" and only the cap existed). Also inclusive: "over $5" is
+`--min-price 5.01`. In final mode under it is `violates:min-price`. In shortlist
+mode the page price can be far ABOVE the grid (+31% that day), so a grid price
+down to the floor / 1.31 is kept and flagged `price-under-floor-on-grid`, and
+only a lower one is dropped (`under-min-price`). Expect many such cheap listings
+in a band near the floor: their page decides.
+
 ```bash
 node ~/.claude/skills/aliexpress-finder/scripts/rank.mjs --mode shortlist --top 18 --spread 6 \
-  --class 'mouse|mice' --exclude 'wireless|bluetooth|tri-?mode|dual-?mode|rechargeable|jiggler' --max-price 14.99 < harvest.json
+  --class 'mouse|mice' --exclude 'wireless|bluetooth|tri-?mode|dual-?mode|rechargeable|jiggler' --min-price 5.01 --max-price 14.99 < harvest.json
 ```
 
 The no-rating filter removes AliExpress's SEO keyword-stuffing links (titles
@@ -1412,7 +1420,14 @@ It prints, per listing, and adds to each record:
   Options that name no model ("X1 Wired Mouse", "Only Mouse") are not caught:
   only the photos tell.
 - `connection`, with a `wired-vs-wireless` warning when the title and the rows
-  say both: its wired status is `unknown` (step 7).
+  say both: its wired status is `unknown` (step 7). When only a `Power Type` /
+  `Power Source` row says rechargeable beside `Battery Included: no`, the
+  warning is `power-type-only` instead: seen on 7 wired listings on 2026-11-23,
+  likely a default value. Still `unknown`; report it as a likely default.
+- Options that name `Wired` and `Wireless` (or `2.4G`) are different products:
+  `options-differ` says so (the Honeycomb listing sold both under one rating).
+- A weight in a sentence about the package ("comes in a package size of 20 x
+  20 x 20 cm with a weight of 0.084 kg") is the shipping weight.
 
 `checked.json` goes to `rank.mjs --mode final` in place of the details file.
 
@@ -1890,7 +1905,7 @@ Then, briefly:
   (a `brandScore` under 0.2: the brand weight can only demote it a little,
   so say it is likely a counterfeit), `rating-may-be-pooled`,
   `rating-shared-by-options` (the own rating covers several products),
-  `price-over-cap-on-grid`, `price-unknown`), and any
+  `price-over-cap-on-grid`, `price-under-floor-on-grid`, `price-unknown`), and any
   `sold-unparsed`, `own-reviews-unknown`, `no-rating`, `below-evidence-floor`, `criterion-unknown`,
   `brandScore-out-of-range`, `not-a-number`, `off-query-results`,
   `off-query-connector`, `off-query-keywords`,
@@ -1934,7 +1949,7 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 | `scripts/sheet.swift` | Contact-sheet maker for `labels.sh sheet`: AppKit, compiled once into `~/.cache/aliexpress-finder`. 12 images per sheet, 4 per row, each tile labelled with its file (`3` is `img3.png`, `d3` is `desc3.png`); prints the labels of the images it could not decode. |
 | `scripts/checks.mjs` | Checks on the `details-<stamp>.json` of `sendAll()` (step 5): the product weight apart from the shipping weight (`productWeightG`, `weightLines`), button, DPI and model codes against the spec rows (`specs-vs-option`), options that are different products (`optionsDiffer`, read by `rank.mjs` as `rating-shared-by-options`), and wired against wireless (`connection`, `wired-vs-wireless`). `--out` writes the records with these fields for `rank.mjs --mode final`; `--json` for a machine. |
 | `scripts/same.mjs` | Which listings are one product: md5 and a 256-bit difference hash (near copies, `--near`, default 8 bits) of each listing's gallery photos (`img<N>.png` only), a pair sharing at least half of the smaller one's distinct photos (and at least 2) is one product, and a group only when every pair in it is. Prints the groups to put as `product` on the finalists, the chains to check by eye and the skipped arguments; `--json` for a machine. |
-| `scripts/rank.mjs` | Ranker. Bayesian shrinkage (own rating in final mode), log volume, neutral brand default, `--class` split (warns only when it matches no title), `--require` filter (absence warning at 10% of the titles or fewer, with the counts), `--spread` tier stratification, `--constraint` hard filters, off-query (`off-query-results`, `-connector`, `-keywords`) and `tie-at-cutoff` warnings, `sold-unparsed` and `own-reviews-unknown` set-asides with warnings, one product ranked once (`product`; `sameProduct`, `otherListings` and a `same-product` warning for the ranked products, set-aside listings included), `--exclude` (drops what it matches, names the words in `excluded`), `--max-price` and `--currency` (a 5% grid margin in shortlist mode, a hard requirement on the item-page price in final mode), `rating-shared-by-options`, strict flag values. |
+| `scripts/rank.mjs` | Ranker. Bayesian shrinkage (own rating in final mode), log volume, neutral brand default, `--class` split (warns only when it matches no title), `--require` filter (absence warning at 10% of the titles or fewer, with the counts), `--spread` tier stratification, `--constraint` hard filters, off-query (`off-query-results`, `-connector`, `-keywords`) and `tie-at-cutoff` warnings, `sold-unparsed` and `own-reviews-unknown` set-asides with warnings, one product ranked once (`product`; `sameProduct`, `otherListings` and a `same-product` warning for the ranked products, set-aside listings included), `--exclude` (drops what it matches, names the words in `excluded`), `--max-price`, `--min-price` and `--currency` (grid margins of 5% over the cap and 31% under the floor in shortlist mode, hard requirements on the item-page price in final mode), `rating-shared-by-options`, strict flag values. |
 | `scripts/lib.mjs` | Pure helpers (`parseSold`, `SOLD_RE`, `parseReviewBlock`, `median`, `clean`, **`wallVerdict`**, `queryRelevance`, and the request log: `reqLogAdd`, `reqLogRead`, `reqLogSummary`) shared by ranker, browser files, the step-5 reader and tests. |
 | `scripts/test.mjs` | Assertion suite incl. regression guards for every defect below. It also runs the step-5 reader, pulled out of this file. |
 | `scripts/fixtures/` | Real titles for the relevance tests: `real-titles-2026-10-17.json` (craft wire served for `wired usb mouse`, a real mouse stream), `real-streams-2026-10-19.json` (POCO phones for `poco f7 ultra wallet case`, cables for `type c iem`, three correct streams), `live-streams-2026-10-19.json` (18 labelled live captures). |
@@ -1985,6 +2000,13 @@ findings made by hand that day.
    region outside the image.
 10. **Old harvest backups were dropped with no word.** Three of 2026-11-16 were
     in storage. Guard: `start()` names them (`olderBackups`).
+
+Second run the same day ("$5<price<$15", 12 more pages, tests `N13`):
+`--min-price` did not exist; `checks.mjs` took a package sentence's weight as
+the mouse's (84 g); options "Wired-black" and "2.4G Wireless-white" were not
+called different products; and `wired-vs-wireless` fired on 5 wired mice whose
+only conflicting row was `Power Type: Rechargeable` beside `Battery Included:
+no` (now `power-type-only`).
 
 Also found: listing.js could not hold these checks. Its paste copy had 346
 characters to spare under the 45,000 cap, and the first version added 8,400;

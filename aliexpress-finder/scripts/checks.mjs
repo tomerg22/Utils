@@ -82,6 +82,9 @@ export function specCountConflicts(selected, rows) {
   return out;
 }
 
+const WIRED_WORD = /(?<![a-z])wired(?![a-z])/i;
+const WIRELESS_WORD = /wireless|bluetooth|2\.4\s*g(?:hz)?(?![a-z])|tri-?mode|dual-?mode|three-?mode/i;
+
 // ---------------------------------------------------------------- models
 /* A token of letters then digits: "B1", "G102", "X2", "PG1". `core` drops
  * letters after the digits ("G502HERO" -> G502), for a row that names the
@@ -121,7 +124,8 @@ export function modelConflicts(selected, variants, rows) {
  * (full token) or a different button or DPI count, else null. */
 export function optionsDiffer(variants) {
   const info = (variants || []).map((v) => ({ v, models: modelsOf(v, true), buttons: countsIn(v, SPEC_COUNTS[0].opt),
-    dpi: countsIn(v, SPEC_COUNTS[1].opt) }));
+    dpi: countsIn(v, SPEC_COUNTS[1].opt),
+    link: WIRELESS_WORD.test(v) ? 'wireless' : WIRED_WORD.test(v) ? 'wired' : null }));
   const same = (x, y) => x.size === y.size && [...x].every((c) => y.has(c));
   for (let i = 0; i < info.length; i++) {
     for (let j = i + 1; j < info.length; j++) {
@@ -129,14 +133,13 @@ export function optionsDiffer(variants) {
       if (a.models.size && b.models.size && !same(a.models, b.models)) return { a: a.v, b: b.v, why: 'model' };
       if (a.buttons.length && b.buttons.length && a.buttons[0] !== b.buttons[0]) return { a: a.v, b: b.v, why: 'buttons' };
       if (a.dpi.length && b.dpi.length && a.dpi[0] !== b.dpi[0]) return { a: a.v, b: b.v, why: 'DPI' };
+      if (a.link && b.link && a.link !== b.link) return { a: a.v, b: b.v, why: 'connection (wired / wireless)' };
     }
   }
   return null;
 }
 
 // ------------------------------------------------------- wired / wireless
-const WIRED_WORD = /(?<![a-z])wired(?![a-z])/i;
-const WIRELESS_WORD = /wireless|bluetooth|2\.4\s*g(?:hz)?(?![a-z])|tri-?mode|dual-?mode|three-?mode/i;
 /** What the title and the spec rows say: { wired: [...], wireless: [...] } as
  * short "where: what" labels. A battery or "rechargeable" counts as wireless. */
 export function connectionOf(title, rows) {
@@ -178,7 +181,13 @@ export function weightLinesOf(texts, rows) {
   for (const t of texts || []) {
     for (const m of String(t || '').matchAll(WEIGHT_RE)) {
       const text = clean(m[0]);
-      add({ text, grams: grams(m[2], m[3]), isPackage: SHIP_WEIGHT.test(m[1]) || LOGISTICS_RE.test(text), source: 'text' });
+      /* The words before it in the same sentence count too (second run of
+       * 2026-11-23: "The mouse comes in a package size of 20 x 20 x 20 cm with
+       * a weight of 0.084 kg" was read as an 84 g mouse). */
+      const src = String(t);
+      const before = src.slice(Math.max(0, m.index - 100), m.index).split(/[.!?;]\s|\n/).pop();
+      add({ text, grams: grams(m[2], m[3]), isPackage: SHIP_WEIGHT.test(m[1]) || LOGISTICS_RE.test(text) ||
+        /packag|packing|carton|shipping|parcel/i.test(before), source: 'text' });
     }
   }
   for (const [k, v] of Object.entries(rows || {})) {
@@ -221,7 +230,21 @@ export function checkRecord(rec) {
       'The rating and the review count are for the whole listing, both products: say so beside them.');
   }
   const connection = connectionOf(rec.title || d.title, rows);
-  if (connection.wired.length && connection.wireless.length) {
+  /* Only a "Power Type"/"Power Source" row says rechargeable, and a "Battery
+   * Included" row says no, while the type says wired. Seen on 7 listings in
+   * the two runs of 2026-11-23 (both Logitech G502, the strawberry mouse, the
+   * 7-button "FOR THE GAME" mouse, the E-Sports 5000 DPI mouse); every photo
+   * of them showed a cable and none a battery or a receiver. It still is not
+   * proof, so the status stays unknown, but the warning says what it is. */
+  const powerOnly = connection.wired.length && connection.wireless.length &&
+    connection.wireless.every((w) => /^power\s*(type|source)/i.test(w)) &&
+    Object.entries(rows).some(([k, v]) => /battery included/i.test(k) && /^no\b/i.test(String(v).trim()));
+  if (powerOnly) {
+    warnings.push(`power-type-only: the listing says wired (${connection.wired.slice(0, 3).join('; ')}); only ` +
+      `${connection.wireless.join('; ')} says otherwise, beside "Battery Included: no". Seen on 7 wired listings on 2026-11-23, ` +
+      'likely a default value. Wired is still UNKNOWN by step 7: check the photos for a receiver, a battery door or a ' +
+      'charging port, and report it to the user as a likely default.');
+  } else if (connection.wired.length && connection.wireless.length) {
     warnings.push(`wired-vs-wireless: the listing says wired (${connection.wired.slice(0, 3).join('; ')}) and wireless or battery ` +
       `(${connection.wireless.slice(0, 3).join('; ')}). It may be dual-mode, or a line is wrong. A wired requirement is UNKNOWN ` +
       'here: a cable in a photo is not proof (a wireless mouse is shown with its charging cable). Ask the user.');

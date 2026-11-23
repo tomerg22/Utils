@@ -59,7 +59,7 @@ import { median, parseSold, queryRelevance, fourStarWarning } from './lib.mjs';
  * 2026-10-19). */
 const FLAGS = ['mode', 'top', 'min-rating', 'min-evidence', 'w-quality', 'w-volume', 'w-brand', 'prior',
   'brand-default', 'class', 'require', 'spread', 'constraint', 'criterion', 'w-criterion', 'exclude', 'max-price',
-  'currency'];
+  'min-price', 'currency'];
 /* A flag with no value (last on the line, or followed by another --flag)
  * is an error, never a silent NaN. Measured 2026-10-18: `--spread x`, a bare
  * `--spread` or `--top abc` made headCount NaN, slice(0, NaN) returned [],
@@ -143,10 +143,20 @@ if (EXCLUDE != null && !/\S/.test(EXCLUDE)) die('--exclude needs a regex, got a 
  * The cap is inclusive: "under $15" is --max-price 14.99. --currency names the
  * currency of N; without it every priced item must share one currency. */
 const MAX_PRICE = numArg('max-price', null, { min: 0 });
+/* --min-price N, a floor (added 2026-11-23, second wired-mouse run: the user
+ * asked for "$5<price<$15", and only the cap existed). Inclusive: "over $5" is
+ * --min-price 5.01. Final mode: under it is violates:min-price. Shortlist
+ * mode: the item page was up to 31% ABOVE the grid that day ($3.09 grid, $4.05
+ * page), so a grid price down to N / 1.31 is kept and flagged
+ * price-under-floor-on-grid; lower is dropped as under-min-price. */
+const MIN_PRICE = numArg('min-price', null, { min: 0 });
+if (MIN_PRICE != null && MAX_PRICE != null && MIN_PRICE > MAX_PRICE) die(`--min-price ${MIN_PRICE} is above --max-price ${MAX_PRICE}`);
 const CURRENCY = arg('currency', null);
 if (CURRENCY != null && !/^[A-Za-z]{3}$/.test(CURRENCY)) die(`--currency must be a 3-letter code such as USD, got ${JSON.stringify(CURRENCY)}`);
-if (CURRENCY != null && MAX_PRICE == null) die('--currency names the currency of --max-price: pass --max-price too');
+if (CURRENCY != null && MAX_PRICE == null && MIN_PRICE == null) die('--currency names the currency of --max-price or --min-price: pass one of them too');
 const GRID_MARGIN = 1.05;
+const GRID_UP = 1.31;
+const PRICED = MAX_PRICE != null || MIN_PRICE != null;
 const SPREAD = numArg('spread', 0, { min: 0, int: true });
 
 /* All occurrences of a repeatable flag, e.g. --constraint wires --constraint 9v */
@@ -333,22 +343,25 @@ const soldUnparsed = (i) => i.sold == null && !!(i.soldText || i.soldRaw);
 
 // The cap's currency (see --max-price above).
 let capCurrency = CURRENCY ? CURRENCY.toUpperCase() : null;
-if (MAX_PRICE != null && !capCurrency) {
+if (PRICED && !capCurrency) {
   const curs = [...new Set(all.filter((i) => typeof i.price === 'number' && i.currency).map((i) => String(i.currency).toUpperCase()))];
   if (curs.length > 1) die(`--max-price: the prices are in ${curs.join(' and ')}; pass --currency to say which one the cap is in`);
   capCurrency = curs[0] || null;
 }
-/* 'pass', 'fail', 'near' (shortlist: over the cap by at most 5%) or 'unknown'. */
+/* 'pass', 'fail' (over the cap), 'near' (shortlist: over it by at most 5%),
+ * 'low' (under the floor), 'near-low' (shortlist: under it, but within the
+ * grid's 31%) or 'unknown'. */
 const priceCap = (i) => {
-  if (MAX_PRICE == null) return 'pass';
+  if (!PRICED) return 'pass';
   if (typeof i.price !== 'number') return 'unknown';
   if (capCurrency && i.currency && String(i.currency).toUpperCase() !== capCurrency) return 'unknown';
-  if (i.price <= MAX_PRICE) return 'pass';
+  if (MIN_PRICE != null && i.price < MIN_PRICE) return MODE !== 'final' && i.price * GRID_UP >= MIN_PRICE ? 'near-low' : 'low';
+  if (MAX_PRICE == null || i.price <= MAX_PRICE) return 'pass';
   if (MODE !== 'final' && i.price <= MAX_PRICE * GRID_MARGIN) return 'near';
   return 'fail';
 };
-// The requirements of final mode: every --constraint, and the cap.
-const REQS = MODE === 'final' && MAX_PRICE != null ? [...CONSTRAINTS, 'max-price'] : CONSTRAINTS;
+// The requirements of final mode: every --constraint, and the cap and floor.
+const REQS = MODE === 'final' ? [...CONSTRAINTS, ...(MIN_PRICE != null ? ['min-price'] : []), ...(MAX_PRICE != null ? ['max-price'] : [])] : CONSTRAINTS;
 
 /* WHY own-reviews-unknown EXISTS (measured 2026-09-25)
  *
@@ -395,7 +408,8 @@ for (const i of all) {
   const unknown = CONSTRAINTS.filter((n) => constraintStatus(i, n) === 'unknown');
   const cap = priceCap(i);
   if (MODE === 'final' && cap === 'fail') violated.push('max-price');
-  if (MODE === 'final' && cap === 'unknown') unknown.push('max-price');
+  if (MODE === 'final' && cap === 'low') violated.push('min-price');
+  if (MODE === 'final' && cap === 'unknown') unknown.push(...REQS.filter((n) => /-price$/.test(n)));
   if (i.notANumber) dropped.push({ ...i, why: 'not-a-number:' + i.notANumber.join('+') });
   else if (badBrands.includes(i)) dropped.push({ ...i, why: 'brandScore-out-of-range' });
   else if (classRe && !classRe.test(i.title || '')) dropped.push({ ...i, why: 'off-class' });
@@ -403,6 +417,7 @@ for (const i of all) {
   else if (reqRe && !reqRe.test(i.title || '')) dropped.push({ ...i, why: 'off-category' });
   else if (violated.length) dropped.push({ ...i, why: `violates:${violated.join('+')}` });
   else if (MODE !== 'final' && cap === 'fail') dropped.push({ ...i, why: 'over-max-price' });
+  else if (MODE !== 'final' && cap === 'low') dropped.push({ ...i, why: 'under-min-price' });
   /* With no own count the only rating is the pooled one, so it is not
    * judged on it: set aside as unknown, never "rating<4" (review,
    * 2026-10-18). This comes BEFORE "no rating" in final mode: a finalist
@@ -550,20 +565,29 @@ if (noAttr.length) {
 if (REQS.length && unverified.length)
   warnings.push(`unverified-constraint: ${unverified.length} item(s) were NOT ranked because ` +
     `their status for [${REQS.join(', ')}] is unknown. Check them, do not assume they pass.`);
-if (MAX_PRICE != null && MODE !== 'final') {
+if (PRICED && MODE !== 'final') {
   const over = dropped.filter((d) => d.why === 'over-max-price').length;
+  const under = dropped.filter((d) => d.why === 'under-min-price').length;
   const near = all.filter((i) => priceCap(i) === 'near').length;
+  const nearLow = all.filter((i) => priceCap(i) === 'near-low').length;
   const noPrice = all.filter((i) => priceCap(i) === 'unknown').length;
-  warnings.push(`max-price: ${over} item(s) over ${MAX_PRICE}${capCurrency ? ' ' + capCurrency : ''} x ${GRID_MARGIN} on the search grid ` +
-    `were dropped; ${near} just over the cap were kept (flag price-over-cap-on-grid)` +
-    (noPrice ? `, and ${noPrice} with no price or another currency were kept (flag price-unknown)` : '') +
-    '. The grid price is not the item-page price (measured 2026-11-23: +31% to -4.5%). Pass --max-price again in final mode, ' +
+  const cur = capCurrency ? ' ' + capCurrency : '';
+  warnings.push(`max-price: ` + [
+    MAX_PRICE != null ? `${over} item(s) over ${MAX_PRICE}${cur} x ${GRID_MARGIN} on the search grid were dropped, ${near} just over ` +
+      'the cap were kept (flag price-over-cap-on-grid)' : null,
+    MIN_PRICE != null ? `${under} item(s) under ${MIN_PRICE}${cur} / ${GRID_UP} were dropped, ${nearLow} under the floor ` +
+      'but within it were kept (flag price-under-floor-on-grid)' : null,
+    noPrice ? `${noPrice} with no price or another currency were kept (flag price-unknown)` : null].filter(Boolean).join('; ') +
+    '. The grid price is not the item-page price (measured 2026-11-23: +31% to -4.5%). Pass the same bounds again in final mode, ' +
     'on the item-page prices.');
 }
 
 // The cap and the --exclude cut, as they go in the output.
-const capOut = () => (MAX_PRICE == null ? {} : { maxPrice: { cap: MAX_PRICE, currency: capCurrency,
-  appliedTo: MODE === 'final' ? 'item-page price' : 'search-grid price, ' + Math.round((GRID_MARGIN - 1) * 100) + '% margin' } });
+const capOut = () => ({
+  ...(MAX_PRICE == null ? {} : { maxPrice: { cap: MAX_PRICE, currency: capCurrency,
+    appliedTo: MODE === 'final' ? 'item-page price' : 'search-grid price, ' + Math.round((GRID_MARGIN - 1) * 100) + '% margin' } }),
+  ...(MIN_PRICE == null ? {} : { minPrice: { floor: MIN_PRICE, currency: capCurrency,
+    appliedTo: MODE === 'final' ? 'item-page price' : 'search-grid price, kept down to floor / ' + GRID_UP } }) });
 const excludedOut = () => {
   if (!excludeRe) return {};
   const ex = dropped.filter((d) => d.why === 'excluded');
@@ -679,7 +703,8 @@ const scored = kept
     // evidence can stay in the top 4: name it so the report says so.
     if (typeof i.brandScore === 'number' && i.brandScore < 0.2) flags.push('brand-implausible');
     if (MODE !== 'final' && priceCap(i) === 'near') flags.push('price-over-cap-on-grid');
-    if (MODE !== 'final' && MAX_PRICE != null && priceCap(i) === 'unknown') flags.push('price-unknown');
+    if (MODE !== 'final' && priceCap(i) === 'near-low') flags.push('price-under-floor-on-grid');
+    if (MODE !== 'final' && PRICED && priceCap(i) === 'unknown') flags.push('price-unknown');
     /* Two options that are different products (listing.js optionsDiffer): the
      * own rating and count are pooled over both (measured 2026-11-23: the X1
      * listing sold a 3-key and a 7-button mouse under one 414-rating count). */

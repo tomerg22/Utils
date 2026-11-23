@@ -5831,7 +5831,8 @@ await block('N12-1', async () => {
     kind(vert).includes('wired-vs-wireless') && /wired \(title: wired\)/.test(vert.checkWarnings.find((w) => /^wired-vs/.test(w))), JSON.stringify(vert.checkWarnings));
   const g502 = checkRecord(n12Rec('1005007539842734', { title: 'Logitech G502hero Master Wired Gaming Mouse', selected: ['G502HERO'],
     options: ['G502HERO', 'G502SE'], specs: { 'Power Type': 'Rechargeable', Type: 'Wired', 'Battery Included': 'no', 'Logitech Model': 'G502' } }));
-  ok('N12-1: G502: Type Wired beside Power Type Rechargeable', kind(g502).includes('wired-vs-wireless'), JSON.stringify(g502.checkWarnings));
+  // Since N13-2 this pattern (Battery Included: no) is power-type-only: still a warning, still unknown.
+  ok('N12-1: G502: Type Wired beside Power Type Rechargeable', kind(g502).includes('power-type-only'), JSON.stringify(g502.checkWarnings));
   const razer = connectionOf('Razer DeathAdder Essential Wired Gaming Mouse', { Type: 'Wired', 'Connect to the computer': 'Wired',
     'Wireless transmission frequency': 'Wired', 'Battery Included': 'no', 'Power Type': 'USB' });
   eq('N12-1: Razer: a row NAMED "wireless" with the value Wired, no battery: wired only', razer.wireless, []);
@@ -6025,6 +6026,49 @@ await block('N12-8', async () => {
   ok('N12-8: step 4 shows --exclude and --max-price', /--exclude '/.test(step4) && /--max-price 14\.99/.test(step4) && /`excluded`/.test(step4));
   ok('N12-8: the files table lists checks.mjs', /\| `scripts\/checks\.mjs` \|/.test(skillSrc));
   ok('N12-8: the defects of this run are recorded', /### Defects fixed 2026-11-23 \(the wired-mouse session\)/.test(skillSrc));
+});
+
+// ============================================================================
+// 2026-11-23, second wired-mouse run ("$5<price<$15"): gaps found in that run.
+// Each block fails on 3d0ec39.
+// ============================================================================
+console.log('\nN13-1: rank.mjs --min-price, a floor beside the cap');
+await block('N13-1', async () => {
+  const it = (id, price) => ({ id, title: 'Wired Mouse ' + id, price, currency: 'USD', rating: 4.8, ownRating: 4.8,
+    reviews: 200, sold: 2000, soldRaw: '2,000+', constraints: { wired: 'pass' } });
+  const fin = rankRun([it('a', 4.25), it('b', 5.01), it('c', 14.99), it('d', 15.69), it('e', null)],
+    ['--mode', 'final', '--constraint', 'wired', '--min-price', '5.01', '--max-price', '14.99']);
+  eq('N13-1: final: under the floor and over the cap both fail; the bounds themselves pass',
+    [fin.out.ranked.map((r) => r.id).sort(), fin.out.droppedItems.map((d) => [d.id, d.why]).sort(), fin.out.unverified.map((u) => [u.id, u.why])],
+    [['b', 'c'], [['a', 'violates:min-price'], ['d', 'violates:max-price']], [['e', 'unverified:min-price+max-price']]]);
+  eq('N13-1: both bounds are listed as requirements, with what they were applied to',
+    [fin.out.constraints, fin.out.minPrice], [['wired', 'min-price', 'max-price'], { floor: 5.01, currency: 'USD', appliedTo: 'item-page price' }]);
+  const sl = rankRun([it('a', 4.25), it('f', 3.5), it('b', 6)], ['--mode', 'shortlist', '--min-price', '5.01', '--min-evidence', '1']);
+  eq('N13-1: shortlist: a grid price within 31% under the floor is kept and flagged, lower is dropped',
+    [sl.out.ranked.map((r) => [r.id, r.flags.includes('price-under-floor-on-grid')]).sort(), sl.out.droppedReasons], [[['a', true], ['b', false]], { 'under-min-price': 1 }]);
+  ok('N13-1: the warning counts the floor drops', sl.out.warnings.some((w) => /^max-price: 1 item\(s\) under 5\.01 USD \/ 1\.31 were dropped/.test(w)), JSON.stringify(sl.out.warnings));
+  eq('N13-1: a floor above the cap is refused', rankRun([it('a', 3)], ['--min-price', '9', '--max-price', '5']).code, 2);
+  eq('N13-1: --currency with only --min-price is accepted', rankRun([it('a', 6)], ['--min-price', '5', '--currency', 'USD']).code, 0);
+  const step4 = skillSrc.slice(skillSrc.indexOf('## Step 4'), skillSrc.indexOf('## Step 5'));
+  ok('N13-1: step 4 shows --min-price', /--min-price 5\.01/.test(step4));
+});
+
+console.log('\nN13-2: checks.mjs: a package sentence, wired/wireless options, a rechargeable-only Power Type');
+await block('N13-2', async () => {
+  const { checkRecord, optionsDiffer } = await import('./checks.mjs');
+  const pink = checkRecord(n12Rec('1005006337301040', { desc: 'Compact and Safe Packaging The mouse comes in a package size of 20 x 20 x 20 cm with a weight of 0.084 kg. It is light.',
+    specs: { 'Power Type': 'Rechargeable', 'Battery Included': 'no', Type: 'Wired' } }));
+  eq('N13-2: "a package size of … with a weight of 0.084 kg" is the package, not an 84 g mouse',
+    [pink.productWeightG, pink.weightLines.map((w) => [w.grams, w.isPackage])], [null, [[84, true]]]);
+  ok('N13-2: Power Type alone beside "Battery Included: no" says power-type-only, not wired-vs-wireless',
+    pink.checkWarnings.some((w) => /^power-type-only: .*Wired is still UNKNOWN/.test(w)) && !pink.checkWarnings.some((w) => /^wired-vs-wireless/.test(w)), JSON.stringify(pink.checkWarnings));
+  const vert = checkRecord(n12Rec('1', { title: 'Wired Vertical Mouse', specs: { Type: '2.4Ghz Wireless', 'Battery Included': 'Yes' } }));
+  ok('N13-2: a wireless Type row stays wired-vs-wireless', vert.checkWarnings.some((w) => /^wired-vs-wireless/.test(w)) && !vert.checkWarnings.some((w) => /^power-type-only/.test(w)));
+  const g502 = checkRecord(n12Rec('2', { title: 'Logitech G502 Wired', specs: { 'Power Type': 'Rechargeable', Type: 'Wired' } }));
+  ok('N13-2: with no "Battery Included: no" row it stays wired-vs-wireless', g502.checkWarnings.some((w) => /^wired-vs-wireless/.test(w)));
+  eq('N13-2: options "Wired-black" and "2.4G Wireless-white" differ on the connection',
+    optionsDiffer(['Wired-black', 'Wired-white', '2.4G Wireless-white']), { a: 'Wired-black', b: '2.4G Wireless-white', why: 'connection (wired / wireless)' });
+  eq('N13-2: "Item weight: 131g" beside "Package weight: 166g": 131', checkRecord(n12Rec('3', { desc: 'Item weight: 131g. Package weight: 166g' })).productWeightG, 131);
 });
 
 // ---------------------------------------------- the whole suite on dist/

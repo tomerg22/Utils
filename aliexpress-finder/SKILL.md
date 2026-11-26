@@ -240,8 +240,8 @@ NOT close the tab first: the harvest lives in that tab's `window`. Since
 2026-10-18 `harvest.js` also saves it to `localStorage` after every page
 (`status().backup`), and `localStorage` belongs to the origin, not the tab.
 
-1. Check the receiver is up: `curl -s http://127.0.0.1:8765/` must answer
-   `ok …`. It has no payload limit and exits after 60 idle minutes; if it is
+1. Check the receiver is up: `curl -s http://127.0.0.1:8765/` (or the port
+   its `listening` line names, step 3) must answer `ok …`. It has no payload limit and exits after 60 idle minutes; if it is
    gone, start it again (step 3). **Do not skip this check in a hidden
    tab, or in a visible one.** `send(<port>, {via: 'form', token})` never tries a
    fetch. It always posts the form, and a form POST is a navigation. So
@@ -878,6 +878,19 @@ the pool (a test POST with `Origin: https://evil.example` was saved). The
 not. The token is new on each start; after a restart read the new one, or
 start it with `--token <token>` to keep the old one. A body over 64 MiB is
 refused (413).
+
+**Read the port from that line too.** When 8765 is in use, the receiver
+takes the next free port, up to 8784, and the end of the `listening` line
+says so: `Port 8765 (another program) is in use: this receiver took 8766.
+Use 8766 in place of 8765 in every curl and send().` Then every `8765` in
+this file means that port for the rest of the run: the curl checks, the
+sends, `/stop`. `another receiver.mjs` means a receiver of an earlier run
+still holds 8765 (it idles out after 60 minutes); its token is not yours, so
+a send to 8765 is refused (403) and saves nothing. Measured 2026-11-26: a
+Python web server of another project held 8765. The receiver exited 1 with
+`EADDRINUSE`, and `curl -s http://127.0.0.1:8765/` answered with that
+server's HTML directory listing. An answer that does not start with `ok ` is
+not this receiver.
 
 It takes any number of payloads and exits after 60 minutes without a
 request to it (`--count N` / `--idle S` change that). A flag with no value,
@@ -1938,7 +1951,7 @@ That is correct, not a bug — but in `shortlist` mode the "volume" is bucketed
 | File | Role |
 |------|------|
 | `scripts/harvest.js` | **Primary.** Browser-side paged harvester: resumable, block-aware, reads until an empty page or a page with no new ids (never on `finished`), reports `coverage.verdict`, `endSignal`, `relevance` (off-query streams) and `visibility`. Runs unchanged in both browsers; `forceEnglish()` (in-app only), `send()` (outcome-first reply; `send(port, {via: 'form'})` always posts the form, so it navigates even to a dead port: curl the receiver first; a plain `send()` never navigates after a refused fetch; a backup is saved before any form POST; the fetch race is skipped in a hidden tab), `restore()`/`backups()`/`dropBackup()` (localStorage backup per page, the run saved last first), `resume()` (clears a stop, keeps the items), `startPage`, `maxPages` capped at the site's last page (60), one `step()` loop at a time (`running` in `status()`), `expose()`/`chunks()` (Chrome export, visible tab only), `debugUrl()` (in-app only); `fourStar` off by default since 2026-10-20 (`true`, or an `extra` that carries the 4★ switch, makes `start()` `note`, `status()` `note` and a `four-star-switch` payload warning say so); a `step()` that reads the last allowed page ends with its stop set (`done: true`); each search fetch and the page it is installed on go into the shared request log (`requests()`, `siteRequests60m` and `nearWall` in `status()`, step 2). |
-| `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; after a `curl` check, `__aeHarvest.send(port, {via: 'form', token})` POSTs the payload to it (it saves only at `/harvest/<token>`, the token of its `listening` line) and it writes `harvest-<query>-<stamp>.json` and prints `saved <path>` in its own output (a fetch gets the same line as its reply). A payload with a `kind` (the `sendAll()` detail records) is written as `<kind>-<stamp>.json`, so `details-<stamp>.json`, and any other payload that is not a search payload (the one page of `extract.js`) as `page-<stamp>.json`. No payload limit by default; exits after 60 idle minutes; `GET /` answers `ok …`; `GET /stop` ends it with exit 0, and is refused (403) when a web page sends it. |
+| `scripts/receiver.mjs` | **Primary export.** Loopback HTTP receiver; after a `curl` check, `__aeHarvest.send(port, {via: 'form', token})` POSTs the payload to it (it saves only at `/harvest/<token>`, the token of its `listening` line) and it writes `harvest-<query>-<stamp>.json` and prints `saved <path>` in its own output (a fetch gets the same line as its reply). A payload with a `kind` (the `sendAll()` detail records) is written as `<kind>-<stamp>.json`, so `details-<stamp>.json`, and any other payload that is not a search payload (the one page of `extract.js`) as `page-<stamp>.json`. No payload limit by default; exits after 60 idle minutes; `GET /` answers `ok …`; `GET /stop` ends it with exit 0, and is refused (403) when a web page sends it. When 8765 is in use it takes the next free port, up to 8784, and its `listening` line names that port and who holds the busy one (`another receiver.mjs` or `another program`). |
 | `scripts/decode.mjs` | **Fallback decoder and merger.** Reassembles a payload from the in-app harness file (double-encoded), from Chrome `get_page_text` chunk dumps (any order, refuses a partial set), or from a plain payload JSON or an array of them. Several payloads are merged, deduped by id, never dropped. A file that is not a search payload (a `kind`, the one page of `extract.js`, another source, a merged file that holds one) is refused with exit 2, naming the file: it goes to `rank.mjs`. |
 | `scripts/dist/bootstrap-harvest.min.js`, `bootstrap-listing.min.js` | **The one paste per script per run.** Generated. The min copy, which also saves its own text in `localStorage`; later pages run `(0,eval)(localStorage.getItem('__aeSrc:harvest'))`. |
 | `scripts/build.mjs` | Writes `scripts/dist/*.min.js`: the three browser files without comments, for the install paste, and the two `bootstrap-*.min.js` files. `--check` reports a stale copy; `test.mjs` fails on one. |
@@ -1962,6 +1975,21 @@ matches `lib.mjs` on every fixture — keep them in sync, the test will catch yo
 if you don't. A drifted `wallVerdict` means one entry point silently stops
 detecting walls; a drifted `SOLD_RE` means best sellers silently lose their
 sold count.
+
+### Defect fixed 2026-11-26 (the M5 washer session)
+
+**The receiver could not start when port 8765 was taken.** A Python web
+server of another project held 8765. `receiver.mjs` exited 1 with `listen
+EADDRINUSE`, and `curl -s http://127.0.0.1:8765/` answered with that
+server's HTML directory listing. Every command in this file names 8765, and
+no step said what to do. The operator found the cause with `lsof` and
+restarted the receiver on 8775 by hand. Guard: the CLI tries 8765 to 8784
+and names the port it took in the `listening` line, with who holds the busy
+one (it asks the port for this receiver's `ok … saved` answer); step 3 says
+to use that port wherever this file says 8765. Test `N14`. Checked live the
+same day: with `python3 -m http.server 8765` running, the receiver took
+8766 and saved a post; with receivers on 8765 and 8766, a third took 8767
+and named both as `another receiver.mjs`.
 
 ### Defects fixed 2026-11-23 (the wired-mouse session)
 

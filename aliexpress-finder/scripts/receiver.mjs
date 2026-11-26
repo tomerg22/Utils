@@ -5,7 +5,8 @@
  *   node receiver.mjs --dir <outdir> [--port 8765] [--count 0] [--idle 3600] [--token <token>] [--max-bytes N]
  *
  * Prints one line, `listening http://127.0.0.1:<port> dir <dir> token <token>`,
- * then waits. The page POSTs its payload with
+ * then waits. <port> is 8765 unless that port is in use: then the next free
+ * one, named at the end of the line (A BUSY PORT, below). The page POSTs its payload with
  * `await __aeHarvest.send(<port>, {via: 'form', token: '<token>'})` after
  * `curl -s http://127.0.0.1:<port>/` answers ok (a plain send() fetch was
  * refused by both browsers on 2026-10-18; see SKILL.md step 3).
@@ -52,6 +53,16 @@
  * refused send() then lost the harvest. `GET /` answers "ok <saved> idle
  * <seconds left>", so `curl -s http://127.0.0.1:8765/` checks it is up.
  *
+ * A BUSY PORT (measured 2026-11-26): a Python web server of another project
+ * held 8765. The receiver exited 1 with "listen EADDRINUSE", and
+ * `curl -s http://127.0.0.1:8765/` answered with that server's HTML directory
+ * listing, so the curl check did not show at once that no receiver was up.
+ * Now the CLI tries the next ports, up to PORT_TRIES in all (8765 to 8784),
+ * and the "listening" line names the port it took and who held the busy one:
+ * "another receiver.mjs" when that port answers GET / with "ok … saved",
+ * "another program" otherwise. Read the port from that line, as the token.
+ * --port 0 takes a free port the system picks, with no fallback needed.
+ *
  * WHY (measured 2026-09-14): the Chrome connector cuts a javascript_tool
  * result at 1,000 characters and get_page_text at 50,000, so a 90 KB payload
  * could only come back as chunks pasted by hand. A page may POST to
@@ -72,6 +83,27 @@ export const newToken = () => randomBytes(8).toString('hex');
 /* 64 MiB. A full 60-page harvest is about 2 MB (500 chars per item, 3,600
  * items), and the detail records of 40 finalists a few MB more. */
 export const MAX_BYTES = 64 * 1024 * 1024;
+/* Ports the CLI tries, from --port up: 8765 to 8784 by default. */
+export const PORT_TRIES = 20;
+
+/** Who holds a busy port: 'receiver' when it answers GET / like this
+ * receiver ("ok <n> saved, idle …"), 'other' when it answers anything else
+ * or nothing within a second. The probe sends no token. */
+export async function whoHolds(port) {
+  try {
+    const r = await fetch('http://127.0.0.1:' + port + '/', { signal: AbortSignal.timeout(1000) });
+    const t = await r.text();
+    return /^ok \d+(\/\d+)? saved, idle /.test(t) ? 'receiver' : 'other';
+  } catch (e) { return 'other'; }
+}
+
+/** One line about the busy ports, for the "listening" line; '' when none. */
+export function busyNote(busy, took) {
+  if (!busy || !busy.length) return '';
+  const who = (b) => b.port + ' (' + (b.holder === 'receiver' ? 'another receiver.mjs' : 'another program') + ')';
+  return 'Port ' + busy.map(who).join(', ') + (busy.length > 1 ? ' are' : ' is') + ' in use: this receiver took ' +
+    took + '. Use ' + took + ' in place of ' + busy[0].port + ' in every curl and send().';
+}
 
 /* --name value or --name=value. An unknown flag is an error: "--idle=1"
  * and typos used to be ignored, so the receiver ran with the defaults.
@@ -155,7 +187,10 @@ export function tokenOf(url) {
   return path.startsWith('/harvest/') ? path.slice('/harvest/'.length) : '';
 }
 
-export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () => {}, token = newToken(), maxBytes = MAX_BYTES }) {
+/* tries: how many ports to try, from `port` up, when one is in use. 1 (the
+ * default here) keeps the old behaviour: EADDRINUSE rejects. The CLI passes
+ * PORT_TRIES. Port 0 is one try: the system picks a free port. */
+export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () => {}, token = newToken(), maxBytes = MAX_BYTES, tries = 1 }) {
   if (!TOKEN_RE.test(String(token))) throw new Error('the token must be 8 to 64 letters or digits');
   mkdirSync(dir, { recursive: true });
   let received = 0;
@@ -247,13 +282,37 @@ export function startReceiver({ dir, port = 0, count = 0, idle = 3600, log = () 
     timer = setTimeout(() => { log('idle timeout after ' + idle + ' s: exiting'); server.close(); }, idle * 1000);
     timer.unref && timer.unref();
   };
-  return new Promise((resolveP, reject) => {
-    server.on('error', reject);
-    server.listen(port, '127.0.0.1', () => {
-      arm();
-      resolveP({ port: server.address().port, token, close: () => new Promise((r) => server.close(r)), server });
-    });
+  /* One listen() at a time. After a failed listen(), Node allows listen()
+   * again on the same server. */
+  const listenOn = (p) => new Promise((ok, fail) => {
+    const onErr = (e) => { server.off('listening', onOk); fail(e); };
+    const onOk = () => { server.off('error', onErr); ok(); };
+    server.once('error', onErr);
+    server.once('listening', onOk);
+    server.listen(p, '127.0.0.1');
   });
+  return (async () => {
+    const busy = [];
+    const last = port === 0 ? 0 : Math.min(65535, port + Math.max(1, tries) - 1);
+    for (let p = port; ; p++) {
+      try { await listenOn(p); break; } catch (e) {
+        if (e.code !== 'EADDRINUSE' || p >= last) {
+          if (e.code === 'EADDRINUSE' && busy.length) {
+            busy.push({ port: p, holder: await whoHolds(p) });
+            throw new Error('ports ' + port + ' to ' + last + ' are all in use (' +
+              busy.map((b) => b.port + ': ' + (b.holder === 'receiver' ? 'another receiver.mjs' : 'another program')).join(', ') +
+              '). Stop one, or pass --port <another>');
+          }
+          throw e;
+        }
+        busy.push({ port: p, holder: await whoHolds(p) });
+      }
+    }
+    server.on('error', (e) => log('server error: ' + e.message));
+    arm();
+    // The CLI puts busyNote() at the end of its "listening" line, so that line stays the first one.
+    return { port: server.address().port, token, busy, close: () => new Promise((r) => server.close(r)), server };
+  })();
 }
 
 const isMain = process.argv[1] && /receiver\.mjs$/.test(process.argv[1]);
@@ -285,9 +344,9 @@ if (isMain) {
     console.error('receiver: --token must be 8 to 64 letters or digits, got ' + JSON.stringify(opts.token)); process.exit(2);
   }
   const token = opts.token != null ? opts.token : newToken();
-  startReceiver({ dir, port, count, idle, token, maxBytes, log: (m) => console.log(m) })
-    .then(({ port: p }) => console.log('listening http://127.0.0.1:' + p + ' dir ' + dir + ' token ' + token +
+  startReceiver({ dir, port, count, idle, token, maxBytes, tries: PORT_TRIES, log: (m) => console.log(m) })
+    .then(({ port: p, busy }) => console.log('listening http://127.0.0.1:' + p + ' dir ' + dir + ' token ' + token +
       (count > 0 ? ' (exits after ' + count + ' payload(s)' : ' (no payload limit') + ', or ' + idle + ' s idle)' +
-      '. Send with token: \'' + token + '\''))
+      '. Send with token: \'' + token + '\'' + (busy.length ? '. ' + busyNote(busy, p) : '')))
     .catch((e) => { console.error('receiver: ' + e.message); process.exit(1); });
 }

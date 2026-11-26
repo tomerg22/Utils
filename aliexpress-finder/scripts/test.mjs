@@ -6071,6 +6071,89 @@ await block('N13-2', async () => {
   eq('N13-2: "Item weight: 131g" beside "Package weight: 166g": 131', checkRecord(n12Rec('3', { desc: 'Item weight: 131g. Package weight: 166g' })).productWeightG, 131);
 });
 
+console.log('\nN14: a busy receiver port is skipped and named (2026-11-26: a Python web server held 8765)');
+await block('N14', async () => {
+  const http = await import('node:http');
+  const { spawn } = await import('node:child_process');
+  const rxMod = await import('./receiver.mjs');
+  const close = (s) => new Promise((r) => s.close(r));
+  // Another program on the port: it answers GET / with HTML, as python3 -m http.server did.
+  const holdPort = (p) => new Promise((res, rej) => {
+    const s = http.createServer((q, r) => r.end('<!DOCTYPE HTML>\n<html><title>Directory listing for /</title></html>'));
+    s.once('error', rej); s.listen(p, '127.0.0.1', () => res(s));
+  });
+  // A start port with n free ports in a row, never the live 8765 range.
+  const freeRun = async (n) => {
+    for (let t = 0; t < 30; t++) {
+      const p = await freePort();
+      if (p + n > 65535 || (p <= 8784 && p + n >= 8765)) continue;
+      const held = [];
+      try { for (let i = 0; i < n; i++) held.push(await holdPort(p + i)); } catch (e) { await Promise.all(held.map(close)); continue; }
+      await Promise.all(held.map(close));
+      return p;
+    }
+    throw new Error('no ' + n + ' free ports in a row');
+  };
+
+  // N14-1: the CLI, with another program on its --port.
+  const p1 = await freeRun(3);
+  const other = await holdPort(p1);
+  const dir = tmp('ae-rx-n14-');
+  const cp = spawn('node', [join(HERE, 'receiver.mjs'), '--dir', dir, '--port', String(p1), '--idle', '30']);
+  let err1 = '';
+  cp.stderr.on('data', (d) => { err1 += d; });
+  const line = await new Promise((res) => {
+    let b = ''; const t = setTimeout(() => res(b || 'no line; stderr: ' + err1), 5000);
+    cp.stdout.on('data', (d) => { b += d; if (b.includes('\n')) { clearTimeout(t); res(b); } });
+    cp.on('exit', (c) => { clearTimeout(t); res(b || 'exit ' + c + ' ' + err1); });
+  });
+  const took = Number((line.match(/^listening http:\/\/127\.0\.0\.1:(\d+) /) || [])[1]);
+  ok('N14-1: with another program on --port, the CLI still starts, on the next port', took === p1 + 1, line);
+  ok('N14-1: the listening line names the busy port, its holder and the port to use',
+    line.includes('Port ' + p1 + ' (another program) is in use: this receiver took ' + took + '. Use ' + took + ' in place of ' + p1 + ' in every curl and send().'), line);
+  const tk = (line.match(/ token ([0-9a-f]{16}) /) || [])[1];
+  const saved = await fetch('http://127.0.0.1:' + took + '/harvest/' + tk, { method: 'POST', body: '{"query":"busy","items":[]}' });
+  eq('N14-1: a send to the port it took is saved', saved.status, 200);
+  const stop = await new Promise((res) => { cp.on('exit', res); fetch('http://127.0.0.1:' + took + '/stop').catch(() => {}); });
+  eq('N14-1: and /stop on that port ends it with exit 0', stop, 0);
+  await close(other);
+
+  // N14-2: an earlier receiver holds the port: it is named as one.
+  const p2 = await freeRun(3);
+  const old = await rxMod.startReceiver({ dir: tmp('ae-rx-n14b-'), port: p2 });
+  const neu = await rxMod.startReceiver({ dir: tmp('ae-rx-n14c-'), port: p2, tries: 3 });
+  eq('N14-2: an earlier receiver on the port is named "receiver", and the next port is taken',
+    [neu.port, neu.busy], [p2 + 1, [{ port: p2, holder: 'receiver' }]]);
+  ok('N14-2: busyNote says "another receiver.mjs"', /^Port \d+ \(another receiver\.mjs\) is in use: this receiver took \d+\./.test(rxMod.busyNote(neu.busy, neu.port)));
+  const toOld = await fetch('http://127.0.0.1:' + p2 + '/harvest/' + neu.token, { method: 'POST', body: '{"query":"x","items":[]}' });
+  eq('N14-2: the new token is refused by the old receiver, so the old port is never the one to use', toOld.status, 403);
+  await neu.close(); await old.close();
+
+  // N14-3: every port tried is busy: a named error, never a silent random port.
+  const p3 = await freeRun(2);
+  const h3 = [await holdPort(p3), await holdPort(p3 + 1)];
+  let e3 = null;
+  try { const r = await rxMod.startReceiver({ dir: tmp('ae-rx-n14d-'), port: p3, tries: 2 }); await r.close(); } catch (e) { e3 = e; }
+  ok('N14-3: all tried ports busy: the error names the range and each holder',
+    !!e3 && e3.message === 'ports ' + p3 + ' to ' + (p3 + 1) + ' are all in use (' + p3 + ': another program, ' + (p3 + 1) + ': another program). Stop one, or pass --port <another>', String(e3 && e3.message));
+
+  // N14-4: the API default is one try, as before (the tests start on port 0).
+  let e4 = null;
+  try { const r = await rxMod.startReceiver({ dir: tmp('ae-rx-n14e-'), port: p3 }); await r.close(); } catch (e) { e4 = e; }
+  eq('N14-4: startReceiver() with no tries rejects a busy port as before', e4 && e4.code, 'EADDRINUSE');
+  await Promise.all(h3.map(close));
+  eq('N14-4: the CLI tries 20 ports (8765 to 8784)', rxMod.PORT_TRIES, 20);
+  eq('N14-4: busyNote with two busy ports', rxMod.busyNote([{ port: 8765, holder: 'other' }, { port: 8766, holder: 'receiver' }], 8767),
+    'Port 8765 (another program), 8766 (another receiver.mjs) are in use: this receiver took 8767. Use 8767 in place of 8765 in every curl and send().');
+
+  // N14-5: the docs say to read the port from the listening line.
+  const step3 = skillSrc.slice(skillSrc.indexOf('### Getting a large payload out of the browser'), skillSrc.indexOf('then in the browser:'));
+  ok('N14-5: step 3 says to read the port from the listening line and use it for every 8765',
+    /\*\*Read the port from that line too\.\*\*/.test(step3) && /every `8765` in\s+this file means that port/.test(step3) && /does not start with `ok ` is\s+not this receiver/.test(step3), step3.slice(0, 200));
+  ok('N14-5: the hidden-tab recovery curl names the listening-line port', /curl -s http:\/\/127\.0\.0\.1:8765\/` \(or the port\s+its `listening` line names, step 3\)/.test(skillSrc));
+  ok('N14-5: receiver.mjs explains the busy port in its header', /A BUSY PORT \(measured 2026-11-26\)/.test(SRC('receiver.mjs')));
+});
+
 // ---------------------------------------------- the whole suite on dist/
 /* The operator pastes dist/*.min.js, so the suite runs again on them: every
  * scenario above, not a handful (review, 2026-10-18: only 4 assertions
